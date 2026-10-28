@@ -224,10 +224,12 @@ Pi reports its state with the [Program Status Protocol (OSC 7501)](https://www.s
 
 | State | When |
 |---|---|
-| `working` | An agent run or compaction is in progress. The message is the session name. |
+| `working` | An agent run, compaction, or extension-registered background job is in progress. |
 | `blocked` | An extension dialog or login waits for you. The message is the dialog title. |
 | `done` | A run finished. The message is the session name. |
 | `error` | A run ended with an error that is not retried. The message is the first line of the error. |
 | `idle` | Pi started, or you cancelled the run. |
+
+Extensions can keep status `working` across parent runs with [`ctx.ui.beginBackgroundWork()`](extensions.md#background-work-and-terminal-status). Pi cannot detect unregistered background jobs. Dialogs and final parent errors still take precedence over background work.
 
 Reports never contain prompts or model output. Pi sends them only after the terminal answers the protocol's support query; tmux and screen do not forward them. Set `PI_PROGRAM_STATUS=1` to send reports without asking, or `PI_PROGRAM_STATUS=0` to turn them off.

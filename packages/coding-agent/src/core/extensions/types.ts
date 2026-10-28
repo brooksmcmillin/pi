@@ -166,6 +166,13 @@ export interface ExtensionUIContext {
 	/** Set status text in the footer/status bar. Pass undefined to clear. */
 	setStatus(key: string, text: string | undefined): void;
 
+	/**
+	 * Keep terminal program status working while extension-owned background work is pending.
+	 * Returns an idempotent release callback. Registrations are cleared on session replacement or reload.
+	 * Does not keep the agent running or change cancellation. No-op outside interactive mode.
+	 */
+	beginBackgroundWork(): () => void;
+
 	/** Set the working/loading message shown during streaming. Call with no argument to restore default. */
 	setWorkingMessage(message?: string): void;
 

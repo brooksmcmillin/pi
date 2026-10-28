@@ -2559,6 +2559,7 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
+		this.programStatus.clearBackgroundWork();
 		if (this.extensionDialogs.length > 0) {
 			for (const dialog of this.extensionDialogs) {
 				dialog.component.dispose?.();
@@ -2745,6 +2746,7 @@ export class InteractiveMode {
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
+			beginBackgroundWork: () => this.programStatus.beginBackgroundWork(),
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
 				if (this.activeStatusIndicator?.kind === "working") {

@@ -2965,6 +2965,26 @@ ctx.ui.theme.fg("accent", "styled text");  // Access current theme
 
 Custom working-indicator frames are rendered verbatim. If you want colors, add them to the frame strings yourself, for example with `ctx.ui.theme.fg(...)`.
 
+### Background work and terminal status
+
+Use `ctx.ui.beginBackgroundWork()` when an extension starts work that outlives an agent run, such as asynchronous subagents. It returns an idempotent release callback. While any registration remains, terminal [program status](terminal-setup.md#program-status) stays `working` instead of reporting `done` when the parent settles. Dialogs and final parent errors still take precedence.
+
+```typescript
+const release = ctx.ui.beginBackgroundWork();
+try {
+  await runBackgroundJob();
+  // Present the result before releasing the registration.
+} finally {
+  release();
+}
+```
+
+Register before handing off the work, not after `agent_settled` has already reported completion. Keep the registration until results are handled; if results require another agent run, keep it through that handoff so no intermediate `done` is emitted. Releasing the last registration restores the parent's current status; it does not itself create a completion or error result.
+
+Registrations are cleared on session replacement and `/reload`. Old release callbacks cannot clear new registrations. Extensions remain responsible for stopping their background resources in `session_shutdown`. This API only controls terminal status: it does not change `ctx.isIdle()`, queue messages, keep the agent running, or cancel work on Escape. It is a no-op outside interactive mode and does not detect existing subagent extensions automatically.
+
+See [background-work.ts](../examples/extensions/background-work.ts) for a model-free demo.
+
 ### Autocomplete Providers
 
 Use `ctx.ui.addAutocompleteProvider()` to stack custom autocomplete logic on top of the built-in slash-command and path provider. Set `triggerCharacters` for custom natural triggers such as `$`.

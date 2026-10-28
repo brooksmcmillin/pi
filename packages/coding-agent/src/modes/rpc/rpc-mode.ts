@@ -176,6 +176,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			} as RpcExtensionUIRequest);
 		},
 
+		beginBackgroundWork(): () => void {
+			// Terminal program status is not emitted in RPC mode.
+			return () => {};
+		},
+
 		setWorkingMessage(_message?: string): void {
 			// Working message not supported in RPC mode - requires TUI loader access
 		},

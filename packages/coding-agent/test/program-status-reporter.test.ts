@@ -147,6 +147,103 @@ describe("ProgramStatusReporter", () => {
 		expect(last()).toEqual({ state: "working", message: "New" });
 	});
 
+	it("stays working across parent settlements until all background work is released", () => {
+		const { reporter, reports, send, last } = setup("Review");
+		send({ type: "agent_start" });
+		const finishCode = reporter.beginBackgroundWork();
+		const finishSecurity = reporter.beginBackgroundWork();
+		send(assistantEnd("stop"), settled);
+		finishSecurity();
+		finishSecurity();
+		send({ type: "agent_start" }, assistantEnd("stop"), settled);
+		expect(reports.map((report) => report.state)).toEqual(["working"]);
+		finishCode();
+		expect(last()).toEqual({ state: "done", message: "Review" });
+		finishCode();
+		expect(reports).toHaveLength(2);
+	});
+
+	it("does not finish an active parent when background work completes", () => {
+		const { reporter, send, last } = setup();
+		send({ type: "agent_start" });
+		const finish = reporter.beginBackgroundWork();
+		finish();
+		expect(last()).toEqual({ state: "working" });
+		send(assistantEnd("stop"), settled);
+		expect(last()).toEqual({ state: "done" });
+	});
+
+	it("does not invent completion for background work started while idle", () => {
+		const { reporter, last } = setup();
+		const finish = reporter.beginBackgroundWork();
+		expect(last()).toEqual({ state: "working" });
+		finish();
+		expect(last()).toEqual({ state: "idle" });
+	});
+
+	it("keeps dialogs and stopped parent errors visible during background work", () => {
+		const { reporter, send, last } = setup();
+		const finish = reporter.beginBackgroundWork();
+		reporter.setBlocked("permission", { kind: "permission", message: "Allow?" });
+		expect(last()).toEqual({ state: "blocked", kind: "permission", message: "Allow?" });
+		reporter.setBlocked("permission", undefined);
+		expect(last()).toEqual({ state: "working" });
+		send({ type: "agent_start" }, assistantEnd("error", "Failed"), settled);
+		expect(last()).toEqual({ state: "error", message: "Failed" });
+		finish();
+		expect(last()).toEqual({ state: "error", message: "Failed" });
+	});
+
+	it("preserves background work on parent abort and returns to idle when released", () => {
+		const { reporter, send, last } = setup();
+		send({ type: "agent_start" });
+		const finish = reporter.beginBackgroundWork();
+		send({ type: "agent_settled", aborted: true });
+		expect(last()).toEqual({ state: "working" });
+		finish();
+		expect(last()).toEqual({ state: "idle" });
+	});
+
+	it("clears background work on reset without letting stale callbacks release new work", () => {
+		const { reporter, reports, send, last } = setup();
+		send({ type: "agent_start" }, assistantEnd("stop"));
+		const oldFinish = reporter.beginBackgroundWork();
+		send(settled);
+		reporter.reset();
+		expect(last()).toEqual({ state: "idle" });
+		const newFinish = reporter.beginBackgroundWork();
+		const count = reports.length;
+		oldFinish();
+		expect(reports).toHaveLength(count);
+		expect(last()).toEqual({ state: "working" });
+		newFinish();
+		expect(last()).toEqual({ state: "idle" });
+	});
+
+	it("preserves normal completion and errors when extension UI is torn down", () => {
+		const { reporter, reports, send, last } = setup();
+		send({ type: "agent_start" }, assistantEnd("stop"), settled);
+		reporter.clearBackgroundWork();
+		expect(last()).toEqual({ state: "done" });
+		expect(reports).toHaveLength(2);
+		const finish = reporter.beginBackgroundWork();
+		send({ type: "agent_start" }, assistantEnd("error", "Failed"), settled);
+		reporter.clearBackgroundWork();
+		finish();
+		expect(last()).toEqual({ state: "error", message: "Failed" });
+	});
+
+	it("does not report abandoned background work as completed on teardown", () => {
+		const { reporter, reports, send, last } = setup();
+		send({ type: "agent_start" });
+		const finish = reporter.beginBackgroundWork();
+		send(assistantEnd("stop"), settled);
+		reporter.clearBackgroundWork();
+		expect(last()).toEqual({ state: "idle" });
+		finish();
+		expect(reports.map(({ state }) => state)).toEqual(["working", "idle"]);
+	});
+
 	it("returns to idle when the session is replaced", () => {
 		const { reporter, send, last } = setup();
 		send({ type: "agent_start" }, assistantEnd("stop"), settled);

@@ -10,8 +10,9 @@ function firstLine(text: string | undefined): string {
 
 /**
  * Reports interactive-mode state to the terminal (OSC 7501): `working` during agent runs and
- * compaction, `blocked` while a dialog waits for the user, then `done`, `error`, or `idle` once the run
- * settles. Messages are limited to the session name, dialog titles, and the first line of errors; prompts
+ * compaction or registered background work, `blocked` while a dialog waits for the user, then
+ * `done`, `error`, or `idle` once the run settles. Messages are limited to the session name,
+ * dialog titles, and the first line of errors; prompts
  * and assistant output are never reported.
  */
 export class ProgramStatusReporter {
@@ -19,6 +20,7 @@ export class ProgramStatusReporter {
 	private readonly getSessionName: () => string | undefined;
 	private runActive = false;
 	private compacting = false;
+	private readonly backgroundWork = new Set<symbol>();
 	/** Outcome of the current run, reported once it settles. */
 	private runResult: ProgramStatus = { state: "done" };
 	/** Status while no run is active. */
@@ -83,10 +85,29 @@ export class ProgramStatusReporter {
 		this.report();
 	}
 
+	/** Keep the terminal working until the returned idempotent callback releases this registration. */
+	beginBackgroundWork(): () => void {
+		const token = Symbol();
+		this.backgroundWork.add(token);
+		this.report();
+		return () => {
+			if (this.backgroundWork.delete(token)) this.report();
+		};
+	}
+
+	/** Forget pending extension work on teardown without claiming it completed. */
+	clearBackgroundWork(): void {
+		if (this.backgroundWork.size === 0) return;
+		this.backgroundWork.clear();
+		if (this.restingStatus.state === "done") this.restingStatus = { state: "idle" };
+		this.report();
+	}
+
 	/** Forget the previous session's run, for example after switching sessions. */
 	reset(): void {
 		this.runActive = false;
 		this.compacting = false;
+		this.backgroundWork.clear();
 		this.runResult = { state: "done" };
 		this.restingStatus = { state: "idle" };
 		this.report();
@@ -104,7 +125,9 @@ export class ProgramStatusReporter {
 		const blocked = [...this.blocked.values()].at(-1);
 		if (blocked) return { state: "blocked", ...blocked };
 		if (this.compacting) return { state: "working", message: "Compacting context" };
-		const status = this.runActive ? { state: "working" as const } : this.restingStatus;
+		// Background work must not hide a stopped parent run's error.
+		const working = this.runActive || (this.backgroundWork.size > 0 && this.restingStatus.state !== "error");
+		const status = working ? { state: "working" as const } : this.restingStatus;
 		if (status.state === "working" || status.state === "done") return { ...status, message: this.getSessionName() };
 		return status;
 	}
