@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
+import { stripBom } from "../utils/text.ts";
 
 export interface PiManifest {
 	extensions?: string[];
 	skills?: string[];
 	prompts?: string[];
 	themes?: string[];
+	changelogPath?: string;
 }
 
 const RESOURCE_FIELDS = ["extensions", "skills", "prompts", "themes"] as const;
@@ -15,7 +17,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 export function readPiManifest(packageJsonPath: string): PiManifest | null {
 	try {
-		const pkg: unknown = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
+		const pkg: unknown = JSON.parse(stripBom(readFileSync(packageJsonPath, "utf-8")));
 		if (!isObject(pkg) || !isObject(pkg.pi)) {
 			return null;
 		}
@@ -27,6 +29,12 @@ export function readPiManifest(packageJsonPath: string): PiManifest | null {
 				manifest[field] = entries;
 			}
 		}
+
+		const changelogPath = pkg.pi.changelogPath;
+		if (typeof changelogPath === "string") {
+			manifest.changelogPath = changelogPath;
+		}
+
 		return manifest;
 	} catch {
 		return null;

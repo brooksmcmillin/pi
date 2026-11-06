@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
-import { getModel } from "../src/compat.ts";
+import { getModel, normalizeContext } from "../src/compat.ts";
 import type { Model } from "../src/types.ts";
 
 interface FakeOpenAIClientOptions {
@@ -99,10 +99,10 @@ describe("openai-completions prompt caching", () => {
 	) {
 		await streamOpenAICompletions(
 			model,
-			{
+			normalizeContext({
 				systemPrompt: "sys",
 				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
-			},
+			}),
 			{ apiKey: "test-key", ...options },
 		).result();
 
@@ -151,6 +151,90 @@ describe("openai-completions prompt caching", () => {
 		expect(payload?.prompt_cache_retention).toBeUndefined();
 	});
 
+	it.each([undefined, "short", "long"] as const)(
+		"sends a stable cache key through an opted-in proxy with retention %s",
+		async (cacheRetention) => {
+			const model = createModel({
+				baseUrl: "https://proxy.example.com/v1",
+				compat: { promptCacheKeyMode: "enabled", supportsLongCacheRetention: false },
+			});
+			const options = { cacheRetention, sessionId: "session-proxy" };
+			const first = await captureRequest(options, model);
+			const repeated = await captureRequest(options, model);
+			const other = await captureRequest({ ...options, sessionId: "other-session" }, model);
+
+			expect(first.payload?.prompt_cache_key).toBe("session-proxy");
+			expect(repeated.payload?.prompt_cache_key).toBe(first.payload?.prompt_cache_key);
+			expect(other.payload?.prompt_cache_key).toBe("other-session");
+			expect(first.payload?.prompt_cache_retention).toBeUndefined();
+			expect(first.headers.session_id).toBeUndefined();
+		},
+	);
+
+	it.each([undefined, "auto"] as const)("preserves default proxy behavior with mode %s", async (mode) => {
+		const model = createModel({
+			baseUrl: "https://proxy.example.com/v1",
+			compat: mode ? { promptCacheKeyMode: mode } : undefined,
+		});
+		const short = await captureRequest({ sessionId: "session-proxy" }, model);
+		const long = await captureRequest({ cacheRetention: "long", sessionId: "session-proxy" }, model);
+
+		expect(short.payload?.prompt_cache_key).toBeUndefined();
+		expect(long.payload?.prompt_cache_key).toBe("session-proxy");
+		expect(long.payload?.prompt_cache_retention).toBe("24h");
+	});
+
+	it("respects disabled caching on an opted-in proxy", async () => {
+		process.env.PI_CACHE_RETENTION = "long";
+		const model = createModel({
+			baseUrl: "https://proxy.example.com/v1",
+			compat: { promptCacheKeyMode: "enabled" },
+		});
+		const { payload } = await captureRequest({ cacheRetention: "none", sessionId: "session-proxy" }, model);
+
+		expect(payload?.prompt_cache_key).toBeUndefined();
+		expect(payload?.prompt_cache_retention).toBeUndefined();
+	});
+
+	it.each(["short", "long"] as const)("allows disabling cache keys with %s retention", async (cacheRetention) => {
+		const model = createModel({ compat: { promptCacheKeyMode: "disabled" } });
+		const { payload } = await captureRequest({ cacheRetention, sessionId: "session-disabled" }, model);
+
+		expect(payload?.prompt_cache_key).toBeUndefined();
+		expect(payload?.prompt_cache_retention).toBe(cacheRetention === "long" ? "24h" : undefined);
+	});
+
+	it("lets a proxy disable cache keys independently of long retention", async () => {
+		const model = createModel({
+			baseUrl: "https://proxy.example.com/v1",
+			compat: { promptCacheKeyMode: "disabled", supportsLongCacheRetention: true },
+		});
+		const { payload } = await captureRequest({ cacheRetention: "long", sessionId: "session-proxy" }, model);
+
+		expect(payload?.prompt_cache_key).toBeUndefined();
+		expect(payload?.prompt_cache_retention).toBe("24h");
+	});
+
+	it("does not invent an identity for an opted-in proxy", async () => {
+		const model = createModel({
+			baseUrl: "https://proxy.example.com/v1",
+			compat: { promptCacheKeyMode: "enabled" },
+		});
+		const { payload } = await captureRequest({}, model);
+
+		expect(payload?.prompt_cache_key).toBeUndefined();
+	});
+
+	it("clamps proxy cache keys to 64 Unicode characters", async () => {
+		const model = createModel({
+			baseUrl: "https://proxy.example.com/v1",
+			compat: { promptCacheKeyMode: "enabled" },
+		});
+		const { payload } = await captureRequest({ sessionId: "𐐀".repeat(67) }, model);
+
+		expect(payload?.prompt_cache_key).toBe("𐐀".repeat(64));
+	});
+
 	it("uses PI_CACHE_RETENTION for direct OpenAI requests", async () => {
 		process.env.PI_CACHE_RETENTION = "long";
 		const { payload } = await captureRequest({ sessionId: "session-env" });
@@ -171,7 +255,7 @@ describe("openai-completions prompt caching", () => {
 		expect(headers["x-session-affinity"]).toBe("session-affinity");
 	});
 
-	it.each(["accounts/fireworks/models/glm-5p2", "accounts/fireworks/routers/glm-5p2-fast"] as const)(
+	it.each(["accounts/fireworks/models/glm-5p3", "accounts/fireworks/routers/glm-5p3-fast"] as const)(
 		"sends Fireworks session affinity for %s",
 		async (modelId) => {
 			const model = getModel("fireworks", modelId);
@@ -180,6 +264,14 @@ describe("openai-completions prompt caching", () => {
 			expect(headers["x-session-affinity"]).toBe("fireworks-session");
 		},
 	);
+
+	it("sends Baseten session affinity for built-in catalog models", async () => {
+		const model = getModel("baseten", "zai-org/GLM-5.2");
+		const { headers } = await captureRequest({ sessionId: "baseten-catalog-session" }, model);
+
+		expect(headers["x-session-affinity"]).toBe("baseten-catalog-session");
+		expect(headers["x-client-request-id"]).toBe("baseten-catalog-session");
+	});
 
 	it("uses OpenAI no-session format when configured", async () => {
 		const model = createModel({
@@ -210,12 +302,8 @@ describe("openai-completions prompt caching", () => {
 		expect(headers["x-session-affinity"]).toBeUndefined();
 	});
 
-	it("auto-detects OpenRouter session-affinity header for OpenRouter endpoints", async () => {
-		const model = createModel({
-			provider: "openrouter",
-			baseUrl: "https://openrouter.ai/api/v1",
-			compat: { sendSessionAffinityHeaders: true },
-		});
+	it("sends OpenRouter session-affinity header by default for built-in OpenRouter models", async () => {
+		const model = getModel("openrouter", "auto");
 		const { payload, headers } = await captureRequest({ sessionId: "session-openrouter" }, model);
 
 		expect(payload?.session_id).toBeUndefined();
@@ -230,6 +318,7 @@ describe("openai-completions prompt caching", () => {
 		const model = createModel({
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
+			compat: { sendSessionAffinityHeaders: false },
 		});
 		const { payload, headers } = await captureRequest({ sessionId: "session-openrouter" }, model);
 

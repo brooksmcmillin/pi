@@ -1,5 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
-import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type {
@@ -156,6 +156,43 @@ describe("TreeSelectorComponent", () => {
 			expect(list.getSelectedNode()?.entry.id).toBe("user-2");
 		});
 
+		test("hides context edits by default and labels them in all mode", () => {
+			const entries: SessionEntry[] = [
+				userMessage("user-1", null, "hello"),
+				assistantMessage("asst-1", "user-1", "hi"),
+				{
+					type: "context_edit",
+					id: "edit-1",
+					parentId: "asst-1",
+					timestamp: new Date().toISOString(),
+					targetId: "asst-1",
+					replacement: null,
+				},
+			];
+			const tree = buildTree(entries);
+			const defaultSelector = new TreeSelectorComponent(
+				tree,
+				"edit-1",
+				24,
+				() => {},
+				() => {},
+			);
+			expect(defaultSelector.getTreeList().getSelectedNode()?.entry.id).toBe("asst-1");
+
+			const allSelector = new TreeSelectorComponent(
+				tree,
+				"edit-1",
+				24,
+				() => {},
+				() => {},
+				undefined,
+				undefined,
+				"all",
+			);
+			const rendered = allSelector.getTreeList().render(200).map(stripVTControlCharacters).join("\n");
+			expect(rendered).toContain("[context omit: asst-1]");
+		});
+
 		test("focuses nearest visible ancestor when currentLeafId is a thinking_level_change entry", () => {
 			// Similar structure with thinking_level_change instead of model_change
 			const entries = [
@@ -270,6 +307,73 @@ describe("TreeSelectorComponent", () => {
 			expect(plain).toContain("label time");
 			expect(plain).not.toContain("...");
 			expect(plainLines.every((line) => visibleWidth(line) <= 30)).toBe(true);
+		});
+	});
+
+	describe("search cursor", () => {
+		test("renders the cursor only while the selector is focused", () => {
+			const tree = buildTree([userMessage("user-1", null, "hello")]);
+			const selector = new TreeSelectorComponent(
+				tree,
+				"user-1",
+				24,
+				() => {},
+				() => {},
+			);
+
+			expect(selector.render(80).join("\n")).not.toContain(CURSOR_MARKER);
+
+			selector.focused = true;
+			const focusedLines = selector.render(80);
+			const cursorLines = focusedLines.filter((line) => line.includes(CURSOR_MARKER));
+			expect(cursorLines).toHaveLength(1);
+			expect(stripVTControlCharacters(cursorLines[0]!.replace(CURSOR_MARKER, ""))).toBe("  Type to search:  ");
+			expect(cursorLines[0]).toContain(`${CURSOR_MARKER}\x1b[7m \x1b[27m`);
+
+			selector.focused = false;
+			expect(selector.render(80).join("\n")).not.toContain(CURSOR_MARKER);
+		});
+
+		test("moves focus to the label input and restores it after cancellation", () => {
+			const tree = buildTree([userMessage("user-1", null, "hello")]);
+			const selector = new TreeSelectorComponent(
+				tree,
+				"user-1",
+				24,
+				() => {},
+				() => {},
+			);
+			selector.focused = true;
+
+			selector.handleInput("L");
+			let rendered = selector.render(80);
+			let cursorLineIndex = rendered.findIndex((line) => line.includes(CURSOR_MARKER));
+			expect(cursorLineIndex).toBeGreaterThan(0);
+			expect(stripVTControlCharacters(rendered[cursorLineIndex - 1]!)).toContain("Label (empty to remove):");
+			expect(rendered.filter((line) => line.includes(CURSOR_MARKER))).toHaveLength(1);
+
+			selector.handleInput("\x1b");
+			rendered = selector.render(80);
+			cursorLineIndex = rendered.findIndex((line) => line.includes(CURSOR_MARKER));
+			expect(stripVTControlCharacters(rendered[cursorLineIndex]!)).toContain("Type to search:");
+			expect(rendered.filter((line) => line.includes(CURSOR_MARKER))).toHaveLength(1);
+		});
+
+		test("keeps the cursor within narrow terminal widths", () => {
+			const tree = buildTree([userMessage("user-1", null, "hello")]);
+			const selector = new TreeSelectorComponent(
+				tree,
+				"user-1",
+				24,
+				() => {},
+				() => {},
+			);
+			selector.focused = true;
+			selector.handleInput("a long search query");
+
+			const cursorLine = selector.render(10).find((line) => line.includes(CURSOR_MARKER));
+			expect(cursorLine).toBeDefined();
+			expect(visibleWidth(cursorLine!)).toBeLessThanOrEqual(10);
 		});
 	});
 

@@ -1,9 +1,11 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { describe, expect, test } from "vitest";
+import type { TuiMouseEvent } from "@earendil-works/pi-tui";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
+import * as syntaxHighlight from "../src/utils/syntax-highlight.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -33,6 +35,37 @@ function createAssistantMessage(
 }
 
 describe("AssistantMessageComponent", () => {
+	afterEach(() => vi.restoreAllMocks());
+
+	test("reuses its Markdown across streaming and its end, and renders like a new component after a theme change", () => {
+		initTheme("dark");
+		const highlight = vi.spyOn(syntaxHighlight, "highlight");
+		const streaming: boolean[] = [];
+		const code = "```ts\nconst a = 1;\n```";
+		const content = (text: string): AssistantMessage["content"] => [
+			{ type: "thinking", thinking: "Thinking with **bold** text" },
+			{ type: "text", text },
+		];
+		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking...", 1, [
+			(markdown, { isStreaming }) => {
+				streaming.push(isStreaming);
+				return markdown;
+			},
+		]);
+		component.updateContent(createAssistantMessage(content(code)), true);
+		component.render(80);
+		const message = createAssistantMessage(content(`${code}\n\nThe end.`));
+		component.updateContent(message, false);
+		component.render(80);
+		expect(highlight).toHaveBeenCalledTimes(1);
+		expect(streaming.at(-1)).toBe(false);
+
+		initTheme("light");
+		component.invalidate();
+		expect(component.render(80)).toEqual(new AssistantMessageComponent(message).render(80));
+		initTheme("dark");
+	});
+
 	test("adds OSC 133 zone markers to assistant messages without tool calls", () => {
 		initTheme("dark");
 
@@ -89,6 +122,83 @@ describe("AssistantMessageComponent", () => {
 
 		expect(rendered.match(/Thinking\.\.\./g)).toHaveLength(1);
 		expect(rendered).toContain("answer");
+	});
+
+	test("renders nothing for hidden thinking with an empty label", () => {
+		initTheme("dark");
+
+		const thinkingOnly = new AssistantMessageComponent(
+			createAssistantMessage(
+				[
+					{ type: "thinking", thinking: "reasoning" },
+					{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "file.txt" } },
+				],
+				{ stopReason: "toolUse" },
+			),
+			true,
+			undefined,
+			"",
+		);
+		expect(thinkingOnly.render(80)).toEqual([]);
+
+		const withText = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "thinking", thinking: "reasoning" },
+				{ type: "text", text: "answer" },
+			]),
+			true,
+			undefined,
+			"",
+		);
+		expect(withText.render(80).map((line) => stripAnsi(line).trim())).toEqual(["", "answer"]);
+	});
+
+	test("keeps label row and spacing for hidden thinking with a label", () => {
+		initTheme("dark");
+
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "thinking", thinking: "reasoning" },
+				{ type: "text", text: "answer" },
+			]),
+			true,
+		);
+		expect(component.render(80).map((line) => stripAnsi(line).trim())).toEqual(["", "Thinking...", "", "answer"]);
+	});
+
+	test("collapses individual thinking runs when clicked", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "thinking", thinking: "first reasoning" },
+				{ type: "text", text: "answer" },
+				{ type: "thinking", thinking: "second reasoning" },
+			]),
+		);
+		const width = 80;
+		const lines = component.render(width);
+		const firstThinkingRow = lines.findIndex((line) => stripAnsi(line).includes("first reasoning"));
+		expect(firstThinkingRow).toBeGreaterThanOrEqual(0);
+		const event: TuiMouseEvent = {
+			type: "click",
+			button: "left",
+			x: 1,
+			y: firstThinkingRow,
+			screenX: 1,
+			screenY: firstThinkingRow,
+			width,
+			height: lines.length,
+			shift: false,
+			alt: false,
+			ctrl: false,
+			clickCount: 1,
+		};
+		expect(component.handleMouse(event)?.handled).toBe(true);
+
+		const collapsed = stripAnsi(component.render(width).join("\n"));
+		expect(collapsed).not.toContain("first reasoning");
+		expect(collapsed).toContain("Thinking...");
+		expect(collapsed).toContain("second reasoning");
 	});
 
 	test("uses configured output padding for text and thinking", () => {
