@@ -27,6 +27,7 @@ vi.mock("../../../src/modes/interactive/components/bash-execution.js", () => ({
 	BashExecutionComponent: class {
 		appendOutput(): void {}
 		setComplete(): void {}
+		setExpanded(): void {}
 	},
 }));
 
@@ -125,6 +126,7 @@ type InteractiveBashContext = {
 	pendingBashComponents: unknown[];
 	isBashMode: boolean;
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
+	executeUserBash(session: Harness["session"], command: string, excludeFromContext: boolean): Promise<void>;
 	showError(message: string): void;
 	updateEditorBorderColor(): void;
 };
@@ -132,6 +134,12 @@ type InteractiveBashContext = {
 const interactiveModePrototype = InteractiveMode.prototype as unknown as {
 	setupEditorSubmitHandler(this: InteractiveBashContext): void;
 	handleBashCommand(this: InteractiveBashContext, command: string, excludeFromContext?: boolean): Promise<void>;
+	executeUserBash(
+		this: InteractiveBashContext,
+		session: Harness["session"],
+		command: string,
+		excludeFromContext: boolean,
+	): Promise<void>;
 };
 
 const localResult = {
@@ -177,6 +185,90 @@ const rpcCases: Array<{
 afterEach(() => {
 	rpcIo.outputLines = [];
 	rpcIo.lineHandler = undefined;
+});
+
+function deferred() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
+describe("user shell admission accounting", () => {
+	test.each(["rpc", "tui"] as const)(
+		"%s holds activity across hook, routing handoff and shell execution",
+		async (mode) => {
+			const hookEntered = deferred();
+			const hookRelease = deferred();
+			const shellEntered = deferred();
+			const shellRelease = deferred();
+			let handoffResult: unknown;
+			let harness!: Harness;
+			const attempt = () =>
+				harness.session.submitGuardedPrompt("autonomous", harness.session.ownerSnapshot, () => true, true);
+			const extension = (pi: ExtensionAPI) => {
+				pi.on("user_bash", async () => {
+					hookEntered.resolve();
+					await hookRelease.promise;
+					queueMicrotask(() => {
+						handoffResult = attempt();
+					});
+				});
+			};
+			const rpc = mode === "rpc" ? await startRpcHarness(extension) : undefined;
+			harness = rpc?.harness ?? (await createHarness({ extensionFactories: [extension] }));
+			const execute = vi.spyOn(harness.session, "executeBash").mockImplementation(async () => {
+				shellEntered.resolve();
+				await shellRelease.promise;
+				return localResult;
+			});
+			const context: InteractiveBashContext = {
+				defaultEditor: {},
+				editor: { addToHistory: vi.fn() },
+				session: harness.session,
+				sessionManager: harness.sessionManager,
+				ui: { requestRender: vi.fn() },
+				chatContainer: { addChild: vi.fn() },
+				pendingMessagesContainer: { addChild: vi.fn() },
+				pendingBashComponents: [],
+				isBashMode: true,
+				handleBashCommand: interactiveModePrototype.handleBashCommand,
+				executeUserBash: interactiveModePrototype.executeUserBash,
+				showError: vi.fn(),
+				updateEditorBorderColor: vi.fn(),
+			};
+			let completion = Promise.resolve();
+			try {
+				if (rpc) rpc.send({ id: "tracked-shell", type: "bash", command: "offline fixture" });
+				else {
+					interactiveModePrototype.setupEditorSubmitHandler.call(context);
+					completion = Promise.resolve(context.defaultEditor.onSubmit?.("!offline fixture"));
+				}
+				await hookEntered.promise;
+				expect(attempt()).toEqual({ status: "rejected", reason: "busy" });
+				hookRelease.resolve();
+				await shellEntered.promise;
+				expect(handoffResult).toEqual({ status: "rejected", reason: "busy" });
+				expect(attempt()).toEqual({ status: "rejected", reason: "busy" });
+				shellRelease.resolve();
+				await completion;
+				if (rpc)
+					await vi.waitFor(() =>
+						expect(parseOutputLines()).toContainEqual(
+							expect.objectContaining({ id: "tracked-shell", success: true }),
+						),
+					);
+				expect(harness.session.pendingMessageCount).toBe(0);
+			} finally {
+				hookRelease.resolve();
+				shellRelease.resolve();
+				execute.mockRestore();
+				if (rpc) rpc.cleanup();
+				else harness.cleanup();
+			}
+		},
+	);
 });
 
 describe("RPC user_bash failure handling (#9068)", () => {
@@ -247,6 +339,7 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 			pendingBashComponents: [],
 			isBashMode: true,
 			handleBashCommand: interactiveModePrototype.handleBashCommand,
+			executeUserBash: interactiveModePrototype.executeUserBash,
 			showError: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
 		};

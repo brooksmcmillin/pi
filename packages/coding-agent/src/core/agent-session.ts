@@ -120,6 +120,7 @@ import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./m
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
+import type { AdmissionResult, OwnerActivity, OwnerSnapshot } from "./owner-activity.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
@@ -410,6 +411,8 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
+	private _ownerActivity: OwnerActivity;
+	private _disposed = false;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -521,6 +524,7 @@ export class AgentSession {
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
+		this._ownerActivity = config.resourceLoader.getExtensions().runtime.ownerActivity;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._modelRuntime = config.modelRuntime;
@@ -556,6 +560,65 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
+	}
+
+	/** Internal admission snapshot; the extension-facing capability API is a separate layer. */
+	get ownerSnapshot(): OwnerSnapshot {
+		return this._ownerActivity.snapshot;
+	}
+
+	/** Runtime replacement preserves outstanding activity from the outgoing session. */
+	inheritOwnerActivity(previous: AgentSession): void {
+		this._ownerActivity.inherit(previous._ownerActivity);
+		this._ownerActivity = previous._ownerActivity;
+		this._resourceLoader.getExtensions().runtime.ownerActivity = this._ownerActivity;
+	}
+
+	/** Host entrypoints use this around routing, including asynchronous user_bash interception. */
+	trackOwnerActivity<T>(operation: () => Promise<T>): Promise<T> {
+		return this._ownerActivity.track(operation);
+	}
+
+	/** Human input fences pending requests; it does not abort a running mutation. */
+	notifyHumanInput(): void {
+		this._ownerActivity.intervene();
+	}
+
+	/** Fence pending requests before a session replacement begins its asynchronous hooks. */
+	invalidateOwner(): void {
+		this._ownerActivity.invalidate();
+	}
+
+	/**
+	 * Internal guarded submission. `supported` must come from a validated cooperative backend,
+	 * never from wire input. Completion joins registered JS work, not subprocess settlement.
+	 */
+	submitGuardedPrompt(
+		text: string,
+		expected: OwnerSnapshot,
+		authorize: () => boolean,
+		supported = false,
+	): AdmissionResult<void> {
+		if (this._disposed) return { status: "rejected", reason: "stale" };
+		if (
+			this._ownerActivity.busy ||
+			!this.isIdle ||
+			this._promptPreflightCount > 0 ||
+			this.isBashRunning ||
+			this.agent.hasQueuedMessages()
+		) {
+			return { status: "rejected", reason: "busy" };
+		}
+		if (runtimeStreamFunctions.get(this.agent.streamFunction) !== this._modelRuntime) {
+			return { status: "rejected", reason: "unsupported" };
+		}
+		const commandName = text.startsWith("/") ? text.slice(1).split(" ", 1)[0] : undefined;
+		if (commandName && this._extensionRunner.getCommand(commandName)) {
+			return { status: "rejected", reason: "unsupported" };
+		}
+		return this._ownerActivity.submit(expected, authorize, supported, () =>
+			this.prompt(text, { source: "extension" }),
+		);
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -821,7 +884,7 @@ export class AgentSession {
 				this._emit(event);
 			},
 		});
-		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+		return this._ownerActivity.track(() => this._nestedToolCalls!.execute(parentToolCallId, name, args, options));
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -870,6 +933,7 @@ export class AgentSession {
 				return { previous, context: previous?.context ?? canonicalContext, projection };
 			};
 			let { previous, context, projection } = await prepare();
+			this._ownerActivity.assertCurrent();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
@@ -887,6 +951,7 @@ export class AgentSession {
 				failed,
 				state,
 			});
+			this._ownerActivity.assertCurrent();
 			if (route.state !== undefined && route.state !== state) {
 				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
 				const entry = this.sessionManager.getEntry(
@@ -1475,6 +1540,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._disposed = true;
+		this._ownerActivity.invalidate();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1946,6 +2013,7 @@ export class AgentSession {
 		let messages: AgentMessage[];
 		try {
 			messages = await this._prepareRun(trigger);
+			this._ownerActivity.assertCurrent();
 		} catch (error) {
 			this._isAgentRunActive = false;
 			this._flushPendingBashMessages();
@@ -1968,6 +2036,7 @@ export class AgentSession {
 		try {
 			await this.agent.prompt(messages);
 			while (!this._agentRunAbortRequested) {
+				this._ownerActivity.assertCurrent();
 				if (await this._handlePostAgentRun()) {
 					if (this._agentRunAbortRequested) break;
 					await this.agent.continue();
@@ -2002,7 +2071,9 @@ export class AgentSession {
 		}
 
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		this._ownerActivity.assertCurrent();
 		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
+		this._ownerActivity.assertCurrent();
 		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 		// which updates the live loadout instead. An explicit edit wins; otherwise the live
 		// loadout is authoritative, so a setActiveTools() call is not undone here.
@@ -2160,7 +2231,13 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (!this._ownerActivity.guarded && options?.source !== "extension") this._ownerActivity.intervene();
+		return this._ownerActivity.track(() => this._prompt(text, options));
+	}
+
+	private async _prompt(text: string, options?: PromptOptions): Promise<void> {
 		if (this._isEmittingAgentSettled) {
+			if (this._ownerActivity.guarded) throw new Error("Autonomous request is busy");
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
 		}
@@ -2192,6 +2269,7 @@ export class AgentSession {
 		} finally {
 			this._promptPreflightCount--;
 		}
+		this._ownerActivity.assertCurrent();
 		if (trigger) await this._startRun(trigger, () => preflightResult?.("started"));
 	}
 
@@ -2214,6 +2292,7 @@ export class AgentSession {
 			preflightResult?.("handled");
 			return undefined;
 		}
+		this._ownerActivity.assertCurrent();
 		const { text: currentText, images: currentImages } = processedInput;
 
 		// Expand skill commands (/skill:name args) and prompt templates (/template args)
@@ -2223,6 +2302,8 @@ export class AgentSession {
 			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 		}
 
+		// Guarded requests must never fall through to the normal human-input queues.
+		if (this._ownerActivity.guarded && this.isStreaming) throw new Error("Autonomous request is busy");
 		// If streaming, queue via steer() or followUp() based on option
 		if (this.isStreaming) {
 			if (!options?.streamingBehavior) {
@@ -2273,6 +2354,7 @@ export class AgentSession {
 
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return false;
+		if (this._ownerActivity.guarded) throw new Error("Autonomous extension commands are unsupported");
 
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
@@ -2365,7 +2447,10 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
-		return this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+		if (options?.source !== "extension") this._ownerActivity.intervene();
+		return this._ownerActivity.track(() =>
+			this._queueUserInput(text, images, "steer", options?.source ?? "interactive"),
+		);
 	}
 
 	/**
@@ -2381,7 +2466,10 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
-		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+		if (options?.source !== "extension") this._ownerActivity.intervene();
+		return this._ownerActivity.track(() =>
+			this._queueUserInput(text, images, "followUp", options?.source ?? "interactive"),
+		);
 	}
 
 	/**
@@ -2461,6 +2549,13 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		return this._ownerActivity.track(() => this._sendCustomMessage(message, options));
+	}
+
+	private async _sendCustomMessage<T = unknown>(
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<void> {
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -2480,6 +2575,7 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			if (this._isEmittingAgentSettled) {
+				if (this._ownerActivity.guarded) throw new Error("Autonomous request is busy");
 				this._deferredSettledActions.push(async () => await this.sendCustomMessage(message, options));
 				return;
 			}
@@ -2599,6 +2695,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this._ownerActivity.intervene();
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
 		}
@@ -2921,6 +3018,10 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		return this._ownerActivity.track(() => this._compact(customInstructions));
+	}
+
+	private async _compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
@@ -3716,6 +3817,18 @@ export class AgentSession {
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
 			toolRegistry.set(tool.name, tool);
 		}
+		for (const [name, tool] of toolRegistry) {
+			toolRegistry.set(name, {
+				...tool,
+				execute: (...args) =>
+					this._ownerActivity.track(() => {
+						if (this._ownerActivity.guarded && ["bash", "powershell", "grep", "find"].includes(name)) {
+							throw new Error("Autonomous subprocess tools require a supported settlement backend");
+						}
+						return tool.execute(...args);
+					}),
+			});
+		}
 		this._toolRegistry = toolRegistry;
 
 		const nextActiveToolNames = (
@@ -3813,6 +3926,11 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		this._ownerActivity.invalidate();
+		return this._ownerActivity.track(() => this._reload(options));
+	}
+
+	private async _reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before reloading.");
 		}
@@ -3836,6 +3954,8 @@ export class AgentSession {
 		this.syncQueueModesFromSettings();
 		resetApiProviders();
 		await this._resourceLoader.reload();
+		this._resourceLoader.getExtensions().runtime.ownerActivity.inherit(this._ownerActivity);
+		this._resourceLoader.getExtensions().runtime.ownerActivity = this._ownerActivity;
 		// Activate tools newly added to defaultTools. Removed ones stay active, and tools disabled
 		// during the session stay disabled unless the setting newly adds them.
 		const addedDefaultTools = getDefaultTools().filter((name) => !previousDefaultTools.has(name));
@@ -4005,6 +4125,17 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
+		return this._ownerActivity.track(() => this._executeBash(command, onChunk, options));
+	}
+
+	private async _executeBash(
+		command: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
+	): Promise<BashResult> {
+		if (this._ownerActivity.guarded) {
+			throw new Error("Autonomous shells require a supported subprocess settlement backend");
+		}
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
 
@@ -4027,6 +4158,7 @@ export class AgentSession {
 				},
 			);
 
+			this._ownerActivity.assertCurrent();
 			this.recordBashResult(command, result, options);
 			return result;
 		} finally {
@@ -4126,6 +4258,14 @@ export class AgentSession {
 	async navigateTree(
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		this._ownerActivity.invalidate();
+		return this._ownerActivity.track(() => this._navigateTree(targetId, options));
+	}
+
+	private async _navigateTree(
+		targetId: string,
+		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.isStreaming || this._promptPreflightCount > 0) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");

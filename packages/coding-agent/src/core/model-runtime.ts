@@ -72,6 +72,7 @@ import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
+import { OwnerActivity } from "./owner-activity.ts";
 import {
 	type AuthStatus,
 	type CompatibilityRequestConfig,
@@ -726,6 +727,7 @@ export class ModelRuntime implements Models {
 					model,
 					options as (StreamOptions & ModelsRequestTransforms) | undefined,
 				);
+				OwnerActivity.dispatchRequest();
 				return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
 			},
 			undefined,
@@ -773,6 +775,7 @@ export class ModelRuntime implements Models {
 			async () => {
 				assertChatModel(model);
 				const prepared = await this.prepareRequest(model, options);
+				OwnerActivity.dispatchRequest();
 				return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
 			},
 			undefined,
@@ -797,6 +800,7 @@ export class ModelRuntime implements Models {
 				if (!prepared.provider.fetchDeferred) {
 					throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
 				}
+				OwnerActivity.dispatchRequest();
 				return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
 			},
 			undefined,
@@ -822,6 +826,7 @@ export class ModelRuntime implements Models {
 		if (!prepared.provider.cancelDeferred) {
 			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
 		}
+		OwnerActivity.dispatchRequest();
 		await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
 	}
 
@@ -836,6 +841,7 @@ export class ModelRuntime implements Models {
 			if (!prepared.provider.generateImages) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
 			}
+			OwnerActivity.dispatchRequest();
 			return await prepared.provider.generateImages(prepared.model, context, prepared.options as ImagesOptions);
 		} catch (error) {
 			return imageErrorResult(model, error, options?.signal?.aborted);
@@ -854,6 +860,7 @@ export class ModelRuntime implements Models {
 			if (!prepared.provider.classify) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support classification`);
 			}
+			OwnerActivity.dispatchRequest();
 			return await prepared.provider.classify(prepared.model, context, prepared.options as ClassifierOptions);
 		} catch (error) {
 			return classifierErrorResult(model, error, options?.signal?.aborted);

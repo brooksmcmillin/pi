@@ -178,6 +178,7 @@ export class AgentSessionRuntime {
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
+		result.session.inheritOwnerActivity(this._session);
 		this._session = result.session;
 		this._services = result.services;
 		this._diagnostics = result.diagnostics;
@@ -194,6 +195,18 @@ export class AgentSessionRuntime {
 	}
 
 	async switchSession(
+		sessionPath: string,
+		options?: {
+			cwdOverride?: string;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+			projectTrustContextFactory?: (cwd: string) => ProjectTrustContext;
+		},
+	): Promise<{ cancelled: boolean }> {
+		this.session.invalidateOwner();
+		return this.session.trackOwnerActivity(() => this._switchSession(sessionPath, options));
+	}
+
+	private async _switchSession(
 		sessionPath: string,
 		options?: {
 			cwdOverride?: string;
@@ -224,6 +237,15 @@ export class AgentSessionRuntime {
 	}
 
 	async newSession(options?: {
+		parentSession?: string;
+		setup?: (sessionManager: SessionManager) => Promise<void>;
+		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+	}): Promise<{ cancelled: boolean }> {
+		this.session.invalidateOwner();
+		return this.session.trackOwnerActivity(() => this._newSession(options));
+	}
+
+	private async _newSession(options?: {
 		parentSession?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
@@ -260,6 +282,14 @@ export class AgentSessionRuntime {
 	}
 
 	async fork(
+		entryId: string,
+		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		this.session.invalidateOwner();
+		return this.session.trackOwnerActivity(() => this._fork(entryId, options));
+	}
+
+	private async _fork(
 		entryId: string,
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
@@ -357,6 +387,11 @@ export class AgentSessionRuntime {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		this.session.invalidateOwner();
+		return this.session.trackOwnerActivity(() => this._importFromJsonl(inputPath, cwdOverride));
+	}
+
+	private async _importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
 		const resolvedPath = resolvePath(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
@@ -407,6 +442,7 @@ export class AgentSessionRuntime {
 	 * is saved would lose the login (#11692).
 	 */
 	async dispose(): Promise<void> {
+		this.session.invalidateOwner();
 		await this.session.abort();
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",

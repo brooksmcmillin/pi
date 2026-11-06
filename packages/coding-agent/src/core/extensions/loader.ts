@@ -17,6 +17,7 @@ import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
 import { type McpServerConfig, McpServerRegistry, validateMcpServerConfig } from "../mcp-servers.ts";
+import { OwnerActivity } from "../owner-activity.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
@@ -174,6 +175,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	};
 
 	const runtime: ExtensionRuntime = {
+		ownerActivity: new OwnerActivity(),
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
 		appendEntry: notInitialized,
@@ -422,7 +424,12 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			return runtime.ownerActivity.track(async () => {
+				if (runtime.ownerActivity.guarded) {
+					throw new Error("Autonomous pi.exec requires a supported subprocess settlement backend");
+				}
+				return execCommand(command, args, options?.cwd ?? cwd, options);
+			});
 		},
 
 		getActiveTools(): string[] {
