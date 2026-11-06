@@ -1,16 +1,12 @@
 import { createInterface } from "node:readline";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Text } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
 import path from "path";
 import { type Static, Type } from "typebox";
-import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
-import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
-import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
-import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.ts";
-import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
+import { findRenderers } from "./renderers/find.ts";
+import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
 
 /** Relativize a find result against the search root and normalize it to posix separators. */
@@ -70,56 +66,6 @@ export interface FindToolOptions {
 	operations?: FindOperations;
 }
 
-function formatFindCall(args: { pattern: string; path?: string; limit?: number } | undefined, theme: Theme): string {
-	const pattern = str(args?.pattern);
-	const rawPath = str(args?.path);
-	const path = rawPath !== null ? shortenPath(rawPath || ".") : null;
-	const limit = args?.limit;
-	const invalidArg = invalidArgText(theme);
-	let text =
-		theme.fg("toolTitle", theme.bold("find")) +
-		" " +
-		(pattern === null ? invalidArg : theme.fg("accent", pattern || "")) +
-		theme.fg("toolOutput", ` in ${path === null ? invalidArg : path}`);
-	if (limit !== undefined) {
-		text += theme.fg("toolOutput", ` (limit ${limit})`);
-	}
-	return text;
-}
-
-function formatFindResult(
-	result: {
-		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
-		details?: FindToolDetails;
-	},
-	options: ToolRenderResultOptions,
-	theme: Theme,
-	showImages: boolean,
-): string {
-	const output = getTextOutput(result, showImages).trim();
-	let text = "";
-	if (output) {
-		const lines = output.split("\n");
-		const maxLines = options.expanded ? lines.length : 20;
-		const displayLines = lines.slice(0, maxLines);
-		const remaining = lines.length - maxLines;
-		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
-		if (remaining > 0) {
-			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-		}
-	}
-
-	const resultLimit = result.details?.resultLimitReached;
-	const truncation = result.details?.truncation;
-	if (resultLimit || truncation?.truncated) {
-		const warnings: string[] = [];
-		if (resultLimit) warnings.push(`${resultLimit} results limit`);
-		if (truncation?.truncated) warnings.push(`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit`);
-		text += `\n${theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)}`;
-	}
-	return text;
-}
-
 export function createFindToolDefinition(
 	cwd: string,
 	options?: FindToolOptions,
@@ -136,7 +82,7 @@ export function createFindToolDefinition(
 			{ pattern, path: searchDir, limit }: { pattern: string; path?: string; limit?: number },
 			signal?: AbortSignal,
 			_onUpdate?,
-			_ctx?,
+			ctx?: ExtensionContext,
 		) {
 			return new Promise((resolve, reject) => {
 				if (signal?.aborted) {
@@ -161,8 +107,9 @@ export function createFindToolDefinition(
 
 				(async () => {
 					try {
-						const searchPath = resolveToCwd(searchDir || ".", cwd);
-						const effectiveLimit = limit ?? DEFAULT_LIMIT;
+						const searchPath = resolveToCwd(searchDir || ".", ctx?.cwd || cwd);
+						// fd treats --max-results 0 as unlimited, so a limit below 1 means 1.
+						const effectiveLimit = Math.max(1, Math.floor(limit ?? DEFAULT_LIMIT));
 						const ops = customOps ?? defaultFindOperations;
 
 						// If custom operations provide glob(), use that instead of fd.
@@ -175,9 +122,10 @@ export function createFindToolDefinition(
 								settle(() => reject(new Error("Operation aborted")));
 								return;
 							}
+							// One result past the limit tells "exactly N matches" apart from "more than N".
 							const results = await ops.glob(pattern, searchPath, {
 								ignore: ["**/node_modules/**", "**/.git/**"],
-								limit: effectiveLimit,
+								limit: effectiveLimit + 1,
 							});
 							if (signal?.aborted) {
 								settle(() => reject(new Error("Operation aborted")));
@@ -193,9 +141,11 @@ export function createFindToolDefinition(
 								return;
 							}
 
+							const resultLimitReached = results.length > effectiveLimit;
 							// Relativize paths against the search root for stable output.
-							const relativized = results.map((p) => relativizeFindResultPath(p, searchPath));
-							const resultLimitReached = relativized.length >= effectiveLimit;
+							const relativized = results
+								.slice(0, effectiveLimit)
+								.map((p) => relativizeFindResultPath(p, searchPath));
 							const rawOutput = relativized.join("\n");
 							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
 							let resultOutput = truncation.content;
@@ -249,7 +199,8 @@ export function createFindToolDefinition(
 							current = parent;
 						}
 						if (!insideGitRepo) args.push("--no-require-git");
-						args.push("--max-results", String(effectiveLimit));
+						// One result past the limit tells "exactly N matches" apart from "more than N" (#7121).
+						args.push("--max-results", String(effectiveLimit + 1));
 
 						// fd --glob matches against the basename unless --full-path is set; in --full-path
 						// mode it matches against the absolute candidate path, so a path-containing
@@ -269,7 +220,13 @@ export function createFindToolDefinition(
 						const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
-						const lines: string[] = [];
+						// Results within the limit, stored only up to the first one past the byte cap:
+						// truncateHead drops the rest anyway, so they are counted but not kept.
+						const storedResults: string[] = [];
+						let resultCount = 0;
+						// Byte size of all results within the limit, each counted with a trailing newline.
+						let outputBytes = 0;
+						let resultLimitReached = false;
 
 						stopChild = () => {
 							if (!child.killed) {
@@ -285,8 +242,17 @@ export function createFindToolDefinition(
 							stderr += chunk.toString();
 						});
 
-						rl.on("line", (line) => {
-							lines.push(line);
+						rl.on("line", (rawLine) => {
+							const line = rawLine.replace(/\r$/, "").trim();
+							if (!line) return;
+							if (resultCount === effectiveLimit) {
+								resultLimitReached = true;
+								return;
+							}
+							const result = relativizeFindResultPath(line, searchPath);
+							resultCount++;
+							if (outputBytes - 1 <= DEFAULT_MAX_BYTES) storedResults.push(result);
+							outputBytes += Buffer.byteLength(result, "utf-8") + 1;
 						});
 
 						child.on("error", (error) => {
@@ -300,15 +266,12 @@ export function createFindToolDefinition(
 								settle(() => reject(new Error("Operation aborted")));
 								return;
 							}
-							const output = lines.join("\n");
-							if (code !== 0) {
+							if (code !== 0 && resultCount === 0) {
 								const errorMsg = stderr.trim() || `fd exited with code ${code}`;
-								if (!output) {
-									settle(() => reject(new Error(errorMsg)));
-									return;
-								}
+								settle(() => reject(new Error(errorMsg)));
+								return;
 							}
-							if (!output) {
+							if (resultCount === 0) {
 								settle(() =>
 									resolve({
 										content: [{ type: "text", text: "No files found matching pattern" }],
@@ -318,16 +281,13 @@ export function createFindToolDefinition(
 								return;
 							}
 
-							const relativized: string[] = [];
-							for (const rawLine of lines) {
-								const line = rawLine.replace(/\r$/, "").trim();
-								if (!line) continue;
-								relativized.push(relativizeFindResultPath(line, searchPath));
-							}
-
-							const resultLimitReached = relativized.length >= effectiveLimit;
-							const rawOutput = relativized.join("\n");
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+							// Stored results extend past the byte cap when more exist, so truncateHead decides
+							// truncation as for the full output; only the totals need the unstored rest.
+							const truncation = {
+								...truncateHead(storedResults.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER }),
+								totalLines: resultCount,
+								totalBytes: outputBytes - 1,
+							};
 							let resultOutput = truncation.content;
 							const details: FindToolDetails = {};
 							const notices: string[] = [];
@@ -362,19 +322,10 @@ export function createFindToolDefinition(
 				})();
 			});
 		},
-		renderCall(args, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatFindCall(args, theme));
-			return text;
-		},
-		renderResult(result, options, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatFindResult(result as any, options, theme, context.showImages));
-			return text;
-		},
+		...findRenderers,
 	};
 }
 
-export function createFindTool(cwd: string, options?: FindToolOptions): AgentTool<typeof findSchema> {
+export function createFindTool(cwd: string, options?: FindToolOptions): TypeBoxAgentTool<typeof findSchema> {
 	return wrapToolDefinition(createFindToolDefinition(cwd, options));
 }

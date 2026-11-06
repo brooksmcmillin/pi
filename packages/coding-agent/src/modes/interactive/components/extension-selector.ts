@@ -13,6 +13,7 @@ export interface ExtensionSelectorOptions {
 	tui?: TUI;
 	timeout?: number;
 	onToggleToolsExpanded?: () => void;
+	description?: string;
 }
 
 export class ExtensionSelectorComponent extends Container {
@@ -46,6 +47,10 @@ export class ExtensionSelectorComponent extends Container {
 
 		this.titleText = new Text(theme.fg("accent", theme.bold(title)), 1, 0);
 		this.addChild(this.titleText);
+		if (opts?.description) {
+			this.addChild(new Spacer(1));
+			this.addChild(new Text(theme.fg("text", opts.description), 1, 0));
+		}
 		this.addChild(new Spacer(1));
 
 		if (opts?.timeout && opts.timeout > 0 && opts.tui) {
@@ -79,12 +84,26 @@ export class ExtensionSelectorComponent extends Container {
 
 	private updateList(): void {
 		this.listContainer.clear();
-		for (let i = 0; i < this.options.length; i++) {
+
+		const maxVisible = 10;
+		// Center the window on the selection, then clamp it to the list boundaries.
+		const startIndex = Math.max(
+			0,
+			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.options.length - maxVisible),
+		);
+		const endIndex = Math.min(startIndex + maxVisible, this.options.length);
+
+		for (let i = startIndex; i < endIndex; i++) {
 			const isSelected = i === this.selectedIndex;
 			const text = isSelected
 				? theme.fg("accent", "→ ") + theme.fg("accent", this.options[i])
 				: `  ${theme.fg("text", this.options[i])}`;
 			this.listContainer.addChild(new Text(text, 1, 0));
+		}
+
+		if (startIndex > 0 || endIndex < this.options.length) {
+			const scrollInfo = theme.fg("muted", `  (${this.selectedIndex + 1}/${this.options.length})`);
+			this.listContainer.addChild(new Text(scrollInfo, 0, 0));
 		}
 	}
 
