@@ -135,7 +135,7 @@ jobs:
 
   update-stable:
     needs: build
-    if: ${{ github.ref_type == 'tag' }}
+    if: ${{ github.repository == 'earendil-works/pi' && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -155,7 +155,7 @@ jobs:
     needs:
       - pin
       - build
-    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.pin.outputs.updated == 'true' }}
+    if: ${{ github.repository == 'earendil-works/pi' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.pin.outputs.updated == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
