@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import type { AgentSession } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -398,7 +399,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	registerSignalHandlers();
 
 	// Handle a single command
-	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
+	const handleCommand = async (command: RpcCommand, session: AgentSession): Promise<RpcResponse | undefined> => {
 		const id = command.id;
 
 		switch (command.type) {
@@ -802,7 +803,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		try {
 			let response: RpcResponse | undefined;
 			try {
-				response = await handleCommand(command);
+				const ownerSession = session;
+				if (command.type.startsWith("get_")) {
+					response = await handleCommand(command, ownerSession);
+				} else {
+					ownerSession.notifyHumanInput();
+					response = await ownerSession.trackOwnerActivity(() => handleCommand(command, ownerSession));
+				}
 			} finally {
 				activeCommands--;
 			}

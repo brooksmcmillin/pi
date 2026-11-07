@@ -490,6 +490,7 @@ export class InteractiveMode {
 	private isInitialized = false;
 	private onInputCallback?: (text: string) => void;
 	private pendingUserInputs: string[] = [];
+	private pendingInputCompletions: Array<() => void> = [];
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private activeWorkingIndicatorEmbedded = false;
 	private readonly idleStatus = new IdleStatus();
@@ -1287,7 +1288,9 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				const prompt = this.session.prompt(userInput);
+				this.pendingInputCompletions.shift()?.();
+				await prompt;
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -2418,9 +2421,12 @@ export class InteractiveMode {
 				// Cast to KeyId - extension shortcuts use the same format
 				if (matchesKey(data, shortcutStr as KeyId)) {
 					// Run handler async, don't block input
-					Promise.resolve(shortcut.handler(createContext())).catch((err) => {
-						this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
-					});
+					this.session.notifyHumanInput();
+					this.session
+						.trackOwnerActivity(async () => shortcut.handler(createContext()))
+						.catch((err) => {
+							this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
+						});
 					return true;
 				}
 			}
@@ -3184,6 +3190,7 @@ export class InteractiveMode {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
+			this.session.notifyHumanInput();
 			if (this.session.isStreaming) {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.session.isBashRunning) {
@@ -3313,7 +3320,7 @@ export class InteractiveMode {
 	}
 
 	private setupEditorSubmitHandler(): void {
-		this.defaultEditor.onSubmit = async (text: string) => {
+		const submit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
 
@@ -3504,12 +3511,23 @@ export class InteractiveMode {
 			// First, move any pending bash components to chat
 			this.flushPendingBashComponents();
 
+			// The UI queue is outside AgentSession; retain activity until prompt() takes over.
+			void this.session.trackOwnerActivity(
+				() =>
+					new Promise<void>((resolve) => {
+						this.pendingInputCompletions.push(resolve);
+					}),
+			);
 			if (this.onInputCallback) {
 				this.onInputCallback(text);
 			} else {
 				this.pendingUserInputs.push(text);
 			}
 			this.editor.addToHistory?.(text);
+		};
+		this.defaultEditor.onSubmit = (text: string) => {
+			this.session.notifyHumanInput();
+			return this.session.trackOwnerActivity(() => submit(text));
 		};
 	}
 
@@ -4442,6 +4460,7 @@ export class InteractiveMode {
 	// =========================================================================
 
 	private handleCtrlC(): void {
+		this.session.notifyHumanInput();
 		const now = Date.now();
 		if (now - this.lastSigintTime < 500) {
 			void this.shutdown();
@@ -4700,6 +4719,7 @@ export class InteractiveMode {
 	}
 
 	private cycleThinkingLevel(): void {
+		this.session.notifyHumanInput();
 		const newLevel = this.session.cycleThinkingLevel();
 		if (newLevel === undefined) {
 			this.showStatus("Current model does not support thinking");
@@ -4711,8 +4731,10 @@ export class InteractiveMode {
 	}
 
 	private async cycleModel(direction: "forward" | "backward"): Promise<void> {
+		const session = this.session;
+		session.notifyHumanInput();
 		try {
-			const result = await this.session.cycleModel(direction);
+			const result = await session.trackOwnerActivity(() => session.cycleModel(direction));
 			if (result === undefined) {
 				const msg = this.session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available";
 				this.showStatus(msg);
@@ -5194,6 +5216,7 @@ export class InteractiveMode {
 						// If the override is for the current model, apply it to the session too
 						const current = this.session.model;
 						if (current && current.provider === provider && current.id === modelId) {
+							this.session.notifyHumanInput();
 							this.session.setThinkingLevel(level);
 							this.footer.invalidate();
 							this.updateEditorBorderColor();
@@ -5205,6 +5228,7 @@ export class InteractiveMode {
 						const current = this.session.model;
 						if (current && current.provider === provider && current.id === modelId) {
 							const globalDefault = this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+							this.session.notifyHumanInput();
 							this.session.setThinkingLevel(globalDefault);
 							this.footer.invalidate();
 							this.updateEditorBorderColor();
@@ -5343,6 +5367,7 @@ export class InteractiveMode {
 	}
 
 	private selectThinkingLevel(level: ThinkingLevel, persist: boolean): void {
+		this.session.notifyHumanInput();
 		try {
 			this.session.setThinkingLevel(level, { persist });
 			this.footer.invalidate();
@@ -5525,8 +5550,10 @@ export class InteractiveMode {
 	private showModelSelector(initialSearchInput?: string): void {
 		this.showSelector((done) => {
 			const selectModel = async (model: Model<any>, persist: boolean) => {
+				const session = this.session;
+				session.notifyHumanInput();
 				try {
-					await this.session.setModel(model, { persist });
+					await session.trackOwnerActivity(() => session.setModel(model, { persist }));
 					this.updateAvailableProviderCount();
 					this.footer.invalidate();
 					this.updateEditorBorderColor();
@@ -7138,7 +7165,12 @@ export class InteractiveMode {
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
-		const extensionRunner = this.session.extensionRunner;
+		const session = this.session;
+		return session.trackOwnerActivity(() => this.executeUserBash(session, command, excludeFromContext));
+	}
+
+	private async executeUserBash(session: AgentSession, command: string, excludeFromContext: boolean): Promise<void> {
+		const extensionRunner = session.extensionRunner;
 
 		// Emit user_bash event to let extensions intercept
 		let eventResult: UserBashEventResult | undefined;
@@ -7154,6 +7186,7 @@ export class InteractiveMode {
 			return;
 		}
 
+		if (this.session !== session) return;
 		// If extension returned a full result, use it directly
 		if (eventResult?.result) {
 			const result = eventResult.result;
@@ -7180,7 +7213,7 @@ export class InteractiveMode {
 			);
 
 			// Record the result in session
-			this.session.recordBashResult(command, result, { excludeFromContext });
+			session.recordBashResult(command, result, { excludeFromContext });
 			this.bashComponent = undefined;
 			this.ui.requestRender();
 			return;
@@ -7202,7 +7235,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 
 		try {
-			const result = await this.session.executeBash(
+			const result = await session.executeBash(
 				command,
 				(chunk) => {
 					if (this.bashComponent) {

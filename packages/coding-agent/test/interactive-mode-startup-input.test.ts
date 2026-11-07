@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { OwnerActivity } from "../src/core/owner-activity.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 type SubmitContext = {
@@ -12,7 +13,11 @@ type SubmitContext = {
 		isStreaming: boolean;
 		isBashRunning: boolean;
 		prompt: (text: string, options?: unknown) => Promise<void>;
+		notifyHumanInput(): void;
+		trackOwnerActivity<T>(operation: () => Promise<T>): Promise<T>;
 	};
+	owner: OwnerActivity;
+	pendingInputCompletions: Array<() => void>;
 	flushPendingBashComponents: () => void;
 	onInputCallback?: (text: string) => void;
 	pendingUserInputs: string[];
@@ -37,7 +42,10 @@ type InteractiveModePrivate = {
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrivate;
 
 function createSubmitContext(): SubmitContext {
+	const owner = new OwnerActivity();
 	return {
+		owner,
+		pendingInputCompletions: [],
 		defaultEditor: {},
 		editor: {
 			addToHistory: vi.fn(),
@@ -48,6 +56,8 @@ function createSubmitContext(): SubmitContext {
 			isStreaming: false,
 			isBashRunning: false,
 			prompt: vi.fn(async () => {}),
+			notifyHumanInput: () => owner.intervene(),
+			trackOwnerActivity: (operation) => owner.track(operation),
 		},
 		flushPendingBashComponents: vi.fn(),
 		pendingUserInputs: [],
@@ -74,6 +84,17 @@ describe("InteractiveMode startup input", () => {
 		await context.defaultEditor.onSubmit?.(" early prompt ");
 
 		expect(context.pendingUserInputs).toEqual(["early prompt"]);
+		expect(
+			context.owner.submit(
+				context.owner.snapshot,
+				() => true,
+				true,
+				async () => {},
+			),
+		).toEqual({ status: "rejected", reason: "busy" });
+		context.pendingInputCompletions.shift()?.();
+		await Promise.resolve();
+		expect(context.owner.busy).toBe(false);
 		expect(context.flushPendingBashComponents).toHaveBeenCalledTimes(1);
 		expect(context.editor.addToHistory).toHaveBeenCalledWith("early prompt");
 	});
