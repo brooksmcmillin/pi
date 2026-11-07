@@ -9,6 +9,7 @@ export interface OwnerSnapshot {
 export type AdmissionRejection = "busy" | "stale" | "revoked" | "unsupported";
 
 interface Reservation {
+	kind: "autonomous";
 	generation: number;
 	lifecycle: number;
 	authorize: () => boolean;
@@ -16,6 +17,18 @@ interface Reservation {
 	closed: boolean;
 	children: Set<Promise<unknown>>;
 }
+
+interface Maintenance {
+	kind: "maintenance";
+	generation: number;
+	lifecycle: number;
+	closed: boolean;
+	children: Set<Promise<unknown>>;
+	isCurrent: () => boolean;
+	beforeDispatch: () => boolean;
+}
+
+type ExecutionScope = Reservation | Maintenance;
 
 export type AdmissionResult<T> =
 	| { status: "rejected"; reason: AdmissionRejection }
@@ -36,13 +49,13 @@ export class OwnerActivity {
 		lifecycle: number;
 		active: number;
 		reservation?: Reservation;
-		context: AsyncLocalStorage<Reservation>;
+		context: AsyncLocalStorage<ExecutionScope>;
 	} = {
 		owner: Symbol("owner"),
 		generation: 0,
 		lifecycle: 0,
 		active: 0,
-		context: new AsyncLocalStorage<Reservation>(),
+		context: new AsyncLocalStorage<ExecutionScope>(),
 	};
 
 	/** Preserve both incoming startup work and outgoing work across session replacement. */
@@ -65,6 +78,10 @@ export class OwnerActivity {
 		return this.state.context.getStore() !== undefined;
 	}
 
+	get maintenance(): boolean {
+		return this.state.context.getStore()?.kind === "maintenance";
+	}
+
 	/** Fence pending autonomous dispatch without aborting an already-running mutation. */
 	intervene(): void {
 		this.state.generation++;
@@ -80,6 +97,17 @@ export class OwnerActivity {
 	assertCurrent(): void {
 		const reservation = this.state.context.getStore();
 		if (!reservation) return;
+		if (reservation.kind === "maintenance") {
+			if (
+				reservation.closed ||
+				reservation.lifecycle !== this.state.lifecycle ||
+				reservation.generation !== this.state.generation ||
+				!reservation.isCurrent()
+			) {
+				throw new Error("Cache maintenance is stale");
+			}
+			return;
+		}
 		if (
 			reservation.closed ||
 			reservation.lifecycle !== this.state.lifecycle ||
@@ -97,7 +125,10 @@ export class OwnerActivity {
 	dispatch(): void {
 		this.assertCurrent();
 		const reservation = this.state.context.getStore();
-		if (reservation) reservation.dispatched = true;
+		if (reservation?.kind === "maintenance" && !reservation.beforeDispatch()) {
+			throw new Error("Cache maintenance dispatch expired");
+		}
+		if (reservation?.kind === "autonomous") reservation.dispatched = true;
 	}
 
 	/** Track before invoking executable hooks. Nested work inherits its reservation. */
@@ -117,6 +148,54 @@ export class OwnerActivity {
 		}
 	}
 
+	/** Execute an accepted human handoff without changing the outgoing reservation or its children. */
+	runHumanInput<T>(operation: () => Promise<T>): Promise<T> {
+		if (this.state.context.getStore()?.kind !== "autonomous") {
+			throw new Error("Human handoff requires an outgoing autonomous run");
+		}
+		return this.state.context.exit(() => this.track(operation));
+	}
+
+	/** Capture the originating lifetime without retaining prompt consent for later cache maintenance. */
+	captureMaintenance(): (
+		isCurrent: () => boolean,
+		beforeDispatch: () => boolean,
+		operation: () => Promise<void>,
+	) => Promise<void> {
+		const { generation, lifecycle, reservation: capturedReservation } = this.state;
+		const origin = this.state.context.getStore();
+		return async (isCurrent, beforeDispatch, operation) => {
+			const scope: Maintenance = {
+				kind: "maintenance",
+				generation,
+				lifecycle,
+				closed: false,
+				children: new Set(),
+				isCurrent,
+				beforeDispatch,
+			};
+			if (
+				(origin?.kind === "autonomous" && !origin.dispatched) ||
+				(this.state.reservation && this.state.reservation !== capturedReservation)
+			) {
+				throw new Error("Cache maintenance owner changed");
+			}
+			await requestOwner.run(this, () =>
+				this.state.context.run(scope, async () => {
+					this.assertCurrent();
+					this.state.active++;
+					try {
+						await operation();
+					} finally {
+						while (scope.children.size > 0) await Promise.allSettled([...scope.children]);
+						scope.closed = true;
+						this.state.active--;
+					}
+				}),
+			);
+		};
+	}
+
 	/** Reserve synchronously; busy submissions never enter a later-turn queue. */
 	submit<T>(
 		expected: OwnerSnapshot,
@@ -130,6 +209,7 @@ export class OwnerActivity {
 		if (this.busy) return { status: "rejected", reason: "busy" };
 		if (!supported) return { status: "rejected", reason: "unsupported" };
 		const reservation: Reservation = {
+			kind: "autonomous",
 			generation: this.state.generation,
 			lifecycle: this.state.lifecycle,
 			authorize,

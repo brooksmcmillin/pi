@@ -413,6 +413,9 @@ export class AgentSession {
 	readonly settingsManager: SettingsManager;
 	private _ownerActivity: OwnerActivity;
 	private _disposed = false;
+	private _guardedPromptActive = false;
+	private _humanHandoffCancelled = false;
+	private _humanHandoff: Array<{ message: UserMessage; behavior: "steer" | "followUp" }> = [];
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -586,6 +589,7 @@ export class AgentSession {
 
 	/** Fence pending requests before a session replacement begins its asynchronous hooks. */
 	invalidateOwner(): void {
+		this._humanHandoffCancelled = true;
 		this._ownerActivity.invalidate();
 	}
 
@@ -604,6 +608,7 @@ export class AgentSession {
 			this._ownerActivity.busy ||
 			!this.isIdle ||
 			this._promptPreflightCount > 0 ||
+			this.pendingMessageCount > 0 ||
 			this.isBashRunning ||
 			this.agent.hasQueuedMessages()
 		) {
@@ -616,9 +621,42 @@ export class AgentSession {
 		if (commandName && this._extensionRunner.getCommand(commandName)) {
 			return { status: "rejected", reason: "unsupported" };
 		}
-		return this._ownerActivity.submit(expected, authorize, supported, () =>
-			this.prompt(text, { source: "extension" }),
-		);
+		return this._ownerActivity.submit(expected, authorize, supported, async () => {
+			this._guardedPromptActive = true;
+			this._humanHandoffCancelled = false;
+			try {
+				await this.prompt(text, { source: "extension" });
+			} finally {
+				this._guardedPromptActive = false;
+				if (!this._disposed && !this._humanHandoffCancelled && this._humanHandoff.length > 0) {
+					await this._ownerActivity.runHumanInput(async () => {
+						const inputs = this._humanHandoff.splice(0);
+						const behavior = inputs.some((input) => input.behavior === "steer") ? "steer" : "followUp";
+						const mode = behavior === "steer" ? this.agent.steeringMode : this.agent.followUpMode;
+						const batch = inputs
+							.filter((input) => input.behavior === behavior)
+							.slice(0, mode === "all" ? undefined : 1);
+						const messages = batch.map((input) => input.message);
+						const message = messages[0];
+						for (const input of inputs) {
+							if (!batch.includes(input)) this.agent[input.behavior](input.message);
+						}
+						await this._startRun(
+							{
+								messageType: "user",
+								prompt: contentText(message.content, ""),
+								images:
+									typeof message.content === "string"
+										? undefined
+										: message.content.filter((block): block is ImageContent => block.type === "image"),
+							},
+							undefined,
+							{ messages, behavior },
+						);
+					});
+				}
+			}
+		});
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -1015,6 +1053,9 @@ export class AgentSession {
 			this._boundaryDispatchedMessages.add(turn.message);
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
 			const previousDecision = await previousFinishTurn?.(turn, signal);
+			if (this._guardedPromptActive && this._humanHandoff.some((input) => input.behavior === "steer")) {
+				return { action: "end" };
+			}
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
@@ -1030,6 +1071,10 @@ export class AgentSession {
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
 			const context = await this._compactBeforeNextAssistantResponse(turn.context);
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
+			if (this._guardedPromptActive && this._humanHandoff.some((input) => input.behavior === "steer")) {
+				return { action: "end" };
+			}
+			if (previousSnapshot?.action === "end") return previousSnapshot;
 			const nextContext = previousSnapshot?.context ?? context;
 			const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
 			const options = normalizeBuildSystemPromptOptions({
@@ -1541,7 +1586,7 @@ export class AgentSession {
 	 */
 	dispose(): void {
 		this._disposed = true;
-		this._ownerActivity.invalidate();
+		this.invalidateOwner();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -2007,12 +2052,17 @@ export class AgentSession {
 	 * starting another, and an abort requested meanwhile aborts the run as soon as it exists.
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
-	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+	private async _startRun(
+		trigger: BeforeAgentStartTrigger,
+		onStarted?: () => void,
+		handoff?: { messages: UserMessage[]; behavior: "steer" | "followUp" },
+	): Promise<void> {
+		if (this._ownerActivity.maintenance) throw new Error("Cache maintenance cannot start agent turns");
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
 		let messages: AgentMessage[];
 		try {
-			messages = await this._prepareRun(trigger);
+			messages = await this._prepareRun(trigger, handoff?.messages);
 			this._ownerActivity.assertCurrent();
 		} catch (error) {
 			this._isAgentRunActive = false;
@@ -2034,16 +2084,19 @@ export class AgentSession {
 		// are dropped, so a tool that never registers does not stay pending.
 		this._pendingToolNames.clear();
 		try {
-			await this.agent.prompt(messages);
-			while (!this._agentRunAbortRequested) {
+			await this.agent.prompt(messages, { skipInitialSteeringPoll: handoff?.behavior === "steer" });
+			this._ownerActivity.assertCurrent();
+			const shouldHandoff = () =>
+				this._guardedPromptActive && this._humanHandoff.some((input) => input.behavior === "steer");
+			while (!this._agentRunAbortRequested && !shouldHandoff()) {
 				this._ownerActivity.assertCurrent();
 				if (await this._handlePostAgentRun()) {
-					if (this._agentRunAbortRequested) break;
+					if (this._agentRunAbortRequested || shouldHandoff()) break;
 					await this.agent.continue();
 					continue;
 				}
-				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
-				if (this._agentRunAbortRequested) break;
+				if (this._agentRunAbortRequested || shouldHandoff() || !(await this._runBeforeSettleBoundary())) break;
+				if (this._agentRunAbortRequested || shouldHandoff()) break;
 				await this.agent.continue();
 			}
 		} finally {
@@ -2062,7 +2115,10 @@ export class AgentSession {
 	 * message followed by pending nextTurn messages (consumed here) and handler messages, with a
 	 * system patch first when the prompt changed.
 	 */
-	private async _prepareRun(trigger: BeforeAgentStartTrigger): Promise<AgentMessage[]> {
+	private async _prepareRun(
+		trigger: BeforeAgentStartTrigger,
+		queuedUserMessages?: UserMessage[],
+	): Promise<AgentMessage[]> {
 		// Check if we need to compact before sending (catches aborted responses).
 		// The starting message is sent below, so do not call agent.continue() here.
 		const lastAssistant = this._findLastAssistantMessage();
@@ -2085,6 +2141,8 @@ export class AgentSession {
 		const messages: AgentMessage[] = [];
 		if (trigger.messageType === "custom") {
 			messages.push(trigger.message);
+		} else if (queuedUserMessages) {
+			messages.push(...queuedUserMessages);
 		} else {
 			// Normalize images after before_agent_start so extension-driven model selection
 			// determines the resize profile used for the request and history.
@@ -2236,6 +2294,7 @@ export class AgentSession {
 	}
 
 	private async _prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._ownerActivity.maintenance) throw new Error("Cache maintenance cannot start agent turns");
 		if (this._isEmittingAgentSettled) {
 			if (this._ownerActivity.guarded) throw new Error("Autonomous request is busy");
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
@@ -2304,17 +2363,18 @@ export class AgentSession {
 
 		// Guarded requests must never fall through to the normal human-input queues.
 		if (this._ownerActivity.guarded && this.isStreaming) throw new Error("Autonomous request is busy");
-		// If streaming, queue via steer() or followUp() based on option
-		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
+		// Hold accepted human input outside the autonomous loop until ownership can be handed off.
+		if (this.isStreaming || (this._guardedPromptActive && !this._ownerActivity.guarded)) {
+			if (this.isStreaming && !options?.streamingBehavior) {
 				throw new Error(
 					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
 				);
 			}
-			if (options.streamingBehavior === "followUp") {
-				await this._queueFollowUp(expandedText, currentImages);
+			const human = !this._ownerActivity.guarded && options?.source !== "extension";
+			if (options?.streamingBehavior === "steer") {
+				await this._queueSteer(expandedText, currentImages, human);
 			} else {
-				await this._queueSteer(expandedText, currentImages);
+				await this._queueFollowUp(expandedText, currentImages, human);
 			}
 			preflightResult?.("queued");
 			return undefined;
@@ -2425,10 +2485,11 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
+		const human = !this._ownerActivity.guarded && source !== "extension";
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images);
+			await this._queueSteer(expandedText, processedInput.images, human);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images);
+			await this._queueFollowUp(expandedText, processedInput.images, human);
 		}
 		return "queued";
 	}
@@ -2447,6 +2508,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
+		if (this._ownerActivity.maintenance) throw new Error("Cache maintenance cannot start agent turns");
 		if (options?.source !== "extension") this._ownerActivity.intervene();
 		return this._ownerActivity.track(() =>
 			this._queueUserInput(text, images, "steer", options?.source ?? "interactive"),
@@ -2466,6 +2528,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
+		if (this._ownerActivity.maintenance) throw new Error("Cache maintenance cannot start agent turns");
 		if (options?.source !== "extension") this._ownerActivity.intervene();
 		return this._ownerActivity.track(() =>
 			this._queueUserInput(text, images, "followUp", options?.source ?? "interactive"),
@@ -2475,31 +2538,33 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(text: string, images?: ImageContent[], human = false): Promise<void> {
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		const message: UserMessage = { role: "user", content, timestamp: Date.now() };
 		if (images?.length) this._queuedMessagesWithImages.add(message);
-		this.agent.steer(message);
+		if (human && this._guardedPromptActive) this._humanHandoff.push({ message, behavior: "steer" });
+		else this.agent.steer(message);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(text: string, images?: ImageContent[], human = false): Promise<void> {
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		const message: UserMessage = { role: "user", content, timestamp: Date.now() };
 		if (images?.length) this._queuedMessagesWithImages.add(message);
-		this.agent.followUp(message);
+		if (human && this._guardedPromptActive) this._humanHandoff.push({ message, behavior: "followUp" });
+		else this.agent.followUp(message);
 	}
 
 	/** Replace a queued user message's images in place with normalized ones, appending hints to its text. */
@@ -2556,6 +2621,13 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		if (
+			this._ownerActivity.maintenance &&
+			options?.deliverAs !== "nextTurn" &&
+			(options?.triggerTurn || (this.isStreaming && options?.triggerTurn !== false))
+		) {
+			throw new Error("Cache maintenance cannot start agent turns");
+		}
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -2667,6 +2739,7 @@ export class AgentSession {
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
+		this._humanHandoff = [];
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
@@ -2695,6 +2768,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this._humanHandoffCancelled = true;
 		this._ownerActivity.intervene();
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
@@ -2882,11 +2956,21 @@ export class AgentSession {
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
-			void this._extensionRunner.emit({
-				type: "thinking_level_select",
-				level: effectiveLevel,
-				previousLevel,
-			});
+			void this._ownerActivity
+				.track(() =>
+					this._extensionRunner.emit({
+						type: "thinking_level_select",
+						level: effectiveLevel,
+						previousLevel,
+					}),
+				)
+				.catch((error: unknown) => {
+					this._extensionRunner.emitError({
+						extensionPath: "<runtime>",
+						event: "thinking_level_select",
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
 		}
 	}
 
@@ -3926,7 +4010,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
-		this._ownerActivity.invalidate();
+		this.invalidateOwner();
 		return this._ownerActivity.track(() => this._reload(options));
 	}
 
@@ -4259,7 +4343,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
-		this._ownerActivity.invalidate();
+		this.invalidateOwner();
 		return this._ownerActivity.track(() => this._navigateTree(targetId, options));
 	}
 

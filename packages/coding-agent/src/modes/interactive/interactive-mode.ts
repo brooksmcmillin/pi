@@ -4719,6 +4719,7 @@ export class InteractiveMode {
 	}
 
 	private cycleThinkingLevel(): void {
+		this.session.notifyHumanInput();
 		const newLevel = this.session.cycleThinkingLevel();
 		if (newLevel === undefined) {
 			this.showStatus("Current model does not support thinking");
@@ -4730,8 +4731,10 @@ export class InteractiveMode {
 	}
 
 	private async cycleModel(direction: "forward" | "backward"): Promise<void> {
+		const session = this.session;
+		session.notifyHumanInput();
 		try {
-			const result = await this.session.cycleModel(direction);
+			const result = await session.trackOwnerActivity(() => session.cycleModel(direction));
 			if (result === undefined) {
 				const msg = this.session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available";
 				this.showStatus(msg);
@@ -5213,6 +5216,7 @@ export class InteractiveMode {
 						// If the override is for the current model, apply it to the session too
 						const current = this.session.model;
 						if (current && current.provider === provider && current.id === modelId) {
+							this.session.notifyHumanInput();
 							this.session.setThinkingLevel(level);
 							this.footer.invalidate();
 							this.updateEditorBorderColor();
@@ -5224,6 +5228,7 @@ export class InteractiveMode {
 						const current = this.session.model;
 						if (current && current.provider === provider && current.id === modelId) {
 							const globalDefault = this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+							this.session.notifyHumanInput();
 							this.session.setThinkingLevel(globalDefault);
 							this.footer.invalidate();
 							this.updateEditorBorderColor();
@@ -5362,6 +5367,7 @@ export class InteractiveMode {
 	}
 
 	private selectThinkingLevel(level: ThinkingLevel, persist: boolean): void {
+		this.session.notifyHumanInput();
 		try {
 			this.session.setThinkingLevel(level, { persist });
 			this.footer.invalidate();
@@ -5544,8 +5550,10 @@ export class InteractiveMode {
 	private showModelSelector(initialSearchInput?: string): void {
 		this.showSelector((done) => {
 			const selectModel = async (model: Model<any>, persist: boolean) => {
+				const session = this.session;
+				session.notifyHumanInput();
 				try {
-					await this.session.setModel(model, { persist });
+					await session.trackOwnerActivity(() => session.setModel(model, { persist }));
 					this.updateAvailableProviderCount();
 					this.footer.invalidate();
 					this.updateEditorBorderColor();

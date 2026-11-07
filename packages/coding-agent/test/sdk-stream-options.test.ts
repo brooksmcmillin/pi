@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +10,7 @@ import {
 	normalizeContext,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
@@ -147,7 +148,13 @@ describe("createAgentSession stream options", () => {
 		}
 	}
 
-	async function createCacheWarmingSession(populate?: (manager: SessionManager, model: Model<Api>) => void) {
+	async function createCacheWarmingSession(
+		populate?: (manager: SessionManager, model: Model<Api>) => void,
+		options: {
+			extensionFactory?: ExtensionFactory;
+			stream?: (call: number) => ReturnType<typeof createDoneStream>;
+		} = {},
+	) {
 		const model: Model<Api> = {
 			...createModel("anthropic-messages"),
 			cost: { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 },
@@ -161,17 +168,26 @@ describe("createAgentSession stream options", () => {
 			api: model.api,
 			streamSimple: () => {
 				providerCalls++;
-				return createDoneStream(model.api, 100_000);
+				return options.stream?.(providerCalls) ?? createDoneStream(model.api, 100_000);
 			},
 		});
 		const sessionManager = SessionManager.inMemory(cwd);
 		populate?.(sessionManager, model);
+		const settingsManager = SettingsManager.inMemory({ cacheWarming: "idle" });
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			extensionFactories: options.extensionFactory ? [options.extensionFactory] : [],
+		});
+		await resourceLoader.reload();
 		const { session } = await createAgentSession({
 			cwd,
 			agentDir,
 			model,
 			modelRuntime: getModelRuntime(modelRegistry),
-			settingsManager: SettingsManager.inMemory({ cacheWarming: "idle" }),
+			settingsManager,
+			resourceLoader,
 			sessionManager,
 		});
 		return {
@@ -198,6 +214,228 @@ describe("createAgentSession stream options", () => {
 			expect(fixture.session.cacheWarmingStatus?.reason).toBe("conversation context changed");
 		} finally {
 			fixture.dispose();
+		}
+	});
+
+	it.each(["normal", "guarded"] as const)("refreshes idle cache after a completed %s prompt", async (kind) => {
+		const fixture = await createCacheWarmingSession();
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		const schedule = setTimeout;
+		// Fake clocks otherwise run callbacks in the clock driver's context, unlike Node timers.
+		vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) =>
+			schedule(AsyncResource.bind(callback), delay, ...args),
+		);
+		try {
+			if (kind === "guarded") {
+				const result = fixture.session.submitGuardedPrompt("test", fixture.session.ownerSnapshot, () => true, true);
+				if (result.status !== "running") throw new Error(JSON.stringify(result));
+				await result.completion;
+			} else {
+				await fixture.session.prompt("test");
+			}
+			expect(fixture.providerCalls()).toBe(1);
+			await vi.advanceTimersByTimeAsync(270_000);
+			expect(fixture.providerCalls()).toBe(2);
+			expect(
+				fixture.session.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "usage" && entry.kind === "cache_warm"),
+			).toHaveLength(1);
+		} finally {
+			fixture.dispose();
+			vi.restoreAllMocks();
+			vi.useRealTimers();
+		}
+	});
+
+	it("warms the human request after a fenced autonomous auth handoff", async () => {
+		const fixture = await createCacheWarmingSession();
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		const schedule = setTimeout;
+		vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) =>
+			schedule(AsyncResource.bind(callback), delay, ...args),
+		);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const runtime = fixture.session.modelRuntime;
+		const getAuth = runtime.getAuth.bind(runtime);
+		vi.spyOn(runtime, "getAuth").mockImplementationOnce(async (model, options) => {
+			entered.resolve();
+			await release.promise;
+			return typeof model === "string" ? getAuth(model, options) : getAuth(model, options);
+		});
+		try {
+			const result = fixture.session.submitGuardedPrompt(
+				"autonomous",
+				fixture.session.ownerSnapshot,
+				() => true,
+				true,
+			);
+			if (result.status !== "running") throw new Error(JSON.stringify(result));
+			const completion = result.completion.catch((error: Error) => error);
+			await entered.promise;
+			await fixture.session.steer("human input");
+			release.resolve();
+			await completion;
+			expect(fixture.providerCalls()).toBe(1);
+			await vi.advanceTimersByTimeAsync(270_000);
+			expect(fixture.providerCalls()).toBe(2);
+			expect(
+				fixture.session.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "usage" && entry.kind === "cache_warm"),
+			).toHaveLength(1);
+		} finally {
+			release.resolve();
+			fixture.dispose();
+			vi.restoreAllMocks();
+			vi.useRealTimers();
+		}
+	});
+
+	it.each(["finish", "cancel", "replace"] as const)("accounts for refresh auth through %s", async (action) => {
+		const fixture = await createCacheWarmingSession();
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		const schedule = setTimeout;
+		vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) =>
+			schedule(AsyncResource.bind(callback), delay, ...args),
+		);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			const result = fixture.session.submitGuardedPrompt("test", fixture.session.ownerSnapshot, () => true, true);
+			if (result.status !== "running") throw new Error(JSON.stringify(result));
+			await result.completion;
+			const runtime = fixture.session.modelRuntime;
+			const getAuth = runtime.getAuth.bind(runtime);
+			vi.spyOn(runtime, "getAuth").mockImplementation(async (model, options) => {
+				entered.resolve();
+				await release.promise;
+				return typeof model === "string" ? getAuth(model, options) : getAuth(model, options);
+			});
+			const clock = vi.advanceTimersByTimeAsync(270_000);
+			await entered.promise;
+			expect(
+				fixture.session.submitGuardedPrompt("competitor", fixture.session.ownerSnapshot, () => true, true),
+			).toEqual({ status: "rejected", reason: "busy" });
+			if (action === "cancel") fixture.session.setCacheWarmingMode("off");
+			if (action === "replace") fixture.session.invalidateOwner();
+			release.resolve();
+			await clock;
+			expect(fixture.providerCalls()).toBe(action === "finish" ? 2 : 1);
+			expect(
+				fixture.session.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "usage" && entry.kind === "cache_warm"),
+			).toHaveLength(action === "finish" ? 1 : 0);
+		} finally {
+			release.resolve();
+			fixture.dispose();
+			vi.restoreAllMocks();
+			vi.useRealTimers();
+		}
+	});
+
+	it.each([
+		{ deliverAs: "steer" as const, triggerTurn: true },
+		{ deliverAs: "followUp" as const, triggerTurn: true },
+		{ deliverAs: "followUp" as const, triggerTurn: undefined },
+		{ deliverAs: "followUp" as const, triggerTurn: false },
+		{ userQueue: "steer" as const, triggerTurn: true },
+		{ userQueue: "followUp" as const, triggerTurn: true },
+	])("fences maintenance custom-message turns while streaming: %j", async (messageOptions) => {
+		const entered = Promise.withResolvers<void>();
+		const response = createAssistantMessageEventStream();
+		let decisions = 0;
+		const errors: string[] = [];
+		const fixture = await createCacheWarmingSession(undefined, {
+			stream: (call) => {
+				if (call !== 1) return createDoneStream("anthropic-messages", 100_000);
+				entered.resolve();
+				return response;
+			},
+			extensionFactory: (pi) => {
+				pi.on("cache_warming_decision", async () => {
+					decisions++;
+					const userQueue = "userQueue" in messageOptions ? messageOptions.userQueue : undefined;
+					if (userQueue) {
+						await fixture.session[userQueue]("maintenance input", undefined, {
+							source: "extension",
+						}).catch((error: Error) => errors.push(error.message));
+					} else {
+						pi.sendMessage(
+							{ customType: "maintenance", content: "context only", display: false },
+							messageOptions,
+						);
+					}
+					return { action: "stop" };
+				});
+			},
+		});
+		await fixture.session.bindExtensions({ onError: (error) => errors.push(error.error) });
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		const schedule = setTimeout;
+		vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) =>
+			schedule(AsyncResource.bind(callback), delay, ...args),
+		);
+		const prompt = fixture.session.prompt("test");
+		try {
+			await entered.promise;
+			await vi.advanceTimersByTimeAsync(270_000);
+			expect(decisions).toBe(1);
+			response.end(createDoneMessage("anthropic-messages", 100_000));
+			await prompt;
+			expect(errors).toEqual(
+				messageOptions.triggerTurn === false ? [] : ["Cache maintenance cannot start agent turns"],
+			);
+			expect(fixture.providerCalls()).toBe(1);
+			expect(fixture.session.agent.state.messages.some((message) => message.role === "custom")).toBe(
+				messageOptions.triggerTurn === false,
+			);
+		} finally {
+			response.end(createDoneMessage("anthropic-messages", 100_000));
+			await prompt;
+			fixture.dispose();
+			vi.restoreAllMocks();
+			vi.useRealTimers();
+		}
+	});
+
+	it("records billed refresh usage after intervention without rescheduling stale work", async () => {
+		const entered = Promise.withResolvers<void>();
+		const response = createAssistantMessageEventStream();
+		const fixture = await createCacheWarmingSession(undefined, {
+			stream: (call) => {
+				if (call !== 2) return createDoneStream("anthropic-messages", 100_000);
+				entered.resolve();
+				return response;
+			},
+		});
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		const schedule = setTimeout;
+		vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) =>
+			schedule(AsyncResource.bind(callback), delay, ...args),
+		);
+		try {
+			await fixture.session.prompt("test");
+			const clock = vi.advanceTimersByTimeAsync(270_000);
+			await entered.promise;
+			fixture.session.notifyHumanInput();
+			response.end(createDoneMessage("anthropic-messages", 100_000));
+			await clock;
+			expect(
+				fixture.session.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "usage" && entry.kind === "cache_warm"),
+			).toHaveLength(1);
+			await vi.advanceTimersByTimeAsync(270_000);
+			expect(fixture.providerCalls()).toBe(2);
+			expect(fixture.session.cacheWarmingStatus?.state).toBe("inactive");
+		} finally {
+			response.end(createDoneMessage("anthropic-messages", 100_000));
+			fixture.dispose();
+			vi.restoreAllMocks();
+			vi.useRealTimers();
 		}
 	});
 

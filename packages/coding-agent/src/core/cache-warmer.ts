@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { getProviderEnvValue } from "@earendil-works/pi-ai/utils/provider-env";
 import type { ModelRuntime } from "./model-runtime.ts";
+import { OwnerActivity } from "./owner-activity.ts";
 import type { SessionEntry, SessionManager, UsageEntry } from "./session-manager.ts";
 import type { CacheWarmingMode } from "./settings-manager.ts";
 
@@ -139,6 +140,7 @@ export interface CacheWarmRequest {
 }
 
 interface ActiveRun extends CacheWarmRequest {
+	maintain: ReturnType<OwnerActivity["captureMaintenance"]>;
 	/** False once the session's model or messages no longer match the request. */
 	isCurrent: () => boolean;
 	ttlMs: number;
@@ -165,6 +167,7 @@ export class CacheWarmer {
 	private readonly models: Pick<ModelRuntime, "streamSimple">;
 	private readonly sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">;
 	private readonly getMode: () => CacheWarmingMode;
+	private readonly ownerActivity: OwnerActivity;
 	/** Lets extensions override `event.action`; failures fall back to pi's decision. */
 	private readonly decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction>;
 	/** Called with the persisted usage entry after each successful refresh. */
@@ -175,7 +178,9 @@ export class CacheWarmer {
 		sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">,
 		getMode: () => CacheWarmingMode,
 		decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction> = async (event) => event.action,
+		ownerActivity = new OwnerActivity(),
 	) {
+		this.ownerActivity = ownerActivity;
 		this.models = models;
 		this.sessionManager = sessionManager;
 		this.getMode = getMode;
@@ -229,6 +234,7 @@ export class CacheWarmer {
 		}
 		this.run = {
 			...request,
+			maintain: this.ownerActivity.captureMaintenance(),
 			isCurrent,
 			ttlMs,
 			delayMs,
@@ -293,7 +299,21 @@ export class CacheWarmer {
 			this.stop(run.phase === "idle" ? "30-minute idle safety limit reached" : "one-hour safety limit reached");
 			return;
 		}
-		run.timer = setTimeout(() => void this.refresh(run), Math.max(0, run.nextWarmAt - Date.now()));
+		run.timer = setTimeout(
+			() => {
+				const deadline = run.refreshDeadlineAt;
+				void run
+					.maintain(
+						() => this.validateRun(run),
+						() => Date.now() <= deadline,
+						() => this.refresh(run),
+					)
+					.catch(() => {
+						if (this.run === run) this.stop("cache maintenance owner changed");
+					});
+			},
+			Math.max(0, run.nextWarmAt - Date.now()),
+		);
 		run.timer.unref?.();
 	}
 
@@ -340,6 +360,7 @@ export class CacheWarmer {
 				})
 				.result();
 			if (!this.validateRun(run)) return;
+			// A generation fence stops future work, not accounting for an already-billed response.
 			if (message.stopReason !== "error" && message.stopReason !== "aborted") {
 				const entry = this.sessionManager.appendUsage(
 					"cache_warm",
@@ -353,7 +374,15 @@ export class CacheWarmer {
 		} catch {
 			// Cache warming is best-effort and must not affect the active agent run.
 		}
-		if (this.run === run) this.schedule(run);
+		if (this.run === run) {
+			try {
+				this.ownerActivity.assertCurrent();
+			} catch {
+				this.stop("cache maintenance owner changed");
+				return;
+			}
+			this.schedule(run);
+		}
 	}
 
 	private refreshDeadlineMissed(run: ActiveRun): boolean {
