@@ -107,7 +107,7 @@ describe("Anthropic empty thinking signature compat", () => {
 
 	// Regression for #9323: Fireworks emits unsigned thinking that must survive replay.
 	const fireworksMessagesModels = getModels("fireworks").filter((model) => hasApi(model, "anthropic-messages"));
-	it("has Fireworks Messages models to verify", () => {
+	it("includes Fireworks Messages models in unsigned-thinking coverage", () => {
 		expect(fireworksMessagesModels.length).toBeGreaterThan(0);
 	});
 

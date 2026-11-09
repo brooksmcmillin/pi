@@ -212,9 +212,9 @@ describe("builtin providers", () => {
 			);
 		}
 		for (const [provider, modelId] of unsupported) {
-			expect(models.getModel(provider, modelId), `${provider}/${modelId}`).not.toHaveProperty(
-				"compat.supportsMidConvoSystemMessages",
-			);
+			const model = models.getModel(provider, modelId);
+			expect(model, `${provider}/${modelId}`).toBeDefined();
+			expect(model, `${provider}/${modelId}`).not.toHaveProperty("compat.supportsMidConvoSystemMessages");
 		}
 	});
 

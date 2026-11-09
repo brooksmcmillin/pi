@@ -122,6 +122,20 @@ describe("FooterComponent width handling", () => {
 		initTheme(undefined, false);
 	});
 
+	it("shows fork identity alongside project, branch, and session name", () => {
+		const footer = new FooterComponent(createSession({ sessionName: "branding" }), createFooterData(1));
+		expect(stripAnsi(footer.render(120)[0])).toBe("pi-fork /tmp/project (main) • branding");
+	});
+
+	it("keeps fork identity visible when the project and session are truncated", () => {
+		const footer = new FooterComponent(createSession({ sessionName: "한글".repeat(30) }), createFooterData(1));
+		for (const width of [12, 20, 40]) {
+			const lines = footer.render(width);
+			expect(stripAnsi(lines[0])).toMatch(/^pi-fork /);
+			for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
+	});
+
 	it("keeps all lines within width for wide session names", () => {
 		const width = 93;
 		const session = createSession({ sessionName: "한글".repeat(30) });
