@@ -1,10 +1,9 @@
 import { stat as fsStat } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { spawn } from "child_process";
 import path from "path";
 import { type Static, Type } from "typebox";
-import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { resolveSearchTool, spawnSearchProcess } from "../managed-search-process.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { grepRenderers } from "./renderers/grep.ts";
 import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -119,7 +118,7 @@ export function createGrepToolDefinition(
 
 				(async () => {
 					try {
-						const rgPath = await ensureTool("rg");
+						const rgPath = await resolveSearchTool("rg", customOps !== undefined);
 						if (!rgPath) {
 							settle(() => reject(new Error("ripgrep (rg) is not available and could not be downloaded")));
 							return;
@@ -159,7 +158,8 @@ export function createGrepToolDefinition(
 						if (contextValue > 0) args.push("--context", String(contextValue));
 						args.push("--", pattern, searchPath);
 
-						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const process = spawnSearchProcess(rgPath, args, signal);
+						const child = process.child;
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						let matchCount = 0;
@@ -176,7 +176,7 @@ export function createGrepToolDefinition(
 						const stopChild = (dueToLimit = false) => {
 							if (!child.killed) {
 								killedDueToLimit = dueToLimit;
-								child.kill();
+								process.stop();
 							}
 						};
 						const onAbort = () => {

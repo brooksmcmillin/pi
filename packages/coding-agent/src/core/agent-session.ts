@@ -595,7 +595,8 @@ export class AgentSession {
 
 	/**
 	 * Internal guarded submission. `supported` must come from a validated cooperative backend,
-	 * never from wire input. Completion joins registered JS work, not subprocess settlement.
+	 * never from wire input. Settlement joins registered JS work and managed search processes;
+	 * it does not certify arbitrary subprocesses or escaped descendants.
 	 */
 	submitGuardedPrompt(
 		text: string,
@@ -3907,7 +3908,13 @@ export class AgentSession {
 				execute: (...args) =>
 					this._ownerActivity.track(() => {
 						if (this._ownerActivity.guarded && ["bash", "powershell", "grep", "find"].includes(name)) {
-							throw new Error("Autonomous subprocess tools require a supported settlement backend");
+							const managedSearch =
+								(name === "grep" || name === "find") &&
+								!this._baseToolsOverride &&
+								definitionRegistry.get(name)?.definition === this._baseToolDefinitions.get(name);
+							if (!managedSearch) {
+								throw new Error("Autonomous subprocess tools require a supported settlement backend");
+							}
 						}
 						return tool.execute(...args);
 					}),

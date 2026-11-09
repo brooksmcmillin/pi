@@ -7,9 +7,11 @@ export interface OwnerSnapshot {
 }
 
 export type AdmissionRejection = "busy" | "stale" | "revoked" | "unsupported";
+export type Settlement = "settled" | "uncertain";
 
 interface Reservation {
 	kind: "autonomous";
+	reportSettlement: (outcome: Settlement) => void;
 	generation: number;
 	lifecycle: number;
 	authorize: () => boolean;
@@ -32,18 +34,24 @@ type ExecutionScope = Reservation | Maintenance;
 
 export type AdmissionResult<T> =
 	| { status: "rejected"; reason: AdmissionRejection }
-	| { status: "running"; completion: Promise<T> };
+	| { status: "running"; completion: Promise<T>; settlement: Promise<Settlement> };
 
 const requestOwner = new AsyncLocalStorage<OwnerActivity>();
 
-/** Registers cooperating JavaScript lifetimes; it does not certify subprocess settlement. */
+/** Joins registered cooperative lifetimes, retaining ownership after lost supervision. */
 export class OwnerActivity {
 	/** Called by the runtime immediately before invoking a physical provider, after auth and routing. */
 	static dispatchRequest(): void {
 		requestOwner.getStore()?.dispatch();
 	}
 
+	/** Internal runtime context, not an extension capability or permission grant. */
+	static get current(): OwnerActivity | undefined {
+		return requestOwner.getStore();
+	}
+
 	private state: {
+		uncertain: boolean;
 		owner: symbol;
 		generation: number;
 		lifecycle: number;
@@ -51,6 +59,7 @@ export class OwnerActivity {
 		reservation?: Reservation;
 		context: AsyncLocalStorage<ExecutionScope>;
 	} = {
+		uncertain: false,
 		owner: Symbol("owner"),
 		generation: 0,
 		lifecycle: 0,
@@ -63,7 +72,9 @@ export class OwnerActivity {
 		if (this.state === previous.state) return;
 		if (this.state.reservation) throw new Error("Cannot transfer an admitted autonomous owner");
 		previous.state.active += this.state.active;
+		previous.state.uncertain ||= this.state.uncertain;
 		this.state = previous.state;
+		if (this.state.uncertain) this.markUncertain();
 	}
 
 	get snapshot(): OwnerSnapshot {
@@ -71,7 +82,7 @@ export class OwnerActivity {
 	}
 
 	get busy(): boolean {
-		return this.state.active > 0 || this.state.reservation !== undefined;
+		return this.state.uncertain || this.state.active > 0 || this.state.reservation !== undefined;
 	}
 
 	get guarded(): boolean {
@@ -97,6 +108,7 @@ export class OwnerActivity {
 	assertCurrent(): void {
 		const reservation = this.state.context.getStore();
 		if (!reservation) return;
+		if (this.state.uncertain) throw new Error("Subprocess settlement is uncertain");
 		if (reservation.kind === "maintenance") {
 			if (
 				reservation.closed ||
@@ -139,13 +151,37 @@ export class OwnerActivity {
 		this.state.active++;
 		let work: Promise<T> | undefined;
 		try {
-			work = operation();
+			work = requestOwner.run(this, operation);
 			reservation?.children.add(work);
 			return await work;
 		} finally {
 			if (work) reservation?.children.delete(work);
 			this.state.active--;
 		}
+	}
+
+	/** Register the terminal acknowledgement separately from the tool's returned promise. */
+	joinSubprocess(acknowledgement: Promise<Settlement>): void {
+		const scope = this.state.context.getStore();
+		this.state.active++;
+		const work = acknowledgement
+			.then(
+				(outcome) => {
+					if (outcome === "uncertain") this.markUncertain();
+				},
+				() => this.markUncertain(),
+			)
+			.finally(() => {
+				scope?.children.delete(work);
+				this.state.active--;
+			});
+		scope?.children.add(work);
+	}
+
+	/** Unknown work is absorbing: reload, cancellation and later exit cannot release the claim. */
+	markUncertain(): void {
+		this.state.uncertain = true;
+		this.state.reservation?.reportSettlement("uncertain");
 	}
 
 	/** Execute an accepted human handoff without changing the outgoing reservation or its children. */
@@ -208,8 +244,10 @@ export class OwnerActivity {
 		}
 		if (this.busy) return { status: "rejected", reason: "busy" };
 		if (!supported) return { status: "rejected", reason: "unsupported" };
+		const { promise: settlement, resolve: reportSettlement } = Promise.withResolvers<Settlement>();
 		const reservation: Reservation = {
 			kind: "autonomous",
+			reportSettlement,
 			generation: this.state.generation,
 			lifecycle: this.state.lifecycle,
 			authorize,
@@ -242,10 +280,13 @@ export class OwnerActivity {
 						await Promise.allSettled([...reservation.children]);
 					}
 					reservation.closed = true;
-					this.state.reservation = undefined;
+					if (!this.state.uncertain) {
+						this.state.reservation = undefined;
+						reportSettlement("settled");
+					}
 				}
 			}),
 		);
-		return { status: "running", completion };
+		return { status: "running", completion, settlement };
 	}
 }
