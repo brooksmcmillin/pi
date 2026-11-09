@@ -14,7 +14,7 @@
 
 ## Code Quality
 
-- Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.
+- Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when investigating or auditing without verified prior coverage. Do not rely on search snippets for broad changes. After a phase transition or compaction, reuse a prior full inspection only when the existing implementation contract records repository/path, inspected revision and content hash (including local edits), full-read evidence, relevant symbols, caller/ownership boundaries, and regression seams. Verify current content against that identity; then read only the affected regions and callers needed for the current question. A known narrow edit may extend coverage after inspecting its complete diff and affected callers against the verified prior source. Stale or unknown identity, missing/unrecoverable coverage, or broad architectural changes require fresh full inspection of the affected files. Keep current coverage and next reads in the contract; keep historical evidence behind references, not a separate coverage store.
 - No `any` unless absolutely necessary.
 - No runtime checks of values whose types TypeScript already guarantees (no `typeof`/`instanceof`/`Array.isArray`/shape guards on typed parameters, typed callback results or typed declarations). Validate only at decided trust boundaries (wire input, schema-checked arguments and params).
 - Inline single-line helpers that have only one call site.
