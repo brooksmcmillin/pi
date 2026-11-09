@@ -192,7 +192,7 @@ describe("builtin providers", () => {
 			["openrouter", "openai/gpt-5.6-terra"],
 		] as const;
 		const unsupported = [
-			["fireworks", "accounts/fireworks/models/nemotron-3-ultra-nvfp4"],
+			["fireworks", "accounts/fireworks/models/deepseek-v4p1-flash"],
 			["openai", "gpt-4.1"],
 			["openai", "gpt-5.2"],
 			["anthropic", "claude-sonnet-4-5"],
@@ -212,9 +212,9 @@ describe("builtin providers", () => {
 			);
 		}
 		for (const [provider, modelId] of unsupported) {
-			expect(models.getModel(provider, modelId), `${provider}/${modelId}`).not.toHaveProperty(
-				"compat.supportsMidConvoSystemMessages",
-			);
+			const model = models.getModel(provider, modelId);
+			expect(model, `${provider}/${modelId}`).toBeDefined();
+			expect(model, `${provider}/${modelId}`).not.toHaveProperty("compat.supportsMidConvoSystemMessages");
 		}
 	});
 

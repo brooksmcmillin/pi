@@ -32,6 +32,7 @@ function generateFireworksModels(
 			id: `accounts/fireworks/models/${id}`,
 			type: "chat",
 			name: id,
+			limit: { context: 200000, output: 32768 },
 			modalities: { input: ["text"], output: ["text"] },
 			capabilities: {
 				tools: { supported: true },
@@ -119,6 +120,25 @@ describe("Fireworks model generation", () => {
 		}).result();
 		expect(payload?.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload?.output_config).toEqual({ effort: "max" });
+	});
+
+	// Regression for #9323: preserve budget-based thinking without depending on a live catalog model.
+	it("keeps toggle-only Messages models without a verified fallback on budget-based thinking", async () => {
+		const models = generateFireworksModels({ "toggle-only": [{ type: "toggle" }] });
+		const model = models["accounts/fireworks/models/toggle-only"];
+		if (!hasApi(model, "anthropic-messages")) throw new Error("Expected Messages model");
+		expect(model.compat?.forceAdaptiveThinking).toBeUndefined();
+		let payload: Record<string, unknown> | undefined;
+		await streamSimple(model, normalizeContext({ messages: [{ role: "user", content: "test", timestamp: 0 }] }), {
+			apiKey: "test-fireworks-key",
+			reasoning: "high",
+			onPayload: (value) => {
+				payload = value as Record<string, unknown>;
+				throw new Error("payload captured");
+			},
+		}).result();
+		expect(payload?.thinking).toEqual({ type: "enabled", budget_tokens: 16384, display: "summarized" });
+		expect(payload?.output_config).toBeUndefined();
 	});
 
 	it("does not infer adaptive thinking from toggle, budget, or missing metadata", () => {
