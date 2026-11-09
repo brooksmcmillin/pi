@@ -174,6 +174,10 @@ class PendingMessageQueue {
 		return drained;
 	}
 
+	prepend(messages: AgentMessage[]): void {
+		this.messages = [...messages, ...this.messages];
+	}
+
 	clear(): void {
 		this.messages = [];
 	}
@@ -377,16 +381,21 @@ export class Agent {
 	}
 
 	/** Start a new prompt from text, a single message, or a batch of messages. */
-	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
+	async prompt(message: AgentMessage | AgentMessage[], options?: { skipInitialSteeringPoll?: boolean }): Promise<void>;
 	async prompt(input: string, images?: ImageContent[]): Promise<void>;
-	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
+	async prompt(
+		input: string | AgentMessage | AgentMessage[],
+		imagesOrOptions?: ImageContent[] | { skipInitialSteeringPoll?: boolean },
+	): Promise<void> {
 		if (this.activeRun) {
 			throw new Error(
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
 			);
 		}
+		const images = Array.isArray(imagesOrOptions) ? imagesOrOptions : undefined;
+		const options = Array.isArray(imagesOrOptions) ? undefined : imagesOrOptions;
 		const messages = this.normalizePromptInput(input, images);
-		await this.runPromptMessages(messages);
+		await this.runPromptMessages(messages, options);
 	}
 
 	/** Continue from the current transcript. The last message must be a user or tool-result message. */
@@ -608,6 +617,10 @@ export class Agent {
 				break;
 
 			case "agent_end":
+				if (event.unconsumedMessages) {
+					const queue = event.unconsumedMessages.queue === "steering" ? this.steeringQueue : this.followUpQueue;
+					queue.prepend(event.unconsumedMessages.messages);
+				}
 				this._state.streamingMessage = undefined;
 				break;
 		}

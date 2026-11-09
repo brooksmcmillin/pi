@@ -159,6 +159,8 @@ export type FinishTurn = (
 
 /** Replacement runtime state used by the agent loop before starting another provider request. */
 export interface AgentLoopTurnUpdate {
+	/** End the run before starting another turn; other update fields are ignored. */
+	action?: "end";
 	/** Context for the next provider request. */
 	context?: AgentContext;
 	/** Messages to append before the next provider request, with normal lifecycle events. */
@@ -177,7 +179,7 @@ export interface PrepareRequestContext {
 }
 
 /** Replacement runtime state for the provider request being prepared. */
-export type AgentRequestUpdate = Omit<AgentLoopTurnUpdate, "messages">;
+export type AgentRequestUpdate = Omit<AgentLoopTurnUpdate, "messages" | "action">;
 
 /**
  * Called immediately before every conversational provider request, including the first.
@@ -528,7 +530,16 @@ export interface AgentContext {
 export type AgentEvent =
 	// Agent lifecycle
 	| { type: "agent_start" }
-	| { type: "agent_end"; messages: AgentMessage[] }
+	| {
+			type: "agent_end";
+			messages: AgentMessage[];
+			/**
+			 * Selected but undelivered messages returned when preparation ends the run.
+			 * Low-level loop consumers must prepend these to their original queue.
+			 * Agent restores them before notifying listeners; they are not transcript messages.
+			 */
+			unconsumedMessages?: { queue: "steering" | "followUp"; messages: AgentMessage[] };
+	  }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }

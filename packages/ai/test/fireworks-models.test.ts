@@ -159,6 +159,26 @@ describe("Fireworks models", () => {
 		expect(getSupportedThinkingLevels(getModel("fireworks", modelId))).toEqual(levels);
 	});
 
+	it("keeps Messages models without adaptive thinking on budget-based thinking", async () => {
+		const model = createFireworksModel();
+		expect(model.compat?.forceAdaptiveThinking).toBeUndefined();
+		let payload: Record<string, unknown> | undefined;
+		await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "test", timestamp: 0 }] },
+			{
+				apiKey: "test-fireworks-key",
+				reasoning: "high",
+				onPayload: (value) => {
+					payload = value as Record<string, unknown>;
+					throw new Error("payload captured");
+				},
+			},
+		).result();
+		expect(payload?.thinking).toEqual({ type: "enabled", budget_tokens: 16384, display: "summarized" });
+		expect(payload?.output_config).toBeUndefined();
+	});
+
 	it("resolves FIREWORKS_API_KEY from the environment", () => {
 		process.env.FIREWORKS_API_KEY = "test-fireworks-key";
 
