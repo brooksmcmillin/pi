@@ -3,6 +3,7 @@
  * Handles TUI rendering and user interaction, delegating business logic to AgentSession.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -273,6 +274,7 @@ type ExtensionDialogComponent = Component & { dispose?(): void };
 type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
+	run: ReturnType<typeof AsyncLocalStorage.snapshot>;
 };
 
 type CompactionCostNotice = {
@@ -4962,7 +4964,8 @@ export class InteractiveMode {
 	}
 
 	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
+		// Completion events may run in an autonomous scope, not the submitter's context.
+		this.compactionQueuedMessages.push({ text, mode, run: AsyncLocalStorage.snapshot() });
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
@@ -5004,11 +5007,11 @@ export class InteractiveMode {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
 					if (this.isExtensionCommand(message.text)) {
-						await this.session.prompt(message.text);
+						await message.run(() => this.session.prompt(message.text));
 					} else if (message.mode === "followUp") {
-						await this.session.followUp(message.text);
+						await message.run(() => this.session.followUp(message.text));
 					} else {
-						await this.session.steer(message.text);
+						await message.run(() => this.session.steer(message.text));
 					}
 				}
 				this.updatePendingMessagesDisplay();
@@ -5020,7 +5023,7 @@ export class InteractiveMode {
 			if (firstPromptIndex === -1) {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
-					await this.session.prompt(message.text);
+					await message.run(() => this.session.prompt(message.text));
 				}
 				return;
 			}
@@ -5031,12 +5034,12 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
-				await this.session.prompt(message.text);
+				await message.run(() => this.session.prompt(message.text));
 			}
 
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
-			const promptPromise = this.session
-				.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode })
+			const promptPromise = firstPrompt
+				.run(() => this.session.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode }))
 				.catch((error) => {
 					restoreQueue(error);
 				});
@@ -5044,11 +5047,11 @@ export class InteractiveMode {
 			// Queue remaining messages
 			for (const message of rest) {
 				if (this.isExtensionCommand(message.text)) {
-					await this.session.prompt(message.text);
+					await message.run(() => this.session.prompt(message.text));
 				} else if (message.mode === "followUp") {
-					await this.session.followUp(message.text);
+					await message.run(() => this.session.followUp(message.text));
 				} else {
-					await this.session.steer(message.text);
+					await message.run(() => this.session.steer(message.text));
 				}
 			}
 			this.updatePendingMessagesDisplay();

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
@@ -255,9 +256,47 @@ describe("InteractiveMode compaction events", () => {
 		expect(abort).toHaveBeenCalledOnce();
 	});
 
+	test.each([
+		{ willRetry: true, texts: ["/command", "steer", "followUp"] },
+		{ willRetry: false, texts: ["/command", "/other"] },
+		{ willRetry: false, texts: ["/before", "prompt", "/after", "steer", "followUp"] },
+	])("restores each queued context for $texts with retry=$willRetry", async ({ willRetry, texts }) => {
+		const context = new AsyncLocalStorage<string>();
+		const observed: (string | undefined)[] = [];
+		const send = async () => {
+			await Promise.resolve();
+			observed.push(context.getStore());
+		};
+		const ui = {
+			compactionQueuedMessages: [],
+			editor: { setText: vi.fn() },
+			session: { prompt: send, steer: send, followUp: send, clearQueue: vi.fn() },
+			isExtensionCommand: (text: string) => text.startsWith("/"),
+			updatePendingMessagesDisplay: vi.fn(),
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+		};
+		const methods = InteractiveMode.prototype as unknown as {
+			queueCompactionMessage(this: unknown, text: string, mode: "steer" | "followUp"): void;
+			flushCompactionQueue(this: unknown, options: { willRetry: boolean }): Promise<void>;
+		};
+		for (const [index, text] of texts.entries()) {
+			// Distinct contexts include a guarded-origin stand-in: draining must not elevate it.
+			context.run(`origin-${index}`, () =>
+				methods.queueCompactionMessage.call(ui, text, text === "followUp" ? "followUp" : "steer"),
+			);
+		}
+		await context.run("completion-context", () => methods.flushCompactionQueue.call(ui, { willRetry }));
+		expect(observed).toEqual(texts.map((_, index) => `origin-${index}`));
+		expect(ui.compactionQueuedMessages).toEqual([]);
+		expect(ui.showError).not.toHaveBeenCalled();
+	});
+
 	test("preserves steering behavior when flushing into an active agent run", async () => {
 		const fakeThis = {
-			compactionQueuedMessages: [{ text: "change direction", mode: "steer" as const }],
+			compactionQueuedMessages: [
+				{ text: "change direction", mode: "steer" as const, run: AsyncLocalStorage.snapshot() },
+			],
 			session: {
 				clearQueue: vi.fn(),
 				prompt: vi.fn().mockResolvedValue(undefined),

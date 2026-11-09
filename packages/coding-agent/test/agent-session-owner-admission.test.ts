@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgentSession, markRuntimeStreamFunction } from "../src/core/agent-session.ts";
+import { AgentSession, type AgentSessionEvent, markRuntimeStreamFunction } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { convertToLlm } from "../src/core/messages.ts";
@@ -134,6 +134,11 @@ async function fixture(
 
 const interactive = InteractiveMode.prototype as unknown as {
 	setupKeyHandlers(this: unknown): void;
+	setupEditorSubmitHandler(this: unknown): void;
+	handleFollowUp(this: unknown): Promise<void>;
+	queueCompactionMessage(this: unknown, text: string, mode: "steer" | "followUp"): void;
+	flushCompactionQueue(this: unknown, options?: { willRetry?: boolean }): Promise<void>;
+	handleEvent(this: unknown, event: AgentSessionEvent): Promise<void>;
 	cycleModel(this: unknown, direction: "forward" | "backward"): Promise<void>;
 	cycleThinkingLevel(this: unknown): void;
 	showModelSelector(this: unknown): void;
@@ -507,6 +512,140 @@ describe("guarded session dispatch", () => {
 		).toHaveLength(1);
 		expect(session.agent.hasQueuedMessages()).toBe(false);
 		expect(session.pendingMessageCount).toBe(0);
+	});
+
+	it.each([
+		["threshold", "steer"],
+		["threshold", "followUp"],
+		["overflow", "steer"],
+		["overflow", "followUp"],
+	] as const)("hands off TUI input queued during %s compaction as human %s", async (reason, mode) => {
+		initTheme("dark");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const humanInputs: string[] = [];
+		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "human tool" }], details: {} }));
+		const { session, faux } = await fixture(undefined, [
+			(pi) => {
+				pi.registerTool({
+					name: "bash",
+					label: "bash",
+					description: "in-process mock",
+					parameters: Type.Object({}),
+					execute,
+				});
+				pi.on("input", (event) => {
+					if (event.source !== "extension") humanInputs.push(event.text);
+				});
+				pi.on("session_before_compact", async (event) => {
+					entered.resolve();
+					await release.promise;
+					return {
+						compaction: {
+							summary: "compacted",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					};
+				});
+			},
+		]);
+		session.agent.convertToLlm = convertToLlm;
+		faux.setResponses([fauxAssistantMessage("old history"), fauxAssistantMessage("recent history")]);
+		await session.prompt("seed old");
+		await session.prompt("seed recent");
+		humanInputs.length = 0;
+		await session.setModel({ ...session.model!, contextWindow: 2000, maxTokens: 100 });
+		session.settingsManager.applyOverrides({
+			compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 1 },
+		});
+		session.setActiveToolsByName(["bash"]);
+		let humanToolRequested = false;
+		const response: FauxResponseFactory = async (context) => {
+			faux.appendResponses([response]);
+			const human = context.messages.some(
+				(message) => message.role === "user" && contentText(message.content, "") === "human queued",
+			);
+			if (human && !humanToolRequested) {
+				humanToolRequested = true;
+				return fauxAssistantMessage(fauxToolCall("bash", {}), { stopReason: "toolUse" });
+			}
+			return fauxAssistantMessage("done");
+		};
+		faux.setResponses([
+			reason === "overflow"
+				? fauxAssistantMessage("", { stopReason: "error", errorMessage: "maximum context length exceeded" })
+				: fauxAssistantMessage("x".repeat(6800)),
+			response,
+		]);
+		const editor = {
+			onSubmit: undefined as ((text: string) => Promise<void>) | undefined,
+			getText: () => "human queued",
+			setText: vi.fn(),
+			addToHistory: vi.fn(),
+		};
+		const drains: Promise<void>[] = [];
+		const ui = {
+			session,
+			editor,
+			defaultEditor: editor,
+			isInitialized: true,
+			compactionQueuedMessages: [] as { text: string; mode: "steer" | "followUp" }[],
+			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn() },
+			settingsManager: session.settingsManager,
+			sessionManager: session.sessionManager,
+			chatContainer: { clear: vi.fn(), addChild: vi.fn() },
+			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+			renderSessionEntries: vi.fn(),
+			addMessageToChat: vi.fn(),
+			addCompactionCostNotice: vi.fn(),
+			clearStatusIndicator: vi.fn(),
+			updatePendingMessagesDisplay: vi.fn(),
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+			isExtensionCommand: () => false,
+			queueCompactionMessage: (text: string, mode: "steer" | "followUp") =>
+				interactive.queueCompactionMessage.call(ui, text, mode),
+			flushCompactionQueue: (options: { willRetry?: boolean }) => {
+				const drain = interactive.flushCompactionQueue.call(ui, options);
+				drains.push(drain);
+				return drain;
+			},
+		};
+		interactive.setupEditorSubmitHandler.call(ui);
+		const ends: AgentSessionEvent[] = [];
+		const delivered: string[] = [];
+		session.subscribe((event) => {
+			if (event.type === "compaction_end") {
+				ends.push(event);
+				void interactive.handleEvent.call(ui, event);
+			}
+			if (event.type === "message_start" && event.message.role === "user")
+				delivered.push(contentText(event.message.content, ""));
+		});
+		const result = session.submitGuardedPrompt("autonomous", session.ownerSnapshot, () => true, true);
+		if (result.status !== "running") throw new Error(JSON.stringify(result));
+		await entered.promise;
+		expect(session.isCompacting).toBe(true);
+		if (mode === "steer") await editor.onSubmit!("human queued");
+		else await interactive.handleFollowUp.call(ui);
+		expect(ui.compactionQueuedMessages).toHaveLength(1);
+		expect(session.submitGuardedPrompt("competitor", session.ownerSnapshot, () => true, true)).toEqual({
+			status: "rejected",
+			reason: "busy",
+		});
+		release.resolve();
+		await result.completion;
+		await Promise.all(drains);
+		expect(ends[0]).toMatchObject({ type: "compaction_end", reason, willRetry: reason === "overflow" });
+		expect(ui.showError).not.toHaveBeenCalled();
+		expect(ui.compactionQueuedMessages).toHaveLength(0);
+		expect(humanInputs).toEqual(["human queued"]);
+		expect(delivered.filter((text) => text === "human queued")).toEqual(["human queued"]);
+		expect(execute).toHaveBeenCalledTimes(1);
+		expect(session.pendingMessageCount).toBe(0);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
 	});
 
 	it("hands off before_agent_start input without running input hooks twice", async () => {
