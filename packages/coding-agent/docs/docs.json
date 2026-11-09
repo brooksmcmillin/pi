@@ -195,6 +195,10 @@
         {
           "title": "Message Types",
           "path": "message-types.md"
+        },
+        {
+          "title": "Owner Admission",
+          "path": "owner-admission.md"
         }
       ]
     }
