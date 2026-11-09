@@ -1,9 +1,9 @@
 import { createInterface } from "node:readline";
-import { spawn } from "child_process";
 import path from "path";
 import { type Static, Type } from "typebox";
-import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { resolveSearchTool, spawnSearchProcess } from "../managed-search-process.ts";
+import { OwnerActivity } from "../owner-activity.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { findRenderers } from "./renderers/find.ts";
 import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -84,6 +84,9 @@ export function createFindToolDefinition(
 			_onUpdate?,
 			ctx?: ExtensionContext,
 		) {
+			if (customOps && OwnerActivity.current?.guarded) {
+				throw new Error("Autonomous custom search operations are unsupported");
+			}
 			return new Promise((resolve, reject) => {
 				if (signal?.aborted) {
 					reject(new Error("Operation aborted"));
@@ -172,7 +175,7 @@ export function createFindToolDefinition(
 						}
 
 						// Default implementation uses fd.
-						const fdPath = await ensureTool("fd");
+						const fdPath = await resolveSearchTool("fd", false);
 						if (signal?.aborted) {
 							settle(() => reject(new Error("Operation aborted")));
 							return;
@@ -217,7 +220,8 @@ export function createFindToolDefinition(
 						}
 						args.push("--", effectivePattern, searchPath);
 
-						const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const processHandle = spawnSearchProcess(fdPath, args, signal);
+						const child = processHandle.child;
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						// Results within the limit, stored only up to the first one past the byte cap:
@@ -230,7 +234,7 @@ export function createFindToolDefinition(
 
 						stopChild = () => {
 							if (!child.killed) {
-								child.kill();
+								processHandle.stop();
 							}
 						};
 
