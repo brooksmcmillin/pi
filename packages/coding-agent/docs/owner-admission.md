@@ -1,6 +1,16 @@
-# Internal owner admission
+# Guarded owner admission
 
-This is a core integration primitive, not an enabled Autopilot feature or an extension capability advertisement. It does not grant consent, budgets or publication authority.
+This is a cooperative runtime primitive, not an enabled Autopilot feature. It does not grant consent, budgets or publication authority.
+
+## Extension and SDK capability
+
+`session.guardedOwner` and `ctx.guardedOwner` expose the same version-1 in-process contract. They are absent by default. An SDK host must explicitly supply `guardedOwner: { isSupported() { ... } }` when creating the session, attesting the backend boundary below. This callback is host code, not a wire flag, persisted setting or extension-controlled opt-in. The CLI does not enable it. Session restoration never reconstructs this attestation.
+
+Capture `capability.snapshot()` and pass it to `capability.submit({ requestId, expected, text, authorize })`. The snapshot binds the live owner symbol and generation, session ID/file and working directory. `authorize` synchronously checks current caller permission and shared writer claims without performing work; it is rechecked with host support after asynchronous preparation. The runtime still independently rejects unknown stream backends and unsupported subprocess paths.
+
+A `rejected` result guarantees the prompt never entered executable hooks. A `running` result includes the caller's `requestId`, execution `completion`, separate `settlement`, and `cancel()`. Completion rejection after admission is not a safe pre-dispatch rejection: an input hook may already have had effects. Completion resolution means the prompt pipeline finished, not that every model/tool action succeeded. Inspect its transcript for those outcomes. Release writer claims only on explicit `settled` acknowledgement, even after cancellation or execution failure. `uncertain` can arrive while completion remains pending and must retain claims.
+
+`cancel()` requests cancellation only while its own prompt is active. It cannot abort a later human prompt, and it does not acknowledge settlement. It preserves accepted human handoff work. Captured capabilities become stale on reload, tree navigation, disposal or replacement; their handles may still report outcomes. Request IDs correlate a live handle, not an idempotent retry service: lost acceptance is uncertain, and consumers must not blindly resubmit. No RPC takeover, terminal injection, replacement runner or automatic workflow entry is provided.
 
 `AgentSession.ownerSnapshot` identifies the live owner and its generation. A snapshot is not authorization. `submitGuardedPrompt(text, snapshot, authorize, supported)` synchronously reserves that owner or returns `busy`, `stale`, `revoked`, or `unsupported`. Rejected requests are never steered or queued. `authorize` is a synchronous, side-effect-free check of host-owned authority; it is checked again before dispatch. `supported` defaults to false and must come from trusted host validation of the participating backend, never a wire argument or model-authored tool input.
 

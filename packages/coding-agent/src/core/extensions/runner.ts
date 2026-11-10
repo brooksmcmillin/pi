@@ -370,6 +370,7 @@ export class ExtensionRunner {
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
+	private getGuardedOwner: ExtensionContextActions["getGuardedOwner"];
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private getScopedModels: () => readonly ScopedModel[] = () => [];
 	private isIdleFn: () => boolean = () => true;
@@ -444,6 +445,7 @@ export class ExtensionRunner {
 		this.runtime.createContext = () => this.createContext();
 
 		// Context actions (required)
+		this.getGuardedOwner = contextActions.getGuardedOwner;
 		this.getModel = contextActions.getModel;
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
@@ -893,6 +895,10 @@ export class ExtensionRunner {
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
 		return {
+			get guardedOwner() {
+				runner.assertActive();
+				return runner.getGuardedOwner?.();
+			},
 			get ui() {
 				runner.assertActive();
 				return runner.uiContext;

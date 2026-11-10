@@ -10,6 +10,7 @@ import { CacheWarmer } from "./cache-warmer.ts";
 import { getClientIdentity } from "./client-identity.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
+import type { GuardedOwnerSupport } from "./guarded-owner.ts";
 import { createToolNameMatcher } from "./mcp-servers.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
@@ -46,6 +47,8 @@ import { getBranchSelection } from "./virtual-models.ts";
 setDefaultStreamFn(streamSimple);
 
 export interface CreateAgentSessionOptions {
+	/** Host-only cooperative backend attestation. Omitted by default; never restored from session data. */
+	guardedOwner?: GuardedOwnerSupport;
 	/** Working directory for project-local discovery. Default: process.cwd() */
 	cwd?: string;
 	/** Global config directory. Default: ~/.pi/agent */
@@ -454,6 +457,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const session = new AgentSession({
+		guardedOwner: options.guardedOwner,
 		agent,
 		sessionManager,
 		settingsManager,

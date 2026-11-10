@@ -15,6 +15,7 @@
 - `pi auth login <provider>` logs in to a provider from the shell without starting a session, for example `pi auth login radius`. It signs in with an account in the browser and exits; `--api-key` saves an API key instead, and `--no-browser` uses device code or copy-code sign-in instead. Logging in to Radius also configures the Radius MCP server. `pi auth logout <provider>` removes the stored credentials, like `/logout`
 - `ctx.ui.custom()` overlays now honor the `blocked` option: pi reports blocked program status (OSC 7501) from when the overlay is shown until it calls `done()`, also while it is hidden with `setHidden()`. Closing one overlay keeps other open questions blocked ([#11816](https://github.com/earendil-works/pi/issues/11816))
 - Added a `pi-fork` launcher and persistent fork identity in the terminal title and default footer, without changing configuration or session storage paths.
+- Added default-disabled `session.guardedOwner` / `ctx.guardedOwner` capabilities for host-attested cooperative submission, with session/generation binding, prompt-scoped cancellation and independent settlement acknowledgements.
 
 ### Changed
 
