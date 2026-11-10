@@ -379,7 +379,12 @@ describe("guarded session dispatch", () => {
 		},
 	);
 
-	it.each(["response", "boundary"] as const)("prioritizes human steering over continuation at %s", async (stage) => {
+	it.each([
+		["response", "one-at-a-time"],
+		["response", "all"],
+		["boundary", "one-at-a-time"],
+		["boundary", "all"],
+	] as const)("prioritizes human steering over continuation at %s in %s mode", async (stage, mode) => {
 		const boundaryEntered = deferred();
 		const boundaryRelease = deferred();
 		let continued = false;
@@ -412,14 +417,24 @@ describe("guarded session dispatch", () => {
 			"bash",
 			2,
 		);
+		session.agent.steeringMode = mode;
+		const delivered: string[] = [];
+		session.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "user")
+				delivered.push(contentText(event.message.content, ""));
+		});
 		const result = session.submitGuardedPrompt("autonomous", session.ownerSnapshot, () => true, true);
 		if (result.status !== "running") throw new Error(JSON.stringify(result));
 		await entered.promise;
-		if (stage === "response") await session.steer("human priority");
+		if (stage === "response") {
+			await session.steer("human priority");
+			await session.steer("human second");
+		}
 		release.resolve();
 		if (stage === "boundary") {
 			await boundaryEntered.promise;
 			await session.steer("human priority");
+			await session.steer("human second");
 			boundaryRelease.resolve();
 		}
 		await result.completion;
@@ -429,6 +444,12 @@ describe("guarded session dispatch", () => {
 			),
 		).toBe(true);
 		expect(execute).toHaveBeenCalledTimes(1);
+		expect(delivered.filter((text) => text.startsWith("human"))).toEqual(["human priority", "human second"]);
+		expect(
+			provider.mock.calls[1][1].messages.some(
+				(message) => message.role === "user" && contentText(message.content, "") === "human second",
+			),
+		).toBe(mode === "all");
 		expect(session.pendingMessageCount).toBe(0);
 	});
 

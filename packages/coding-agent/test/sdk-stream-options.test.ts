@@ -338,11 +338,14 @@ describe("createAgentSession stream options", () => {
 
 	it.each([
 		{ deliverAs: "steer" as const, triggerTurn: true },
+		{ deliverAs: "steer" as const, triggerTurn: undefined },
 		{ deliverAs: "followUp" as const, triggerTurn: true },
 		{ deliverAs: "followUp" as const, triggerTurn: undefined },
 		{ deliverAs: "followUp" as const, triggerTurn: false },
 		{ userQueue: "steer" as const, triggerTurn: true },
 		{ userQueue: "followUp" as const, triggerTurn: true },
+		{ entrypoint: "prompt" as const, triggerTurn: true },
+		{ entrypoint: "sendUserMessage" as const, triggerTurn: true },
 	])("fences maintenance custom-message turns while streaming: %j", async (messageOptions) => {
 		const entered = Promise.withResolvers<void>();
 		const response = createAssistantMessageEventStream();
@@ -358,7 +361,16 @@ describe("createAgentSession stream options", () => {
 				pi.on("cache_warming_decision", async () => {
 					decisions++;
 					const userQueue = "userQueue" in messageOptions ? messageOptions.userQueue : undefined;
-					if (userQueue) {
+					if ("entrypoint" in messageOptions) {
+						const attempt =
+							messageOptions.entrypoint === "prompt"
+								? fixture.session.prompt("maintenance input", {
+										source: "extension",
+										streamingBehavior: "steer",
+									})
+								: fixture.session.sendUserMessage("maintenance input", { deliverAs: "followUp" });
+						await attempt.catch((error: Error) => errors.push(error.message));
+					} else if (userQueue) {
 						await fixture.session[userQueue]("maintenance input", undefined, {
 							source: "extension",
 						}).catch((error: Error) => errors.push(error.message));
@@ -389,6 +401,8 @@ describe("createAgentSession stream options", () => {
 				messageOptions.triggerTurn === false ? [] : ["Cache maintenance cannot start agent turns"],
 			);
 			expect(fixture.providerCalls()).toBe(1);
+			expect(fixture.session.pendingMessageCount).toBe(0);
+			expect(fixture.session.agent.hasQueuedMessages()).toBe(false);
 			expect(fixture.session.agent.state.messages.some((message) => message.role === "custom")).toBe(
 				messageOptions.triggerTurn === false,
 			);
