@@ -159,7 +159,8 @@ describe("Fireworks models", () => {
 		expect(getSupportedThinkingLevels(getModel("fireworks", modelId))).toEqual(levels);
 	});
 
-	it("keeps Messages models without adaptive thinking on budget-based thinking", async () => {
+	it("keeps non-adaptive Messages models on budget-based thinking", async () => {
+		// Use a fixed fixture: the live catalog no longer lists toggle-only Messages models.
 		const model = createFireworksModel();
 		expect(model.compat?.forceAdaptiveThinking).toBeUndefined();
 		let payload: Record<string, unknown> | undefined;
