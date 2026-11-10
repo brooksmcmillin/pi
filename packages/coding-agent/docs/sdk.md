@@ -69,6 +69,10 @@ A steering message enters after the current assistant turn and its tool calls. A
 
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
+## Guarded owner submission
+
+`session.guardedOwner` is an optional versioned capability for a host-validated cooperative backend. It is absent by default; creating a session with an explicit `guardedOwner.isSupported` callback enables inspection and guarded submission, not task consent. Extensions receive it as `ctx.guardedOwner`. See [Guarded owner admission](owner-admission.md) for identity binding, cancellation, settlement and unsupported subprocess boundaries. Do not substitute `prompt()` when this capability is missing.
+
 ## Subscribing to events
 
 Subscribe before prompting when the host needs streamed output:

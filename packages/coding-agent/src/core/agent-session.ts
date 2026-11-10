@@ -115,12 +115,13 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
+import type { GuardedOwnerCapability, GuardedOwnerSupport, GuardedPromptResult } from "./guarded-owner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
-import type { AdmissionResult, OwnerActivity, OwnerSnapshot } from "./owner-activity.ts";
+import type { OwnerActivity, OwnerSnapshot } from "./owner-activity.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
@@ -265,6 +266,8 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 }
 
 export interface AgentSessionConfig {
+	/** Disabled unless the host explicitly supplies current cooperative-backend support. */
+	guardedOwner?: GuardedOwnerSupport;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
@@ -414,6 +417,9 @@ export class AgentSession {
 	private _ownerActivity: OwnerActivity;
 	private _disposed = false;
 	private _guardedPromptActive = false;
+	private _guardedPromptOperation: symbol | undefined;
+	private _guardedOwnerLifetime = Symbol("guarded-owner");
+	private readonly _guardedOwnerSupport: GuardedOwnerSupport | undefined;
 	private _humanHandoffCancelled = false;
 	private _humanHandoff: Array<{ message: UserMessage; behavior: "steer" | "followUp" }> = [];
 
@@ -523,6 +529,7 @@ export class AgentSession {
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
+		this._guardedOwnerSupport = config.guardedOwner;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
@@ -565,7 +572,37 @@ export class AgentSession {
 		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
 	}
 
-	/** Internal admission snapshot; the extension-facing capability API is a separate layer. */
+	/** Absent by default. Captured capabilities cannot cross reload or session replacement. */
+	get guardedOwner(): GuardedOwnerCapability | undefined {
+		const support = this._guardedOwnerSupport;
+		if (!support || this._disposed) return undefined;
+		const lifetime = this._guardedOwnerLifetime;
+		const current = () => !this._disposed && lifetime === this._guardedOwnerLifetime;
+		return {
+			version: 1,
+			boundary: "cooperative-managed-search",
+			snapshot: () => {
+				if (!current()) throw new Error("Guarded owner capability is stale");
+				return { ...this.ownerSnapshot, sessionId: this.sessionId, sessionFile: this.sessionFile, cwd: this._cwd };
+			},
+			submit: ({ requestId, expected, text, authorize }) => {
+				const { owner, generation, sessionId, sessionFile, cwd } = expected;
+				const bound = () =>
+					current() && sessionId === this.sessionId && sessionFile === this.sessionFile && cwd === this._cwd;
+				if (!bound()) return { status: "rejected", reason: "stale", requestId };
+				if (!support.isSupported()) return { status: "rejected", reason: "unsupported", requestId };
+				const result = this.submitGuardedPrompt(
+					text,
+					{ owner, generation },
+					() => bound() && support.isSupported() && authorize(),
+					true,
+				);
+				return { ...result, requestId };
+			},
+		};
+	}
+
+	/** Internal admission snapshot; observation alone does not authorize submission. */
 	get ownerSnapshot(): OwnerSnapshot {
 		return this._ownerActivity.snapshot;
 	}
@@ -590,6 +627,8 @@ export class AgentSession {
 	/** Fence pending requests before a session replacement begins its asynchronous hooks. */
 	invalidateOwner(): void {
 		this._humanHandoffCancelled = true;
+		this._guardedOwnerLifetime = Symbol("guarded-owner");
+		this._guardedPromptOperation = undefined;
 		this._ownerActivity.invalidate();
 	}
 
@@ -603,7 +642,7 @@ export class AgentSession {
 		expected: OwnerSnapshot,
 		authorize: () => boolean,
 		supported = false,
-	): AdmissionResult<void> {
+	): GuardedPromptResult {
 		if (this._disposed) return { status: "rejected", reason: "stale" };
 		if (
 			this._ownerActivity.busy ||
@@ -622,13 +661,16 @@ export class AgentSession {
 		if (commandName && this._extensionRunner.getCommand(commandName)) {
 			return { status: "rejected", reason: "unsupported" };
 		}
-		return this._ownerActivity.submit(expected, authorize, supported, async () => {
+		const operation = Symbol("guarded-prompt");
+		const result = this._ownerActivity.submit(expected, authorize, supported, async () => {
+			this._guardedPromptOperation = operation;
 			this._guardedPromptActive = true;
 			this._humanHandoffCancelled = false;
 			try {
 				await this.prompt(text, { source: "extension" });
 			} finally {
 				this._guardedPromptActive = false;
+				if (this._guardedPromptOperation === operation) this._guardedPromptOperation = undefined;
 				if (!this._disposed && !this._humanHandoffCancelled && this._humanHandoff.length > 0) {
 					await this._ownerActivity.runHumanInput(async () => {
 						const inputs = this._humanHandoff.splice(0);
@@ -658,6 +700,13 @@ export class AgentSession {
 				}
 			}
 		});
+		if (result.status === "rejected") return result;
+		return {
+			...result,
+			cancel: () => {
+				if (this._guardedPromptOperation === operation) this._abortRun();
+			},
+		};
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -2770,6 +2819,11 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this._humanHandoffCancelled = true;
+		this._abortRun();
+		await this.waitForIdle();
+	}
+
+	private _abortRun(): void {
 		this._ownerActivity.intervene();
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
@@ -2779,7 +2833,6 @@ export class AgentSession {
 		this.abortBranchSummary();
 		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
 		this.agent.abort();
-		await this.waitForIdle();
 	}
 
 	async waitForIdle(): Promise<void> {
@@ -3775,6 +3828,7 @@ export class AgentSession {
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
 			},
 			{
+				getGuardedOwner: () => this.guardedOwner,
 				getModel: () => this.model,
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,

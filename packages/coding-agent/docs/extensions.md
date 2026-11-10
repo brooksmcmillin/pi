@@ -1252,6 +1252,10 @@ pi.on("tool_result", async (event, ctx) => {
 });
 ```
 
+### ctx.guardedOwner
+
+Optional, versioned in-process capability for guarded submission to this owner. It is absent unless the host explicitly enables a supported cooperative backend. Require the expected version and coverage; never fall back to `sendUserMessage()` or an idle check. The caller still owns consent and writer claims. See [Guarded owner admission](owner-admission.md) for snapshots, cancellation, rejected/running outcomes and independent settlement acknowledgements.
+
 ### ctx.isIdle() / ctx.abort() / ctx.hasPendingMessages()
 
 Control flow helpers. `ctx.isIdle()` is false while Pi is processing an agent run, automatic retry, auto-compaction retry, or queued continuation.
