@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Preserve all `process` output when pipe-reader delivery is delayed after the child exits; readers now drain buffered bytes before applying the idle-pipe cutoff.
+
 ## [1.5.1] - 2026-11-09
 
 ### Added
