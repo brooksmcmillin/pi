@@ -26,6 +26,33 @@ The runtime registers each leaf process synchronously at spawn, rechecks ownersh
 
 Autonomous SDK shells, `pi.exec`, `bash`, `powershell`, custom/remote search replacements and extension slash commands still fail closed before launch. Ordinary interactive execution remains available. Human-started managed searches also retain activity until acknowledgement, so early tool cancellation does not open an autonomous admission window. Arbitrary detached processes and non-cooperating backends remain excluded.
 
+## Pre-review interaction matrix
+
+Before the first independent review of an owner-admission change, map each affected row below to the current implementation and run its deterministic tests. Reuse existing coverage; add only missing cases. Keep the inspected base/candidate revision, test names, commands, outcomes and remaining gaps in the implementation contract. A passing matrix does not replace independent review or authorize activation.
+
+Test paths below are relative to `packages/coding-agent/test/`, except the explicitly named agent-core test.
+
+| Interaction | Deterministic test | Required assertions |
+| --- | --- | --- |
+| Human handoff × steering/follow-up × one-at-a-time/all, before and after dispatch | `agent-session-owner-admission.test.ts`: `preserves handoff batching` | Accepted input drains in order with the configured batches; no pending messages remain. |
+| Human steering × session-level continuation × queue mode | Same file: `prioritizes human steering over continuation` (response and deferred `agent_before_settle` boundaries) | Human input wins the next request, each message is delivered once, batching is preserved, and the human tool executes in ordinary authority. |
+| Completed handoff → first cache refresh | `sdk-stream-options.test.ts`: `warms the human request after a fenced autonomous auth handoff`; `refreshes idle cache after a completed ... prompt` | The human request runs and its first refresh succeeds after the old reservation closes; exactly one cache usage entry is recorded. Fake timers preserve AsyncLocalStorage with `AsyncResource.bind`. |
+| Maintenance callback × turn-producing entrypoint | Same file: `fences maintenance custom-message turns while streaming` | `prompt`, `sendUserMessage`, `steer`, `followUp`, and custom-message steering/follow-up (explicit and implicit turn requests) reject without another provider call or queued work. `triggerTurn: false` remains context-only. Raw Agent methods are not a sandboxed extension boundary. |
+| Intervention after physical refresh dispatch × usage accounting | Same file: `records billed refresh usage after intervention without rescheduling stale work` | Already-billed work records usage exactly once; intervention prevents another scheduled refresh, rather than erasing usage. |
+| Selected steering/follow-up batch × one-at-a-time/all × preparation handoff | `packages/agent/test/prepare-next-turn-end.test.ts`: `restores selected ... messages ... before settlement` | Already-accepted selected input is restored ahead of later arrivals, delivered exactly once in original order, with configured batching and empty final queues. Ignored preparation `messages` are not accepted input and must not be replayed. |
+| Selected extension input × compaction handoff × human tool authority | `agent-session-owner-admission.test.ts`: `preserves selected extension steering when human input hands off during compaction` | The real session restores selected extension input once in both transcript and persistence; human input runs first with normal tool authority. The agent-core matrix above supplies the queue/mode cross-product, not an assertion that every combination has a separate full-session fixture. |
+
+Run the bounded matrix from a prepared checkout (install dependencies, hydrate pinned model data, and build workspace exports first):
+
+```sh
+# From packages/agent
+node ../../node_modules/vitest/dist/cli.js --run test/prepare-next-turn-end.test.ts
+# From packages/coding-agent
+node ../../node_modules/vitest/dist/cli.js --run test/agent-session-owner-admission.test.ts test/sdk-stream-options.test.ts
+```
+
+Use deferred promises at the named boundaries, not sleeps or live providers. Preserve failures and distinguish fixture setup failures from executed regression failures. Repeat affected coverage after repairs before review; do not reset review budgets or treat these tests as permission to repair another owner's branch.
+
 ## Offline coverage
 
 - `owner-activity.test.ts`: simultaneous attempts, pre-existing activity, generation/lifecycle fences, nested registered lifetimes and replacement accounting.
