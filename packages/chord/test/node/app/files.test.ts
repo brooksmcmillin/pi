@@ -546,9 +546,9 @@ describe("caps", () => {
 describe("summary", () => {
 	it("counts a space's files, versions and bytes and keeps its newest versions", async () => {
 		const files = await filesOf();
-		const a1 = await put(files, "docs/a.txt", "1");
-		const a2 = await put(files, "docs/a.txt", "22");
-		const b = await put(files, "b.txt", "333");
+		const a1 = await put(files, "docs/a.txt", "1", { created: 1_000 });
+		const a2 = await put(files, "docs/a.txt", "22", { created: 2_000 });
+		const b = await put(files, "b.txt", "333", { created: 3_000 });
 		expect(await files.summary.get("shared", context)).toEqual({
 			files: 2,
 			versions: 3,
@@ -565,9 +565,22 @@ describe("summary", () => {
 		await files.close();
 	});
 
+	it("orders equal creation times by descending id, including after removal", async () => {
+		const files = await filesOf();
+		const versions: FileInfo[] = [];
+		for (let index = 0; index < 3; index++) {
+			versions.push(await put(files, `f${index}`, "x", { created: 1_000 }));
+		}
+		const expected = [...versions].sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+		expect((await files.summary.get("shared", context))?.newest).toEqual(expected);
+		await files.remove(expected[0]!.id, context);
+		expect((await files.summary.get("shared", context))?.newest).toEqual(expected.slice(1));
+		await files.close();
+	});
+
 	it("keeps the newest 20 and stays across a restart", async () => {
 		const first = await filesOf();
-		for (let index = 0; index < 25; index++) await put(first, `f${index}`, "x");
+		for (let index = 0; index < 25; index++) await put(first, `f${index}`, "x", { created: 1_000 + index });
 		const summary = await first.summary.get("shared", context);
 		expect(summary?.newest).toHaveLength(20);
 		expect(summary?.newest[0]?.path).toBe("f24");
