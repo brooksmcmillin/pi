@@ -43,7 +43,9 @@ export default defineFacet((host) => {
 		const principal = (request: IncomingMessage, origin: RequestOrigin): P2Principal | undefined => {
 			const session = accessResource.value.session(request, origin.port);
 			if (session?.kind === "device") return { kind: "owner", access: "device", device: session.id };
-			return session?.kind === "local" && !origin.remote ? { kind: "owner", access: "local" } : undefined;
+			return session?.kind === "local" && !origin.remote
+				? { kind: "owner", access: "local", session: session.id }
+				: undefined;
 		};
 		self.contribute(Authenticators, { owner: (request, origin) => principal(request, origin) });
 		// A valid owner cookie takes precedence over a pre-existing guest cookie. Host checks still apply.
@@ -109,9 +111,9 @@ export default defineFacet((host) => {
 				if (all) await accessResource.value.rotate();
 				else if (session) await accessResource.value.logout(session);
 			} finally {
-				// Local sessions share one principal: ending one leaves the others' live links alone.
 				if (all) await server.revokeOwners({}, ctx);
 				else if (session?.kind === "device") await server.revokeOwners({ device: session.id }, ctx);
+				else if (session?.kind === "local") await server.revokeOwners({ local: session.id }, ctx);
 			}
 			sendJson(
 				response,

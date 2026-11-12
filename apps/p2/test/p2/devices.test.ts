@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import { BACKGROUND_CONTEXT, whenLive } from "@p2/app/v1";
 import { WebSocket } from "ws";
+import { Chat } from "../../plugins/chat/contract.ts";
 import { DeviceAccesses, Devices } from "../../plugins/devices/contract.ts";
 import { OwnerAccess } from "../../plugins/devices/owner-access.ts";
 import { ProviderLogin } from "../../plugins/login/contract.ts";
@@ -244,6 +245,51 @@ test("signed cookies expire, logout persists, all-device rotation invalidates co
 	await access.close();
 });
 
+test("security:local-cookie-renewal-outlives-revocation: older-cookie logout covers renewals across restart", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "p2-owner-renewal-"));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const day = 24 * 60 * 60_000;
+	let now = 0;
+	let access = await OwnerAccess.open(directory, () => now);
+	t.after(() => access.close());
+	const original = access.localCookie(8788).split(";")[0]!;
+	const session = access.session(requestWith(original), 8788)!;
+	now = 10 * day;
+	const renewed = access.localCookie(8788, session.id).split(";")[0]!;
+	const independent = access.localCookie(8788).split(";")[0]!;
+	now = 11 * day;
+	await access.logout(session);
+	assert(!signedIn(access, renewed, 8788));
+	await access.close();
+	now = 31 * day;
+	access = await OwnerAccess.open(directory, () => now);
+	assert(!signedIn(access, renewed, 8788), "renewal cannot revive after the presented cookie expires");
+	assert(signedIn(access, independent, 8788), "another local session remains valid");
+	now = 40 * day - 1;
+	assert(!signedIn(access, renewed, 8788), "revocation covers the last millisecond of the renewal");
+	assert(signedIn(access, independent, 8788));
+	now++;
+	assert(!signedIn(access, independent, 8788), "the cookie expiry boundary remains exclusive");
+});
+
+test("security:local-cookie-renewal-outlives-revocation: repeated logout never shortens revocation", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "p2-owner-renewal-repeat-"));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const day = 24 * 60 * 60_000;
+	let now = 0;
+	const access = await OwnerAccess.open(directory, () => now);
+	t.after(() => access.close());
+	const original = access.session(requestWith(access.localCookie(8788)), 8788)!;
+	now = 10 * day;
+	const renewedCookie = access.localCookie(8788, original.id);
+	const renewed = access.session(requestWith(renewedCookie), 8788)!;
+	now = 11 * day;
+	await access.logout(renewed);
+	await access.logout(original);
+	now = 31 * day;
+	assert(!signedIn(access, renewedCookie, 8788), "an older logout cannot reduce an existing revocation");
+});
+
 test("sign out this device and all devices revoke live sockets as well as cookies", async (t) => {
 	const fixture = await startFixture({ allowedHosts: ["owner.test"] });
 	t.after(() => fixture.close());
@@ -427,7 +473,7 @@ test("an owner link redeemed on loopback is a local session, renewed on app load
 	assert.equal(id(renewed), id(cookie));
 	assert.equal((await http(port, "/owner/check", { headers: { Cookie: cookie } })).headers["set-cookie"], undefined);
 	assert.equal((await http(port, "/", { headers: { Cookie: renewed.split(";")[0]! } })).status, 200);
-	// Sign-out of this local browser ends its cookie only; sign-out of all devices ends every local session too.
+	// Sign-out ends this browser's session; sign-out of all devices ends every local session too.
 	const tui = fixture.client({ Cookie: fixture.owner.cookie });
 	await whenLive(tui.host.hold(Access, {}, BACKGROUND_CONTEXT));
 	const logout = (path: string, value: string) =>
@@ -440,6 +486,47 @@ test("an owner link redeemed on loopback is a local session, renewed on app load
 	await poll(() => tui.socket.readyState === 3);
 	assert.equal((await http(port, "/owner/check", { headers: { Cookie: fixture.owner.cookie } })).status, 401);
 	assert.equal((await localOwnerSignIn(new URL(origin), fixture.dataDir)).kind, "signed-in", "the new key signs in");
+});
+
+test("security:local-logout-retains-live-owner-authority: logout revokes only that local session's live capabilities", async (t) => {
+	const fixture = await startFixture();
+	t.after(() => fixture.close());
+	const port = fixture.server.port;
+	const origin = `http://127.0.0.1:${port}`;
+	const signIn = await localOwnerSignIn(new URL(origin), fixture.dataDir);
+	assert(signIn.kind === "signed-in");
+	const first = fixture.client({ Cookie: signIn.cookie });
+	const sameSession = fixture.client({ Cookie: signIn.cookie });
+	const other = fixture.client({ Cookie: fixture.owner.cookie });
+	const devices = first.host.hold(Devices, {}, BACKGROUND_CONTEXT);
+	const sameDevices = sameSession.host.hold(Devices, {}, BACKGROUND_CONTEXT);
+	const otherDevices = other.host.hold(Devices, {}, BACKGROUND_CONTEXT);
+	await whenLive(devices);
+	await whenLive(sameDevices);
+	await whenLive(otherDevices);
+	const sessions = await holdIn(other.host, Sessions, {}, "owner");
+	const session = await sessions.create({ cwd: fixture.workspace }, BACKGROUND_CONTEXT);
+	const where = { session: session.id, conversation: 1 };
+	const chat = await holdIn(first.host, Chat, where, "participant");
+	const otherChat = await holdIn(other.host, Chat, where, "participant");
+	assert.equal(
+		(await http(port, "/owner/logout", { method: "POST", headers: { Origin: origin, Cookie: signIn.cookie } }))
+			.status,
+		200,
+	);
+	await assert.rejects(devices.token(BACKGROUND_CONTEXT), "logged-out capability cannot mint another invitation");
+	await assert.rejects(sameDevices.token(BACKGROUND_CONTEXT), "all tabs of that session lose authority");
+	await assert.rejects(chat.entries({ limit: 1 }, BACKGROUND_CONTEXT), "forwarded worker capability is revoked");
+	assert.equal((await http(port, "/owner/check", { headers: { Cookie: signIn.cookie } })).status, 401);
+	assert.equal(
+		(await http(port, "/owner/logout", { method: "POST", headers: { Origin: origin, Cookie: signIn.cookie } }))
+			.status,
+		200,
+	);
+	await poll(() => first.socket.readyState === 3 && sameSession.socket.readyState === 3);
+	assert.equal(other.socket.readyState, 1);
+	assert((await otherDevices.token(BACKGROUND_CONTEXT)).token.length > 0);
+	assert.equal((await otherChat.entries({ limit: 1 }, BACKGROUND_CONTEXT)).items.length, 0);
 });
 
 test("npm run owner-link mints a private fragment link from the running device path without a browser", async (t) => {

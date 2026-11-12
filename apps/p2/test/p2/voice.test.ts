@@ -679,7 +679,7 @@ describe("voice in chat mode", () => {
 	it("places spoken chat as the speaker's chat entry, and a spoken address as a mention that Pi answers", async (t) => {
 		const fixture = await chatModeHost();
 		t.after(() => fixture.close());
-		const OWNER = { kind: "owner", access: "local" } as const;
+		const OWNER = { kind: "owner", access: "local", session: "test-owner" } as const;
 		const ALICE = {
 			kind: "guest",
 			id: "alice",
@@ -762,7 +762,12 @@ describe("voice mode's switch and voice", () => {
 		const fixture = await chatModeHost({ facet: voiceWorker });
 		t.after(() => fixture.close());
 		const where = { session: "s1", conversation: 1 };
-		const owner = await holdIn(fixture.client({ kind: "owner", access: "local" }), VoiceMode, where, "owner");
+		const owner = await holdIn(
+			fixture.client({ kind: "owner", access: "local", session: "test-owner" }),
+			VoiceMode,
+			where,
+			"owner",
+		);
 		const alice = await holdIn(
 			fixture.client({
 				kind: "guest",

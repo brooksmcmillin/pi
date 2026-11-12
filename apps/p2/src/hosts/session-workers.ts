@@ -4,7 +4,7 @@
 // serialized per session.
 import { realpathSync } from "node:fs";
 import type { FollowAttachment, FollowObserver } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, type Context, withoutAbortSignal } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord/json";
 import type { BaseInputs, Plugins } from "@earendil-works/chord/plugins";
 import { createWorkers, type WorkerState, type Workers, type WorkersError } from "@earendil-works/chord/workers";
@@ -13,6 +13,7 @@ import { logWriter, processLogs } from "../runtime/logs.ts";
 import { canView, type P2Principal } from "../runtime/principals.ts";
 import type {
 	HostEvent,
+	PausePreparation,
 	RelocationSteps,
 	SessionWorkerControl,
 	WorkerState as SessionWorkerState,
@@ -50,6 +51,7 @@ export class SessionWorkers implements SessionWorkerControl {
 	readonly #options: SessionWorkersOptions;
 	readonly #generations = new Map<string, number>();
 	readonly #operations = new Map<string, Promise<unknown>>();
+	readonly #pausedStarts = new Set<string>();
 	readonly #listeners = new Set<(event: HostEvent) => void>();
 	/** The followers of every worker's state (`observe`), and the state they were given last. */
 	readonly #observers = new Set<FollowObserver<unknown>>();
@@ -124,10 +126,15 @@ export class SessionWorkers implements SessionWorkerControl {
 				}),
 				start: async (address, context) => {
 					const session = address.params.id;
+					if (this.#pausedStarts.has(session))
+						throw new Error("Session worker is paused for a checked transition");
 					const generation = ++this.#generation;
 					this.#generations.set(session, generation);
 					processLogs.append(`${SESSION_PREFIX}${session}`, "event", `Starting worker generation ${generation}`);
 					const values = await options.values(session, context);
+					// A start already preparing its values must not escape a newly acquired exclusion.
+					if (this.#pausedStarts.has(session))
+						throw new Error("Session worker is paused for a checked transition");
 					const init: WorkerInit = {
 						app: options.app,
 						dataDir: options.dataDir,
@@ -259,6 +266,42 @@ export class SessionWorkers implements SessionWorkerControl {
 			}
 			await this.#suspended(session, work);
 		});
+	}
+
+	async pauseChecked(
+		session: string,
+		prepare: () => Promise<PausePreparation>,
+		work: () => Promise<void>,
+		context: Context,
+	): Promise<void> {
+		await this.#serially(session, () =>
+			this.#options.host.root(async (ctx) => {
+				// Retain a holder through publication: Chord drops suspension when its last holder leaves.
+				await ctx.get(WorkerBoundary, { session });
+				let prepared: PausePreparation;
+				try {
+					prepared = await prepare();
+				} catch (error) {
+					if (this.#status(session) === "running") await this.#suspended(session, async () => {});
+					throw error;
+				}
+				if (prepared.kind === "refused") throw new Error(prepared.reason);
+				this.#pausedStarts.add(session);
+				const address = Session({ id: session });
+				try {
+					if (this.generation(session) !== prepared.generation || this.#status(session) !== "running")
+						throw new Error("The inspected worker exited or was replaced");
+					await this.workers.stop(address, BACKGROUND_CONTEXT);
+					if (this.generation(session) !== prepared.generation)
+						throw new Error("The inspected worker was replaced before stopping");
+					await work();
+				} finally {
+					this.#pausedStarts.delete(session);
+					await this.workers.retry(address, BACKGROUND_CONTEXT);
+					await this.#started(session);
+				}
+			}, withoutAbortSignal(context)),
+		);
 	}
 
 	async retry(session: string, context: Context): Promise<SessionWorkerState> {

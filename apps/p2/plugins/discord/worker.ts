@@ -6,6 +6,7 @@ import {
 	AgentDoc,
 	type AgentState,
 	type ConversationId,
+	type Cursor,
 	defineDoc,
 	defineExtension,
 	type EntryId,
@@ -18,6 +19,7 @@ import {
 	section,
 } from "@earendil-works/pi-durable";
 import {
+	awaitWithContext,
 	type Context,
 	type Ctx,
 	contribute,
@@ -26,15 +28,23 @@ import {
 	type MessageData,
 	type Ref,
 	safeFileName,
+	withAbortSignal,
 } from "@p2/app/v1";
-import { DOWNLOADS, displayName, durableContext, FILE_CHUNK, Files, findDownload, UPLOADS } from "@p2/app/v1/node";
-import { Extensions, harnessOf, isTopLevel, mainConversation } from "@p2/app/v1/worker";
+import { DOWNLOADS, displayName, durableContext, Files, findDownload, UPLOADS, writeChunks } from "@p2/app/v1/node";
+import {
+	ConversationLocations,
+	Extensions,
+	harnessOf,
+	isTopLevel,
+	mainConversation,
+	workerOf,
+} from "@p2/app/v1/worker";
 import { Conversation } from "../chat/contract.ts";
 import { Attachments, FilesMirror } from "../files/contract.ts";
 import { offeredBy } from "../send-file/contract.ts";
-import { mirrorLock } from "../sessions/lock-worker.ts";
+import { SessionLockMirror } from "../sessions/contract.ts";
 import { Subagents } from "../subagents/contract.worker.ts";
-import { DISCORD_BATCH, DiscordIngress } from "./contract.ts";
+import { DISCORD_BATCH, DiscordConfinement, DiscordIngress } from "./contract.ts";
 
 /** Attachments up to this size are downloaded (the composer's upload limit). */
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
@@ -53,13 +63,19 @@ const IMAGE_TYPES: Record<string, string> = {
  * subagents with their threads' names. Written at each delivery, cleared when the session is unlinked.
  */
 export const DiscordLinkDoc = defineDoc<{
-	link: { channel: string; guild: string } | null;
+	link: { generation: number; channel: string; guild: string } | null;
 	threads: Record<string, string>;
+	revokedThrough: number;
 }>({
 	kind: "p2.discord-link",
-	version: 1,
+	version: 2,
 	scope: "session",
-	initial: () => ({ link: null, threads: {} }),
+	initial: () => ({ link: null, threads: {}, revokedThrough: 0 }),
+	migrate: (value, from) => {
+		if (from !== 1) throw new Error(`Unknown p2.discord-link version ${from}`);
+		const old = value as { link: { channel: string; guild: string } | null; threads: Record<string, string> };
+		return { link: old.link ? { ...old.link, generation: 0 } : null, threads: old.threads, revokedThrough: 0 };
+	},
 	checkpointWhen: () => true,
 });
 
@@ -96,62 +112,128 @@ export default defineFacet((host) => {
 		self.contribute(Extensions, { [discordExtension.name]: discordExtension });
 	});
 
+	host.serve(DiscordConfinement, (_params, principal, self) => {
+		if (principal.kind !== "server") throw forbidden("server only");
+		const harness = harnessOf(self);
+		const worker = workerOf(self);
+		const placements = self.registry(ConversationLocations);
+		return {
+			variant: "server",
+			members: {
+				check: async ({ sandbox }, ctx) => {
+					if (!worker().liveness.relocating) throw new Error("Link inspection requires an idle worker fence");
+					const placement = placements.value.get("subagents");
+					if (!placement) throw new Error("Subagent placement is unavailable");
+					const context = durableContext(ctx);
+					let cursor: Cursor | undefined;
+					do {
+						const page = await harness().durable.commit((tx) => tx.scanConversations({}, 100, cursor), context);
+						for (const conversation of page.items) {
+							const own = await placement.own(harness().durable, conversation.id, context);
+							if (own && own.env !== sandbox)
+								throw new Error(
+									`Conversation ${conversation.id} works outside the selected sandbox ${sandbox}`,
+								);
+						}
+						cursor = page.next;
+					} while (cursor !== undefined);
+					if (!worker().liveness.relocating) throw new Error("The link inspection fence was lost");
+					return { generation: worker().init.generation };
+				},
+			},
+		};
+	});
+
 	host.serve(DiscordIngress, (_params, principal, self) => {
 		if (principal.kind !== "server") throw forbidden("server only");
 		const harness = harnessOf(self);
 		const files = self.get(Files, {});
 		const attachments = self.get(Attachments, {});
 		const mirror = self.get(FilesMirror, {});
+		const lockMirror = self.get(SessionLockMirror, {});
+		let revokedThrough = 0;
+		const pending = new Map<AbortController, { generation: number; done: Promise<unknown> }>();
+		const active = async (generation: number, context: Context): Promise<void> => {
+			const doc = await harness().durable.snapshot(DiscordLinkDoc, durableContext(context));
+			revokedThrough = Math.max(revokedThrough, doc?.revokedThrough ?? 0);
+			context.abortSignal?.throwIfAborted();
+			if (generation <= revokedThrough) throw forbidden("The Discord link was revoked");
+		};
+		const admit = <T>(generation: number, caller: Ctx, work: (context: Context) => Promise<T>): Promise<T> => {
+			const controller = new AbortController();
+			const context = withAbortSignal(controller.signal, caller);
+			const done = (async () => {
+				await active(generation, context);
+				return work(context);
+			})();
+			pending.set(controller, { generation, done });
+			return done.finally(() => pending.delete(controller));
+		};
 		return {
 			variant: "server",
 			members: {
-				deliver: async ({ conversation, requestId, author, text, context, files: downloads, lock }, ctx) => {
-					const durable = harness().durable;
-					await mirrorLock(durable, lock, durableContext(ctx));
-					const target = conversation ?? (await mainConversation(durable, durableContext(ctx)));
-					await durable.commit(async (tx) => {
-						const doc = await tx.doc(DiscordLinkDoc);
-						doc.link = { channel: context.channel, guild: context.guild };
-						if (conversation !== undefined && context.thread !== undefined)
-							doc.threads[String(conversation)] = context.thread;
-					}, durableContext(ctx));
-					const ids: { id: string; name: string }[] = [];
-					for (const file of downloads) {
-						const id = await download(files, file, ctx);
-						if (id) ids.push({ id, name: file.name });
-					}
-					// The Files sheet lists them as it lists the composer's uploads.
-					if (ids.length) await mirror.push(UPLOADS, ctx);
-					const resolved = ids.length
-						? await attachments.resolve({ ids: ids.map((entry) => entry.id), conversation: target }, ctx)
-						: [];
-					const who = { kind: "guest" as const, id: `discord:${author.id}`, name: `${author.name} · Discord` };
-					const data: MessageData & { discord: typeof context } = {
-						author: who,
-						text,
-						attachments: ids,
-						discord: context,
-					};
-					const chat = await ctx.get(Conversation, { conversation: target });
-					const { submissionId } = await chat.submit(
-						{
-							text,
-							requestId,
-							// A batch while a turn runs joins it: its answer replies to the newest mention.
-							whenBusy: "steer",
+				deliver: ({ generation, conversation, requestId, author, text, context, files: downloads }, call) =>
+					admit(generation, call, async (ctx) => {
+						await lockMirror.sync(ctx);
+						const durable = harness().durable;
+						const target = conversation ?? (await mainConversation(durable, durableContext(ctx)));
+						await durable.commit(async (tx) => {
+							const doc = await tx.doc(DiscordLinkDoc);
+							if (generation <= doc.revokedThrough) throw forbidden("The Discord link was revoked");
+							doc.link = { generation, channel: context.channel, guild: context.guild };
+							if (conversation !== undefined && context.thread !== undefined)
+								doc.threads[String(conversation)] = context.thread;
+						}, durableContext(ctx));
+						const ids: { id: string; name: string }[] = [];
+						for (const file of downloads) {
+							const id = await download(files, file, ctx);
+							if (id) ids.push({ id, name: file.name });
+						}
+						// The Files sheet lists them as it lists the composer's uploads.
+						if (ids.length) await mirror.push(UPLOADS, ctx);
+						const resolved = ids.length
+							? await attachments.resolve({ ids: ids.map((entry) => entry.id), conversation: target }, ctx)
+							: [];
+						const who = { kind: "guest" as const, id: `discord:${author.id}`, name: `${author.name} · Discord` };
+						const data: MessageData & { discord: typeof context } = {
 							author: who,
-							...(resolved.length ? { files: resolved } : {}),
-							entry: { kind: DISCORD_BATCH, data },
-						},
-						ctx,
-					);
-					return { conversation: target, submissionId };
-				},
-				unlinked: async (ctx) => {
+							text,
+							attachments: ids,
+							discord: context,
+						};
+						const chat = await awaitWithContext(call.get(Conversation, { conversation: target }), ctx);
+						await active(generation, ctx);
+						const { submissionId } = await chat.submit(
+							{
+								text,
+								requestId,
+								// A batch while a turn runs joins it: its answer replies to the newest mention.
+								whenBusy: "steer",
+								author: who,
+								...(resolved.length ? { files: resolved } : {}),
+								entry: { kind: DISCORD_BATCH, data },
+							},
+							ctx,
+						);
+						return { conversation: target, submissionId };
+					}),
+				unlinked: async ({ generation }, ctx) => {
+					revokedThrough = Math.max(revokedThrough, generation);
+					const finishing: Promise<unknown>[] = [];
+					for (const [controller, admission] of pending) {
+						if (admission.generation > generation) continue;
+						controller.abort();
+						finishing.push(admission.done);
+					}
+					await Promise.allSettled(finishing);
+					// This commit also follows any submission already on Durable's serialized commit line.
 					await harness().durable.commit(async (tx) => {
 						const doc = await tx.doc(DiscordLinkDoc);
-						doc.link = null;
-						doc.threads = {};
+						doc.revokedThrough = Math.max(doc.revokedThrough, generation);
+						if (doc.link && doc.link.generation <= generation) {
+							doc.link = null;
+							doc.threads = {};
+						}
 					}, durableContext(ctx));
 					return null;
 				},
@@ -201,74 +283,83 @@ export default defineFacet((host) => {
 					if (!found) throw new Error("No such file");
 					return files.read({ id: found.file.id, offset, length }, ctx);
 				},
-				command: async ({ conversation, command }, ctx) => {
-					const durable = harness().durable;
-					const context = durableContext(ctx);
-					const target = conversation ?? (await mainConversation(durable, context));
-					const chat = await ctx.get(Conversation, { conversation: target });
-					// From Durable itself: the conversation's view may not have caught up with a compaction just started.
-					const live = await durable.snapshot(LiveDoc, target as ConversationId, context);
-					const inbox = await durable.snapshot(InboxDoc, target as ConversationId, context);
-					const queued = (inbox?.items ?? []).filter((item) => item.mode !== "write").length;
-					const working = Boolean(live?.run);
-					const compacting = live?.compactions?.length ?? 0;
-					if (command === "stop") {
-						if (!working && !queued && !compacting) return { text: "Nothing is running." };
-						const replies: string[] = [];
-						if (working || queued) {
-							// The web's Stop: queued inputs withdrawn first, then the run aborted.
-							const withdrawn = (await chat.stop(ctx)).restored.length;
-							replies.push(
-								withdrawn
-									? `Stopped; ${withdrawn} queued message${withdrawn === 1 ? "" : "s"} withdrawn.`
-									: "Stopped.",
-							);
-						}
-						// A compaction is a task of its own, which Stop leaves running: aborted as the web's Escape does.
-						let aborted = 0;
-						for (const { taskId } of live?.compactions ?? [])
-							if ((await durable.abortTask(taskId, context)) === "marked") {
-								await durable.waitForTask(taskId, context);
-								aborted++;
+				command: ({ generation, conversation, command }, call) =>
+					admit(generation, call, async (ctx) => {
+						const durable = harness().durable;
+						const context = durableContext(ctx);
+						const target = conversation ?? (await mainConversation(durable, context));
+						const chat = await awaitWithContext(call.get(Conversation, { conversation: target }), ctx);
+						// From Durable itself: the conversation's view may not have caught up with a compaction just started.
+						const live = await durable.snapshot(LiveDoc, target as ConversationId, context);
+						const inbox = await durable.snapshot(InboxDoc, target as ConversationId, context);
+						const queued = (inbox?.items ?? []).filter((item) => item.mode !== "write").length;
+						const working = Boolean(live?.run);
+						const compacting = live?.compactions?.length ?? 0;
+						await active(generation, ctx);
+						if (command === "stop") {
+							if (!working && !queued && !compacting) return { text: "Nothing is running." };
+							const replies: string[] = [];
+							if (working || queued) {
+								// The web's Stop: queued inputs withdrawn first, then the run aborted.
+								const withdrawn = (await chat.stop(ctx)).restored.length;
+								replies.push(
+									withdrawn
+										? `Stopped; ${withdrawn} queued message${withdrawn === 1 ? "" : "s"} withdrawn.`
+										: "Stopped.",
+								);
 							}
-						if (aborted) replies.push("Stopped compaction.");
-						return { text: replies.join(" ") || "Nothing is running." };
-					}
-					if (command === "compact") {
-						await chat.compact({}, ctx);
-						return { text: "Compacting the context." };
-					}
-					const model = chat.model.value;
-					const tokens = chat.stats.value?.contextTokens;
-					// The cost sheet's data: each response of the active range with its cost.
-					const costs = await chat.costs(ctx);
-					const total = costs.reduce((sum, entry) => sum + entry.cost, 0);
-					const since = await lastInputTime(durable, target as ConversationId, context);
-					const lastTurn =
-						since === undefined
-							? undefined
-							: costs.filter((entry) => entry.timestamp >= since).reduce((sum, entry) => sum + entry.cost, 0);
-					const usage =
-						tokens === undefined
-							? "unknown"
-							: model?.contextWindow
-								? `${tokens.toLocaleString("en-US")} of ${model.contextWindow.toLocaleString("en-US")} tokens (${Math.round((tokens / model.contextWindow) * 100)}%)`
-								: `${tokens.toLocaleString("en-US")} tokens`;
-					return {
-						text: [
-							`Model: ${model ? `${model.name} (${model.provider}/${model.modelId})` : "none"}`,
-							`Working: ${working ? "yes" : "no"}`,
-							...(compacting ? ["Compacting: yes"] : []),
-							`Queued: ${queued}`,
-							`Context: ${usage}`,
-							`Cost: ${dollars(total)} so far${lastTurn === undefined ? "" : `, last turn ${dollars(lastTurn)}`}`,
-						].join("\n"),
-					};
-				},
-				thread: async ({ name, before }, ctx) => {
-					const conversation = await forkThread(harness().durable, name, before, durableContext(ctx));
-					return { conversation };
-				},
+							// A compaction is a task of its own, which Stop leaves running: aborted as the web's Escape does.
+							let aborted = 0;
+							for (const { taskId } of live?.compactions ?? [])
+								if ((await durable.abortTask(taskId, context)) === "marked") {
+									await durable.waitForTask(taskId, context);
+									aborted++;
+								}
+							if (aborted) replies.push("Stopped compaction.");
+							return { text: replies.join(" ") || "Nothing is running." };
+						}
+						if (command === "compact") {
+							await chat.compact({}, ctx);
+							return { text: "Compacting the context." };
+						}
+						const model = chat.model.value;
+						const tokens = chat.stats.value?.contextTokens;
+						// The cost sheet's data: each response of the active range with its cost.
+						const costs = await chat.costs(ctx);
+						const total = costs.reduce((sum, entry) => sum + entry.cost, 0);
+						const since = await lastInputTime(durable, target as ConversationId, context);
+						const lastTurn =
+							since === undefined
+								? undefined
+								: costs.filter((entry) => entry.timestamp >= since).reduce((sum, entry) => sum + entry.cost, 0);
+						const usage =
+							tokens === undefined
+								? "unknown"
+								: model?.contextWindow
+									? `${tokens.toLocaleString("en-US")} of ${model.contextWindow.toLocaleString("en-US")} tokens (${Math.round((tokens / model.contextWindow) * 100)}%)`
+									: `${tokens.toLocaleString("en-US")} tokens`;
+						return {
+							text: [
+								`Model: ${model ? `${model.name} (${model.provider}/${model.modelId})` : "none"}`,
+								`Working: ${working ? "yes" : "no"}`,
+								...(compacting ? ["Compacting: yes"] : []),
+								`Queued: ${queued}`,
+								`Context: ${usage}`,
+								`Cost: ${dollars(total)} so far${lastTurn === undefined ? "" : `, last turn ${dollars(lastTurn)}`}`,
+							].join("\n"),
+						};
+					}),
+				thread: ({ generation, name, before }, call) =>
+					admit(generation, call, async (ctx) => {
+						const conversation = await forkThread(
+							harness().durable,
+							name,
+							before,
+							generation,
+							durableContext(ctx),
+						);
+						return { conversation };
+					}),
 			},
 		};
 	});
@@ -278,49 +369,46 @@ export default defineFacet((host) => {
 async function download(
 	files: Ref<typeof Files>,
 	file: { url: string; name: string; size: number; key: string; ref: string },
-	ctx: Ctx,
+	ctx: Context,
 ): Promise<string | undefined> {
 	const existing = await files.byKey({ space: UPLOADS, key: file.key }, ctx);
 	if (existing) return file.key;
 	if (file.size > MAX_UPLOAD_BYTES) return undefined;
 	const path = `${file.key.replaceAll(":", "-")}-${safeFileName(file.name)}`;
-	const begun = await files.begin(
-		{
-			space: UPLOADS,
-			path,
-			mime: IMAGE_TYPES[path.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream",
-			source: "discord",
-			key: file.key,
-			ref: file.ref,
-			meta: { name: file.name },
-		},
-		ctx,
-	);
-	if (begun.kind === "exists") return file.key;
+	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+	let started = false;
 	try {
-		const response = await fetch(file.url, { signal: ctx.abortSignal });
-		if (!response.ok || !response.body) throw new Error(`Download failed: ${response.status}`);
-		let offset = 0;
-		let pending = Buffer.alloc(0);
-		const reader = response.body.getReader();
-		for (;;) {
-			const { done, value: chunk } = await reader.read();
-			if (done) break;
-			pending = Buffer.concat([pending, chunk]);
-			while (pending.length >= FILE_CHUNK) {
-				await files.append({ upload: begun.upload, offset, bytes: pending.subarray(0, FILE_CHUNK) }, ctx);
-				offset += FILE_CHUNK;
-				pending = pending.subarray(FILE_CHUNK);
-				if (offset > MAX_UPLOAD_BYTES) throw new Error("Attachment too large");
-			}
-		}
-		if (pending.length) await files.append({ upload: begun.upload, offset, bytes: pending }, ctx);
-		await files.finish(begun.upload, ctx);
+		await writeChunks(
+			files,
+			{
+				space: UPLOADS,
+				path,
+				mime: IMAGE_TYPES[path.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream",
+				source: "discord",
+				key: file.key,
+				ref: file.ref,
+				meta: { name: file.name },
+			},
+			async () => {
+				started = true;
+				if (!reader) {
+					const response = await fetch(file.url, { signal: ctx.abortSignal });
+					reader = response.body?.getReader();
+					if (!response.ok || !reader) throw new Error(`Download failed: ${response.status}`);
+				}
+				return (await reader.read()).value ?? new Uint8Array(0);
+			},
+			MAX_UPLOAD_BYTES,
+			ctx,
+		);
 		return file.key;
 	} catch (error) {
-		await files.cancel(begun.upload, ctx).catch(() => {});
+		// Beginning an upload still refuses the batch on failure; transfer failures only omit the attachment.
+		if (!started) throw error;
 		console.error(`p2 discord: could not download ${file.name}:`, error instanceof Error ? error.message : error);
 		return undefined;
+	} finally {
+		await reader?.cancel().catch(() => {});
 	}
 }
 
@@ -391,7 +479,7 @@ function finished(entry: EntryRecord): number | undefined {
  * new conversation with the main agent's configuration when there is none; registered as subagent `name` (unique).
  * It follows the session's location and has no reporter: its answers go back to the thread.
  */
-async function forkThread(durable: Harness, label: string, before: number, context: Context) {
+async function forkThread(durable: Harness, label: string, before: number, generation: number, context: Context) {
 	const main = await mainConversation(durable, context);
 	const conversation = await durable.conversation(main, context);
 	if (!conversation) throw new Error("No main conversation");
@@ -411,6 +499,7 @@ async function forkThread(durable: Harness, label: string, before: number, conte
 			.slice(0, 40) || "thread"
 	}`;
 	return durable.commit(async (tx) => {
+		if (generation <= (await tx.doc(DiscordLinkDoc)).revokedThrough) throw forbidden("The Discord link was revoked");
 		const state = await tx.doc(Subagents, ROOT_CONVERSATION_ID);
 		let name = base;
 		for (let index = 2; Object.hasOwn(state.agents, name); index++) name = `${base}-${index}`;

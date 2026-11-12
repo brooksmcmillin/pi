@@ -173,7 +173,12 @@ export class OwnerAccess {
 	logout(session: OwnerSession): Promise<void> {
 		const operation = this.operations.then(async () => {
 			this.revoked = Object.fromEntries(Object.entries(this.revoked).filter(([, expires]) => expires > this.now()));
-			this.revoked[session.id] = session.expires;
+			// Other copies may have renewed this ID; cover every cookie issued before revocation.
+			this.revoked[session.id] = Math.max(
+				this.revoked[session.id] ?? 0,
+				session.expires,
+				this.now() + COOKIE_LIFETIME,
+			);
 			await privateWrite(join(this.directory, "owner-revoked.json"), JSON.stringify(this.revoked));
 		});
 		this.operations = operation.catch(() => {});

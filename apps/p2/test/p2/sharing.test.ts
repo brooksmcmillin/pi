@@ -374,7 +374,7 @@ describe("sharing across restarts", () => {
 				async (ctx) => expectVariant(await ctx.get(Sessions, {}), "owner").restore({ id: session.id }, ctx),
 				BACKGROUND_CONTEXT,
 				{
-					principal: { kind: "owner", access: "local" },
+					principal: { kind: "owner", access: "local", session: "test-owner" },
 				},
 			);
 			await poll(() => revision() === 3, 10_000, "restoring bumped the grant once");

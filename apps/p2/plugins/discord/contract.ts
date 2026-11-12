@@ -9,6 +9,7 @@ import {
 	MAX_ATTACHMENTS,
 	method,
 	param,
+	propertiesOf,
 	record,
 	remote,
 	SessionLockSchema,
@@ -51,8 +52,23 @@ export const BindingSchema = obj({
 });
 export type Binding = Static<typeof BindingSchema>;
 
+const Generation = int({ minimum: 1 });
+
+/** Internal link authority; a revoking binding remains until worker cleanup and unlock finish. */
+export const RelayBindingSchema = obj({
+	...propertiesOf(BindingSchema),
+	generation: Generation,
+	phase: union([literal("linked"), literal("revoking")]),
+});
+export type RelayBinding = Static<typeof RelayBindingSchema>;
+
+/** A file the agent offered in a turn (`send_file`): the session's download, to attach to the Discord reply. */
+export const OfferedFileSchema = obj({ id: str(), name: str(), size: num() });
+export type OfferedFile = Static<typeof OfferedFileSchema>;
+
 /** A delivered batch waiting for its turn's answer, to go back as a reply to the message that woke Pi. */
 export const PendingSchema = obj({
+	generation: Generation,
 	botId: str(),
 	session: str(),
 	/** The binding's channel (the reply goes to `replyChannelId`: the channel, or a thread of it). */
@@ -127,8 +143,8 @@ const OWNER_METHODS = {
 	/** The MCP servers of mcp.json, for the lock's picks. */
 	mcpServers: method(undefined, arr(str())),
 	/**
-	 * Links a session to a channel: moves it into the sandbox (as Relocate does), locks it, and listens. Refused when
-	 * the session or the channel is linked already, or the move is refused (a busy session).
+	 * Links an idle session after verifying every own/inherited agent location is in the selected sandbox. Publishes
+	 * its location, lock and binding with the checked worker stopped; refuses unsafe placement or an existing link.
 	 */
 	link: method(LinkSchema),
 	/** Stops listening for `session`, and lifts its lock. */
@@ -166,40 +182,45 @@ export const COMMANDS = ["stop", "status", "compact"] as const;
 export type Command = (typeof COMMANDS)[number];
 const CommandSchema = union(COMMANDS.map((command) => literal(command)));
 
-/** A file the agent offered in a turn (`send_file`): the session's download, to attach to the Discord reply. */
-export const OfferedFileSchema = obj({ id: str(), name: str(), size: num() });
-export type OfferedFile = Static<typeof OfferedFileSchema>;
-
 /** The owner's bots and links. 3: `updateLink`. The provider still serves 2 (its `accepts`). */
 export const Discord = evolve(DiscordV2, (e) => e.addMethod("owner", "updateLink", LinkUpdateSchema, nul()));
 
 /** A Discord attachment to download into the session's uploads (at most 25 MiB; larger ones are links). */
 export const DiscordFileSchema = obj({ url: str(), name: str(), size: num(), key: str(), ref: str() });
 
+/** Link-time placement proof, available only from a fenced authoritative worker. */
+export const DiscordConfinement = remote("p2.discord-confinement", {
+	version: 1,
+	params: { session: param.str() },
+	hostAddress: sessionHost,
+	variants: { server: { methods: { check: method(obj({ sandbox: str() }), obj({ generation: num() })) } } },
+});
+
 /** What the server hands a session's worker (server only): batches, finished turns, threads. */
 export const DiscordIngress = remote("p2.discord-ingress", {
-	version: 1,
+	// 2: the sessions mirror owns policy; mutating calls carry server-issued link generations.
+	version: 2,
 	params: { session: param.str() },
 	hostAddress: sessionHost,
 	variants: {
 		server: {
 			methods: {
 				/** The session is no longer linked: its agents' Discord prompt section goes. */
-				unlinked: method(),
+				unlinked: method(obj({ generation: Generation })),
 				/**
 				 * Places a batch as one input of `conversation` (default: the main conversation), steering the turn under
-				 * way while it is busy (the batch joins it); a retried `requestId` is placed once. `lock`: the session's lock, committed first. Its agent learns that
+				 * way while busy; a retried `requestId` is placed once. Admission awaits the lock mirror. Its agent learns that
 				 * it answers Discord (a prompt section).
 				 */
 				deliver: method(
 					obj({
+						generation: Generation,
 						conversation: opt(int({ minimum: 1 })),
 						requestId: str({ maxLength: 200 }),
 						author: obj({ id: str(), name: str() }),
 						text: str({ maxLength: 200_000 }),
 						context: obj({ channel: str(), guild: str(), messages: int(), thread: opt(str()) }),
 						files: arr(DiscordFileSchema, { maxItems: MAX_ATTACHMENTS }),
-						lock: union([SessionLockSchema, nul()]),
 					}),
 					obj({ conversation: int(), submissionId: num() }),
 				),
@@ -227,14 +248,17 @@ export const DiscordIngress = remote("p2.discord-ingress", {
 				 * (queued inputs withdrawn, the run aborted), `status`, `compact`. The reply's text.
 				 */
 				command: method(
-					obj({ conversation: opt(int({ minimum: 1 })), command: CommandSchema }),
+					obj({ generation: Generation, conversation: opt(int({ minimum: 1 })), command: CommandSchema }),
 					obj({ text: str() }),
 				),
 				/**
 				 * A subagent for a Discord thread: forked from the main conversation at its last finished answer before
 				 * `before` (the thread's creation, ms), registered as subagent `name`. Its conversation.
 				 */
-				thread: method(obj({ name: str({ maxLength: 100 }), before: num() }), obj({ conversation: int() })),
+				thread: method(
+					obj({ generation: Generation, name: str({ maxLength: 100 }), before: num() }),
+					obj({ conversation: int() }),
+				),
 			},
 		},
 	},

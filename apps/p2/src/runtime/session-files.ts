@@ -4,6 +4,7 @@
 // `self.get(Files, {})` or `ctx.get(Files, {})` on the session's worker, never a path.
 import { randomUUID } from "node:crypto";
 import type { FileInfo, Files } from "@earendil-works/chord/app/files";
+import { type Context, withoutAbortSignal } from "@earendil-works/chord/context";
 import type { Ctx, Ref } from "./chord.ts";
 import { type DownloadInfo, safeFileName } from "./files.ts";
 
@@ -53,7 +54,7 @@ export async function writeChunks(
 	write: Parameters<Ref<typeof Files>["begin"]>[0],
 	next: () => Promise<Uint8Array>,
 	max: number,
-	ctx: Ctx,
+	ctx: Context,
 ): Promise<FileInfo> {
 	const begun = await files.begin(write, ctx);
 	if (begun.kind === "exists") return begun.file;
@@ -71,7 +72,7 @@ export async function writeChunks(
 		}
 		return await files.finish(begun.upload, ctx);
 	} catch (error) {
-		await files.cancel(begun.upload, ctx).catch(() => {});
+		await files.cancel(begun.upload, withoutAbortSignal(ctx)).catch(() => {});
 		throw error;
 	}
 }

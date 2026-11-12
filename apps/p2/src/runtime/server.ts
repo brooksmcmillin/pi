@@ -52,8 +52,8 @@ export const Server = local("p2.server", {
 	params: {},
 	members: {
 		info: ServerInfoSchema,
-		/** Ends owners' live links and objects: one device's, or every owner's (remote and local sessions). */
-		revokeOwners: method(obj({ device: opt(str()) })),
+		/** Ends owners' live links and objects: one device's, one local session's, or every owner's. */
+		revokeOwners: method(obj({ device: opt(str()), local: opt(str()) })),
 		revokeGuests: method(obj({ id: str() })),
 	},
 });
@@ -70,6 +70,9 @@ export type RelocationSteps = {
 	readonly move: () => Promise<void>;
 	readonly cancel: () => Promise<void>;
 };
+
+/** A refusal, or the generation whose idle fence and caller-owned checks succeeded. */
+export type PausePreparation = { kind: "refused"; reason: string } | { kind: "prepared"; generation: number };
 
 /** The session workers (the server's `SessionWorkers`): their generations, and the lifecycle steps plugins run. */
 export interface SessionWorkerControl {
@@ -88,6 +91,13 @@ export interface SessionWorkerControl {
 		prepare: () => Promise<string | undefined>,
 		work: () => Promise<void>,
 		doing: string,
+	): Promise<void>;
+	/** Checks even cold workers, then excludes starts through `work`; preparation must lift its fence on refusal. */
+	pauseChecked(
+		session: string,
+		prepare: () => Promise<PausePreparation>,
+		work: () => Promise<void>,
+		context: Context,
 	): Promise<void>;
 	/**
 	 * Owner-requested retry: stops the previous instance, clears the failure and starts the worker again, resolving with
@@ -126,7 +136,7 @@ export type ServerParts = {
 	 */
 	readonly root: <T>(fn: (ctx: Ctx) => Promise<T>, context: Context) => Promise<T>;
 };
-export const ServerNatives = defineRegistry<ServerParts, ServerParts | undefined>("p2.server-natives", { version: 1 });
+export const ServerNatives = defineRegistry<ServerParts, ServerParts | undefined>("p2.server-natives", { version: 2 });
 
 /** The server's natives for a factory (the core contributes them before anything activates). */
 export function serverOf(self: Self): () => ServerParts {
@@ -303,8 +313,9 @@ export function serverCore(host: Host, info: ServerInfo, parts: ServerParts): Fa
 		self.contribute(ServerNatives, parts);
 		facet.serve(Server, () => ({
 			info: constant(info),
-			revokeOwners: async ({ device }, ctx) => {
+			revokeOwners: async ({ device, local }, ctx) => {
 				if (device !== undefined) host.revoke({ device }, ctx);
+				else if (local !== undefined) host.revoke({ local }, ctx);
 				else {
 					host.revoke({ owners: "remote" }, ctx);
 					host.revoke({ owners: "local" }, ctx);

@@ -10,9 +10,9 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import type { ConversationView } from "@earendil-works/pi-durable";
-import { BACKGROUND_CONTEXT, type SessionLock } from "@p2/app/v1";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@p2/app/v1";
 import { Chat, ChatCosts } from "../../plugins/chat/contract.ts";
-import type { Binding } from "../../plugins/discord/contract.ts";
+import type { RelayBinding as Binding } from "../../plugins/discord/contract.ts";
 import { DISCORD_BATCH, Discord, DiscordIngress, DiscordV2 } from "../../plugins/discord/contract.ts";
 import {
 	batchOf,
@@ -28,12 +28,12 @@ import {
 } from "../../plugins/discord/relay.ts";
 import { FileSummaries } from "../../plugins/files/contract.ts";
 import { Sessions } from "../../plugins/sessions/contract.ts";
+import { WorkerControl } from "../../plugins/status/contract.ts";
 import { Subagents } from "../../plugins/subagents/contract.ts";
 import type { Held } from "../../src/runtime/chord.ts";
 import { type Fixture, holdIn, poll, startFixture, until } from "./helpers.ts";
 
 const BOT = "999";
-const NO_LOCK: SessionLock = { mcp: [], projectMcp: false, instructions: false, capabilities: [] };
 
 let serial = 100;
 function message(text: string, options: Partial<DiscordMessage> = {}): DiscordMessage {
@@ -123,9 +123,6 @@ class FakeSessions implements SessionPort {
 	async usable(): Promise<string | undefined> {
 		return this.refusal;
 	}
-	lock(): SessionLock {
-		return NO_LOCK;
-	}
 	async deliver(_session: string, input: Parameters<SessionPort["deliver"]>[1]) {
 		await new Promise((resolve) => setTimeout(resolve, this.slow));
 		this.delivered.push(input);
@@ -142,7 +139,10 @@ class FakeSessions implements SessionPort {
 	readonly commands: { conversation?: number; command: string }[] = [];
 	/** The fake's `stop`: the conversation's pending turns end stopped. */
 	async command(_session: string, input: { conversation?: number; command: string }) {
-		this.commands.push(input);
+		this.commands.push({
+			command: input.command,
+			...(input.conversation === undefined ? {} : { conversation: input.conversation }),
+		});
 		const conversation = input.conversation ?? 1;
 		if (input.command !== "stop") return { text: `${input.command} of ${conversation}` };
 		if (!this.running.delete(conversation)) return { text: "Nothing is running." };
@@ -161,6 +161,8 @@ class FakeSessions implements SessionPort {
 
 function binding(patch: Partial<Binding> = {}): Binding {
 	return {
+		generation: 1,
+		phase: "linked",
 		botId: "bot-a",
 		channelId: "c1",
 		channelName: "general",
@@ -202,6 +204,211 @@ function setup(initial: Binding = binding()) {
 }
 
 describe("discord relay", () => {
+	for (const phase of ["usable", "history", "thread"] as const) {
+		it(`security:discord-unlink-leaves-relay-authorized: unlink during ${phase} refuses old delivery`, async (t) => {
+			const { discord, sessions, relay, state } = setup();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const pause = async () => {
+				entered.resolve();
+				await release.promise;
+			};
+			if (phase === "usable")
+				t.mock.method(sessions, "usable", async () => {
+					await pause();
+					return undefined;
+				});
+			else if (phase === "history") {
+				const original = discord.messages.bind(discord);
+				t.mock.method(discord, "messages", async (...args: Parameters<FakeDiscord["messages"]>) => {
+					await pause();
+					return original(...args);
+				});
+			} else {
+				const original = sessions.thread.bind(sessions);
+				t.mock.method(sessions, "thread", async (...args: Parameters<FakeSessions["thread"]>) => {
+					await pause();
+					return original(...args);
+				});
+			}
+			const sending = relay.onMessage(
+				"bot-a",
+				discord.say(phase === "thread" ? "t1" : "c1", message(`<@${BOT}> held`)),
+			);
+			await entered.promise;
+			delete state().bindings.c1;
+			release.resolve();
+			await sending;
+			assert.equal(sessions.delivered.length, 0);
+			assert.deepEqual(state().pending, {});
+			assert.deepEqual(discord.posted, []);
+		});
+	}
+
+	it("security:discord-unlink-leaves-relay-authorized: thread lookup cannot inherit a relink", async (t) => {
+		const { discord, sessions, relay, state } = setup();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const original = discord.channel.bind(discord);
+		t.mock.method(discord, "channel", async (id: string) => {
+			entered.resolve();
+			await release.promise;
+			return original(id);
+		});
+		const sending = relay.onMessage("bot-a", discord.say("t1", message(`<@${BOT}> held lookup`)));
+		await entered.promise;
+		// Like a committed State snapshot, replace the map rather than mutating the captured one.
+		state().bindings = { c1: binding({ generation: 2 }) };
+		release.resolve();
+		await sending;
+		assert.equal(sessions.delivered.length, 0);
+		assert.equal(sessions.threads.length, 0);
+		assert.deepEqual(state().pending, {});
+		await relay.onMessage("bot-a", discord.say("t1", message(`<@${BOT}> fresh lookup`)));
+		assert.equal(sessions.delivered.length, 1);
+	});
+
+	it("security:discord-unlink-leaves-relay-authorized: queued mentions cannot inherit a relink", async (t) => {
+		const { discord, sessions, relay, state } = setup();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const original = discord.messages.bind(discord);
+		let calls = 0;
+		t.mock.method(discord, "messages", async (...args: Parameters<FakeDiscord["messages"]>) => {
+			if (++calls === 1) {
+				entered.resolve();
+				await release.promise;
+			}
+			return original(...args);
+		});
+		const first = relay.onMessage("bot-a", discord.say("c1", message(`<@${BOT}> held`)));
+		await entered.promise;
+		const second = relay.onMessage("bot-a", discord.say("c1", message(`<@${BOT}> queued`)));
+		const replacement = { ...binding({ createdAt: 2 }), generation: 3 };
+		state().bindings.c1 = replacement;
+		release.resolve();
+		await Promise.all([first, second]);
+		assert.equal(sessions.delivered.length, 0);
+		assert.equal(state().bindings.c1?.cursor, null);
+		assert.deepEqual(state().pending, {});
+		await relay.onMessage("bot-a", discord.say("c1", message(`<@${BOT}> fresh`)));
+		assert.equal(sessions.delivered.length, 1, "the new link still works");
+	});
+
+	it("security:discord-unlink-leaves-relay-authorized: catch-up cannot inherit a relink after history", async (t) => {
+		const { discord, sessions, relay, state } = setup();
+		discord.say("c1", message(`<@${BOT}> missed`));
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const original = discord.messages.bind(discord);
+		t.mock.method(discord, "messages", async (...args: Parameters<FakeDiscord["messages"]>) => {
+			entered.resolve();
+			await release.promise;
+			return original(...args);
+		});
+		const catching = relay.catchUp("bot-a");
+		await entered.promise;
+		const replacement = { ...binding({ createdAt: 2 }), generation: 3 };
+		state().bindings.c1 = replacement;
+		release.resolve();
+		await catching;
+		assert.equal(sessions.delivered.length, 0);
+		assert.deepEqual(state().pending, {});
+	});
+
+	it("security:discord-unlink-leaves-relay-authorized: orphaned persisted replies cannot post after restart", async () => {
+		const { discord, sessions, relay, state } = setup();
+		await relay.onMessage("bot-a", discord.say("c1", message(`<@${BOT}> first`)));
+		sessions.turns.set(1, { state: "answered", text: "private answer", files: [], answer: 91 });
+		delete state().bindings.c1;
+		const restarted = new Relay(() => discord, sessions, { value: state, change: async (update) => update(state()) });
+		const typed = discord.typed.length;
+		await restarted.typing();
+		await restarted.checkPending();
+		assert.deepEqual(discord.posted, []);
+		assert.equal(discord.typed.length, typed);
+		assert.deepEqual(state().pending, {});
+	});
+
+	for (const phase of ["turn", "file", "part"] as const) {
+		it(`security:discord-unlink-leaves-relay-authorized: unlink during ${phase} prevents further reply parts`, async (t) => {
+			const { discord, sessions, relay, state } = setup();
+			await relay.onMessage("bot-a", discord.say("c1", message(`<@${BOT}> first`)));
+			sessions.bytes.set("file", new Uint8Array(4));
+			sessions.turns.set(1, {
+				state: "answered",
+				text: phase === "part" ? "word ".repeat(600) : "answer",
+				files: phase === "file" ? [{ id: "file", name: "file", size: 4 }] : [],
+				answer: 92,
+			});
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const pause = async () => {
+				entered.resolve();
+				await release.promise;
+			};
+			if (phase === "turn") {
+				const original = sessions.turn.bind(sessions);
+				t.mock.method(sessions, "turn", async (...args: Parameters<FakeSessions["turn"]>) => {
+					await pause();
+					return original(...args);
+				});
+			} else if (phase === "file") {
+				const original = sessions.read.bind(sessions);
+				t.mock.method(sessions, "read", async (...args: Parameters<FakeSessions["read"]>) => {
+					await pause();
+					return original(...args);
+				});
+			} else {
+				const original = discord.reply.bind(discord);
+				t.mock.method(discord, "reply", async (...args: Parameters<FakeDiscord["reply"]>) => {
+					await original(...args);
+					await pause();
+				});
+			}
+			const posting = relay.checkPending();
+			await entered.promise;
+			delete state().bindings.c1;
+			state().pending = {};
+			release.resolve();
+			await posting;
+			assert.equal(
+				discord.posted.length,
+				phase === "part" ? 1 : 0,
+				"an already-issued part cannot be recalled; no later part starts",
+			);
+		});
+	}
+
+	for (const phase of ["usable", "command"] as const) {
+		it(`security:discord-unlink-leaves-relay-authorized: unlink during command ${phase} fences its output`, async (t) => {
+			const { discord, sessions, relay, state } = setup();
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			if (phase === "usable")
+				t.mock.method(sessions, "usable", async () => {
+					entered.resolve();
+					await release.promise;
+					return undefined;
+				});
+			else {
+				const original = sessions.command.bind(sessions);
+				t.mock.method(sessions, "command", async (...args: Parameters<FakeSessions["command"]>) => {
+					entered.resolve();
+					await release.promise;
+					return original(...args);
+				});
+			}
+			const commanding = relay.onMessage("bot-a", discord.say("c1", message(`<@${BOT}> stop`)));
+			await entered.promise;
+			delete state().bindings.c1;
+			release.resolve();
+			await commanding;
+			assert.deepEqual(discord.posted, []);
+			if (phase === "usable") assert.deepEqual(sessions.commands, []);
+		});
+	}
+
 	it("delivers the messages since the cursor when someone allowed mentions Pi; others are ignored", async () => {
 		const { discord, sessions, relay, state } = setup();
 		discord.say("c1", message("before the bot"));
@@ -839,7 +1046,205 @@ async function ended(ingress: Held<typeof DiscordIngress>, submissionId: number)
 	return turn;
 }
 
+it("reuse:discord-upload-chunk-writer: final-byte overruns are dropped, bounded files and retries survive", async (t) => {
+	const limit = 25 * 1024 * 1024;
+	const requests: string[] = [];
+	let retry = false;
+	const cdn = createServer((request, response) => {
+		requests.push(request.url!);
+		if (!retry && request.url === "/error") {
+			response.writeHead(503).end();
+			return;
+		}
+		if (!retry && request.url === "/broken") {
+			response.writeHead(200, { "content-length": "2" });
+			response.on("finish", () => request.socket.end());
+			response.end(Buffer.alloc(1));
+			return;
+		}
+		response.writeHead(200, { "content-type": "application/octet-stream" });
+		const size =
+			request.url === "/limit"
+				? limit
+				: request.url === "/empty"
+					? 0
+					: retry
+						? 1
+						: limit + (request.url === "/over-chunk" ? 1024 * 1024 : 1);
+		response.end(Buffer.alloc(size));
+	});
+	await new Promise<void>((resolve) => cdn.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>((resolve) => cdn.close(() => resolve())));
+	const url = `http://127.0.0.1:${(cdn.address() as AddressInfo).port}`;
+	const fixture = await startFixture();
+	t.after(() => fixture.close());
+	const owner = fixture.browser();
+	const sessions = await holdIn(owner, Sessions, {}, "owner");
+	const session = (await sessions.create({ cwd: fixture.workspace }, BACKGROUND_CONTEXT)).id;
+	const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
+	const mirror = await holdIn(owner, FileSummaries, {}, "owner");
+	const file = (name: string, size: number) => ({
+		url: `${url}/${name}`,
+		name: `${name}.bin`,
+		size,
+		key: `discord:bounds:${name}`,
+		ref: "bounds",
+	});
+	const input = {
+		generation: 1,
+		requestId: "discord:bounds",
+		author: { id: "u1", name: "Ada" },
+		text: "Check the attached files",
+		context: { channel: "general", guild: "Guild", messages: 1 },
+		files: [
+			file("over", limit),
+			file("over-chunk", limit),
+			file("limit", limit),
+			file("declared-over", limit + 1),
+			file("error", 1),
+			file("broken", 1),
+			file("empty", 0),
+		],
+	};
+	await ended(ingress, (await ingress.deliver(input, BACKGROUND_CONTEXT)).submissionId);
+	const summary = (await mirror.of({ session }, BACKGROUND_CONTEXT)).uploads;
+	assert.equal(summary?.bytes, limit, "the final extra byte must not publish an oversized upload");
+	assert.deepEqual(summary?.newest.map((entry) => entry.key).sort(), ["discord:bounds:empty", "discord:bounds:limit"]);
+	assert.deepEqual(
+		requests,
+		["/over", "/over-chunk", "/limit", "/error", "/broken", "/empty"],
+		"declared oversize is never fetched",
+	);
+	// The cancelled key can be retried; an already finished key never downloads again.
+	retry = true;
+	await ended(
+		ingress,
+		(await ingress.deliver({ ...input, requestId: "discord:bounds:retry" }, BACKGROUND_CONTEXT)).submissionId,
+	);
+	assert.deepEqual(requests.slice(6), ["/over", "/over-chunk", "/error", "/broken"]);
+	const retried = (await mirror.of({ session }, BACKGROUND_CONTEXT)).uploads;
+	assert.equal(retried?.files, 6);
+	assert.equal(retried?.bytes, limit + 4);
+});
+
+it("security:discord-unlink-leaves-relay-authorized: unlink cancels a worker download before submission", async (t) => {
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const cdn = createServer(async (_request, response) => {
+		response.writeHead(200, { "content-type": "text/plain" });
+		response.flushHeaders();
+		entered.resolve();
+		await release.promise;
+		response.end("attachment");
+	});
+	await new Promise<void>((resolve) => cdn.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>((resolve) => cdn.close(() => resolve())));
+	const fixture = await startFixture();
+	t.after(() => fixture.close());
+	const owner = fixture.browser();
+	const sessions = await holdIn(owner, Sessions, {}, "owner");
+	const session = (await sessions.create({ cwd: fixture.workspace }, BACKGROUND_CONTEXT)).id;
+	const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
+	const chat = await holdIn(owner, Chat, { session, conversation: 1 }, "participant");
+	const sending = ingress.deliver(
+		{
+			generation: 1,
+			requestId: "held-download",
+			author: { id: "u1", name: "Ada" },
+			text: "must not submit after unlink",
+			context: { channel: "general", guild: "Guild", messages: 1 },
+			files: [
+				{
+					url: `http://127.0.0.1:${(cdn.address() as AddressInfo).port}/file`,
+					name: "held.txt",
+					size: 10,
+					key: "discord:held",
+					ref: "held",
+				},
+			],
+		},
+		BACKGROUND_CONTEXT,
+	);
+	const settled = Promise.allSettled([sending]);
+	await entered.promise;
+	try {
+		await ingress.unlinked({ generation: 1 }, withAbortSignal(AbortSignal.timeout(5_000), BACKGROUND_CONTEXT));
+	} finally {
+		release.resolve();
+		await settled;
+	}
+	assert.equal((await settled)[0]!.status, "rejected", "revoked input must not become a submission");
+	await chat.send({ text: "owner after unlink", requestId: "owner-after" }, BACKGROUND_CONTEXT);
+	const view = await until(chat.view, (value) => texts(value).includes("Echo: owner after unlink"));
+	assert.equal(
+		view?.entries.some((entry) => entry.kind === DISCORD_BATCH),
+		false,
+	);
+	assert.equal(sections(view).discord, undefined);
+});
+
+it("security:discord-unlink-leaves-relay-authorized: unlink preserves already-submitted work", async (t) => {
+	const fixture = await startFixture();
+	t.after(() => fixture.close());
+	const owner = fixture.browser();
+	const sessions = await holdIn(owner, Sessions, {}, "owner");
+	const session = (await sessions.create({ cwd: fixture.workspace }, BACKGROUND_CONTEXT)).id;
+	const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
+	const submitted = await ingress.deliver(
+		{
+			generation: 1,
+			requestId: "already-submitted",
+			author: { id: "u1", name: "Ada" },
+			text: "slow-tool",
+			context: { channel: "general", guild: "Guild", messages: 1 },
+			files: [],
+		},
+		BACKGROUND_CONTEXT,
+	);
+	await poll(async () =>
+		(await ingress.command({ generation: 1, command: "status" }, BACKGROUND_CONTEXT)).text.includes("Working: yes"),
+	);
+	await ingress.unlinked({ generation: 1 }, BACKGROUND_CONTEXT);
+	assert.equal((await ended(ingress, submitted.submissionId)).state, "answered");
+});
+
+it("security:discord-unlink-leaves-relay-authorized: revoked grants stay revoked across worker restart and relink", async (t) => {
+	const fixture = await startFixture();
+	t.after(() => fixture.close());
+	const owner = fixture.browser();
+	const sessions = await holdIn(owner, Sessions, {}, "owner");
+	const session = (await sessions.create({ cwd: fixture.workspace }, BACKGROUND_CONTEXT)).id;
+	const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
+	const input = (generation: number, requestId: string) => ({
+		generation,
+		requestId,
+		author: { id: "u1", name: "Ada" },
+		text: "hello",
+		context: { channel: "general", guild: "Guild", messages: 1 },
+		files: [],
+	});
+	await ended(ingress, (await ingress.deliver(input(1, "first-link"), BACKGROUND_CONTEXT)).submissionId);
+	await ingress.unlinked({ generation: 1 }, BACKGROUND_CONTEXT);
+	const worker = await holdIn(owner, WorkerControl, { session }, "owner");
+	await worker.restart(BACKGROUND_CONTEXT);
+	await assert.rejects(ingress.deliver(input(1, "old-after-restart"), BACKGROUND_CONTEXT), /revoked/);
+	await ended(ingress, (await ingress.deliver(input(2, "replacement-link"), BACKGROUND_CONTEXT)).submissionId);
+	await ingress.unlinked({ generation: 1 }, BACKGROUND_CONTEXT);
+	const chat = await holdIn(owner, Chat, { session, conversation: 1 }, "participant");
+	await chat.send({ text: "owner during replacement", requestId: "owner-replacement" }, BACKGROUND_CONTEXT);
+	const view = await until(chat.view, (value) => texts(value).includes("Echo: owner during replacement"));
+	assert.match(
+		sections(view).discord ?? "",
+		/Discord channel #general/,
+		"late old revocation cannot clear the replacement prompt",
+	);
+	await assert.rejects(ingress.deliver(input(1, "old-after-relink"), BACKGROUND_CONTEXT), /revoked/);
+	await ingress.unlinked({ generation: 2 }, BACKGROUND_CONTEXT);
+	await assert.rejects(ingress.deliver(input(2, "revoked-replacement"), BACKGROUND_CONTEXT), /revoked/);
+});
+
 describe("discord ingress (fake provider)", () => {
+	let generation = 1;
 	let fixture: Fixture;
 	let session: string;
 	let cdn: ReturnType<typeof createServer>;
@@ -863,12 +1268,12 @@ describe("discord ingress (fake provider)", () => {
 	it("places a batch as the Discord author's input with its attachment, and reads the turn's answer", async () => {
 		const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
 		const input = {
+			generation,
 			requestId: "discord:500",
 			author: { id: "u1", name: "Ada" },
 			text: "[Discord #general (Guild): 1 message since the last delivery]\nAda: @Pi read this",
 			context: { channel: "general", guild: "Guild", messages: 1 },
 			files: [{ url: `${cdnUrl}/notes.txt`, name: "notes.txt", size: 20, key: "discord:500:0", ref: "500" }],
-			lock: NO_LOCK,
 		};
 		const delivered = await ingress.deliver(input, BACKGROUND_CONTEXT);
 		assert.equal(delivered.conversation, 1);
@@ -896,13 +1301,13 @@ describe("discord ingress (fake provider)", () => {
 		await writeFile(join(fixture.workspace, "created.txt"), "made for Discord\n");
 		const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
 		const input = (requestId: string, text: string, conversation?: number) => ({
+			generation,
 			...(conversation === undefined ? {} : { conversation }),
 			requestId,
 			author: { id: "u1", name: "Ada" },
 			text,
 			context: { channel: "general", guild: "Guild", messages: 1 },
 			files: [],
-			lock: null,
 		});
 		const sent = await ingress.deliver(input("discord:800", "send-file"), BACKGROUND_CONTEXT);
 		const turn = await ended(ingress, sent.submissionId);
@@ -920,7 +1325,10 @@ describe("discord ingress (fake provider)", () => {
 		const next = await ended(ingress, plain.submissionId);
 		assert(next.state === "answered" && next.files.length === 0, JSON.stringify(next));
 		// A thread's subagent: its own turn's files only.
-		const { conversation } = await ingress.thread({ name: "files", before: Date.now() }, BACKGROUND_CONTEXT);
+		const { conversation } = await ingress.thread(
+			{ generation, name: "files", before: Date.now() },
+			BACKGROUND_CONTEXT,
+		);
 		const inThread = await ingress.deliver(input("discord:802", "send-file", conversation), BACKGROUND_CONTEXT);
 		const threadTurn = await ended(ingress, inThread.submissionId);
 		assert(threadTurn.state === "answered", JSON.stringify(threadTurn));
@@ -941,14 +1349,14 @@ describe("discord ingress (fake provider)", () => {
 		// prompts, not on a batch).
 		const port: SessionPort = {
 			usable: async () => undefined,
-			lock: () => null,
 			deliver: (_session, input) => ingress.deliver({ ...input, text: "send-file" }, BACKGROUND_CONTEXT),
 			turn: (_session, submissionId) => ingress.turn({ submissionId }, BACKGROUND_CONTEXT),
 			read: (_session, id, offset, length) => ingress.read({ id, offset, length }, BACKGROUND_CONTEXT),
-			thread: (_session, name, before) => ingress.thread({ name, before }, BACKGROUND_CONTEXT),
+			thread: (_session, name, before, generation) =>
+				ingress.thread({ name, before, generation }, BACKGROUND_CONTEXT),
 			command: (_session, input) => ingress.command(input, BACKGROUND_CONTEXT),
 		};
-		let state: RelayState = { bindings: { c1: { ...binding({ cursor: "1" }), session } }, pending: {} };
+		let state: RelayState = { bindings: { c1: { ...binding({ cursor: "1", generation }), session } }, pending: {} };
 		const relay = new Relay(() => discord, port, {
 			value: () => state,
 			change: async (update) => {
@@ -985,13 +1393,13 @@ describe("discord ingress (fake provider)", () => {
 	it("tells a linked session's agents where their answer goes; unlinking takes it back", async () => {
 		const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
 		const input = (requestId: string, conversation?: number, thread?: string) => ({
+			generation,
 			...(conversation === undefined ? {} : { conversation }),
 			requestId,
 			author: { id: "u1", name: "Ada" },
 			text: "hello",
 			context: { channel: "general", guild: "Guild", messages: 1, ...(thread ? { thread } : {}) },
 			files: [],
-			lock: null,
 		});
 		await ended(ingress, (await ingress.deliver(input("discord:1000"), BACKGROUND_CONTEXT)).submissionId);
 		const owner = fixture.browser();
@@ -1003,7 +1411,10 @@ describe("discord ingress (fake provider)", () => {
 		assert.match(said, /Nothing else is posted \(not intermediate text, thinking or tool output\)/);
 		assert.match(said, /`Ann \(<@1234>\): text`; write `<@1234>` to mention them/);
 		// A thread's subagent: the same, for its thread.
-		const { conversation } = await ingress.thread({ name: "Release", before: Date.now() }, BACKGROUND_CONTEXT);
+		const { conversation } = await ingress.thread(
+			{ generation, name: "Release", before: Date.now() },
+			BACKGROUND_CONTEXT,
+		);
 		await ended(
 			ingress,
 			(await ingress.deliver(input("discord:1001", conversation, "Release"), BACKGROUND_CONTEXT)).submissionId,
@@ -1015,7 +1426,8 @@ describe("discord ingress (fake provider)", () => {
 			/Your input comes from the thread "Release" of the Discord channel #general/,
 		);
 		// Unlinked: the owner's next turn has no Discord section.
-		await ingress.unlinked(BACKGROUND_CONTEXT);
+		await ingress.unlinked({ generation }, BACKGROUND_CONTEXT);
+		generation++;
 		await main.send({ text: "just me now", requestId: "after-unlink" }, BACKGROUND_CONTEXT);
 		await until(main.view, (view) => texts(view).includes("Echo: just me now") && !sections(view).discord);
 	});
@@ -1023,16 +1435,16 @@ describe("discord ingress (fake provider)", () => {
 	it("a batch while a turn runs steers it: both inputs end with the one answer", async () => {
 		const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
 		const input = (requestId: string, text: string) => ({
+			generation,
 			requestId,
 			author: { id: "u1", name: "Ada" },
 			text,
 			context: { channel: "general", guild: "Guild", messages: 1 },
 			files: [],
-			lock: null,
 		});
 		const running = await ingress.deliver(input("discord:1100", "slow-tool"), BACKGROUND_CONTEXT);
 		await poll(async () =>
-			(await ingress.command({ command: "status" }, BACKGROUND_CONTEXT)).text.includes("Working: yes"),
+			(await ingress.command({ generation, command: "status" }, BACKGROUND_CONTEXT)).text.includes("Working: yes"),
 		);
 		const steered = await ingress.deliver(input("discord:1101", "and this too"), BACKGROUND_CONTEXT);
 		const one = await ended(ingress, running.submissionId);
@@ -1044,66 +1456,84 @@ describe("discord ingress (fake provider)", () => {
 	it("stop aborts the running turn and withdraws the queued inputs, as the web's Stop", async () => {
 		const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
 		const input = (requestId: string, text: string) => ({
+			generation,
 			requestId,
 			author: { id: "u1", name: "Ada" },
 			text,
 			context: { channel: "general", guild: "Guild", messages: 1 },
 			files: [],
-			lock: null,
 		});
 		// A turn that runs a few seconds (its bash tool sleeps), and one queued behind it.
 		const running = await ingress.deliver(input("discord:700", "slow-tool"), BACKGROUND_CONTEXT);
 		const queued = await ingress.deliver(input("discord:701", "queued behind"), BACKGROUND_CONTEXT);
 		await poll(async () =>
-			(await ingress.command({ command: "status" }, BACKGROUND_CONTEXT)).text.includes("Working: yes"),
+			(await ingress.command({ generation, command: "status" }, BACKGROUND_CONTEXT)).text.includes("Working: yes"),
 		);
-		const status = (await ingress.command({ command: "status" }, BACKGROUND_CONTEXT)).text;
+		const status = (await ingress.command({ generation, command: "status" }, BACKGROUND_CONTEXT)).text;
 		assert.match(status, /^Model: .+\nWorking: yes\nQueued: 1\nContext: /);
-		const stopped = await ingress.command({ command: "stop" }, BACKGROUND_CONTEXT);
+		const stopped = await ingress.command({ generation, command: "stop" }, BACKGROUND_CONTEXT);
 		assert.equal(stopped.text, "Stopped; 1 queued message withdrawn.");
 		assert.deepEqual(await ended(ingress, running.submissionId), { state: "stopped" });
 		assert.deepEqual(await ended(ingress, queued.submissionId), { state: "stopped" });
-		assert.equal((await ingress.command({ command: "stop" }, BACKGROUND_CONTEXT)).text, "Nothing is running.");
-		assert.match((await ingress.command({ command: "status" }, BACKGROUND_CONTEXT)).text, /Working: no\nQueued: 0/);
-		assert.equal((await ingress.command({ command: "compact" }, BACKGROUND_CONTEXT)).text, "Compacting the context.");
+		assert.equal(
+			(await ingress.command({ generation, command: "stop" }, BACKGROUND_CONTEXT)).text,
+			"Nothing is running.",
+		);
+		assert.match(
+			(await ingress.command({ generation, command: "status" }, BACKGROUND_CONTEXT)).text,
+			/Working: no\nQueued: 0/,
+		);
+		assert.equal(
+			(await ingress.command({ generation, command: "compact" }, BACKGROUND_CONTEXT)).text,
+			"Compacting the context.",
+		);
 	});
 
 	it("stop also aborts a running compaction (a task of its own), and says so", async () => {
 		const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
-		const status = async () => (await ingress.command({ command: "status" }, BACKGROUND_CONTEXT)).text;
+		const status = async () => (await ingress.command({ generation, command: "status" }, BACKGROUND_CONTEXT)).text;
 		// Something to compact: more than compaction keeps verbatim (20k tokens), in turns the fake echoes quickly enough.
 		await poll(async () => !(await status()).includes("Compacting: yes"));
 		for (const index of [0, 1, 2]) {
 			const turn = await ingress.deliver(
 				{
+					generation,
 					requestId: `discord:90${index}`,
 					author: { id: "u1", name: "Ada" },
 					text: `part ${index}: ${"lorem ipsum dolor ".repeat(700)}`,
 					context: { channel: "general", guild: "Guild", messages: 1 },
 					files: [],
-					lock: null,
 				},
 				BACKGROUND_CONTEXT,
 			);
 			await ended(ingress, turn.submissionId);
 		}
-		assert.equal((await ingress.command({ command: "compact" }, BACKGROUND_CONTEXT)).text, "Compacting the context.");
+		assert.equal(
+			(await ingress.command({ generation, command: "compact" }, BACKGROUND_CONTEXT)).text,
+			"Compacting the context.",
+		);
 		// The fake summary streams for a moment: the stop right after reaches it running (as the web's Escape test).
-		assert.equal((await ingress.command({ command: "stop" }, BACKGROUND_CONTEXT)).text, "Stopped compaction.");
+		assert.equal(
+			(await ingress.command({ generation, command: "stop" }, BACKGROUND_CONTEXT)).text,
+			"Stopped compaction.",
+		);
 		assert.doesNotMatch(await status(), /Compacting/);
-		assert.equal((await ingress.command({ command: "stop" }, BACKGROUND_CONTEXT)).text, "Nothing is running.");
+		assert.equal(
+			(await ingress.command({ generation, command: "stop" }, BACKGROUND_CONTEXT)).text,
+			"Nothing is running.",
+		);
 	});
 
 	it("status reports the cost so far from the cost sheet's data, and the last turn's", async () => {
 		const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
 		const turn = await ingress.deliver(
 			{
+				generation,
 				requestId: "discord:950",
 				author: { id: "u1", name: "Ada" },
 				text: "what does it cost",
 				context: { channel: "general", guild: "Guild", messages: 1 },
 				files: [],
-				lock: null,
 			},
 			BACKGROUND_CONTEXT,
 		);
@@ -1113,13 +1543,16 @@ describe("discord ingress (fake provider)", () => {
 		assert(costs.length > 0);
 		const total = costs.reduce((sum, entry) => sum + entry.cost, 0);
 		const dollars = (value: number) => `$${value.toFixed(value >= 0.01 || value === 0 ? 4 : 6)}`;
-		const text = (await ingress.command({ command: "status" }, BACKGROUND_CONTEXT)).text;
+		const text = (await ingress.command({ generation, command: "status" }, BACKGROUND_CONTEXT)).text;
 		assert(text.includes(`\nCost: ${dollars(total)} so far, last turn $`), text);
 	});
 
 	it("forks a thread's subagent from the main conversation's last answer before the thread", async () => {
 		const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
-		const { conversation } = await ingress.thread({ name: "Release Plan!", before: Date.now() }, BACKGROUND_CONTEXT);
+		const { conversation } = await ingress.thread(
+			{ generation, name: "Release Plan!", before: Date.now() },
+			BACKGROUND_CONTEXT,
+		);
 		assert.notEqual(conversation, 1);
 		const children = await holdIn(fixture.browser(), Subagents, {}, "reader");
 		await until(children.children, (value) =>
@@ -1131,12 +1564,12 @@ describe("discord ingress (fake provider)", () => {
 		const delivered = await ingress.deliver(
 			{
 				conversation,
+				generation,
 				requestId: "discord:600",
 				author: { id: "u1", name: "Ada" },
 				text: "Ada (<@u1>): @Pi in the thread",
 				context: { channel: "general", guild: "Guild", messages: 1, thread: "Release Plan!" },
 				files: [],
-				lock: null,
 			},
 			BACKGROUND_CONTEXT,
 		);
@@ -1144,7 +1577,7 @@ describe("discord ingress (fake provider)", () => {
 		const turn = await ended(ingress, delivered.submissionId);
 		assert(turn.state === "answered" && turn.text.includes("in the thread"), JSON.stringify(turn));
 		// A second thread of the same name gets its own subagent.
-		const again = await ingress.thread({ name: "Release Plan!", before: Date.now() }, BACKGROUND_CONTEXT);
+		const again = await ingress.thread({ generation, name: "Release Plan!", before: Date.now() }, BACKGROUND_CONTEXT);
 		await until(children.children, (value) =>
 			(value?.[session] ?? []).some((child) => child.name === "discord-release-plan-2"),
 		);

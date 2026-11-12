@@ -36,6 +36,12 @@ own location still works on that machine. Open chats stay connected. Subagents s
 where they are, on their machine, and keep running their tools there. Terminals already running stay on the machine
 they were started on; new ones open where the viewed conversation works.
 
+Discord linking is stricter than ordinary Relocate: it refuses existing own or inherited agent locations outside the
+selected sandbox instead of moving or deleting those agents. This includes archived and nested agents, even when the
+session itself is already in that sandbox. Agent-requested session moves recheck their worker generation and current
+sandbox restriction when executed, so an outward move queued before linking cannot escape afterward. Explicit owner
+Relocate retains its ordinary behavior.
+
 ## Sandboxes
 
 A sandbox is a Gondolin VM (earendil-works/gondolin: QEMU with KVM, host-side network policy) on an SSH environment,

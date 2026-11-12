@@ -32,6 +32,7 @@ import {
 	type Held,
 	type Host,
 	type HostError,
+	type HostOptions,
 	hostErrorText,
 	type Self,
 	Server,
@@ -339,6 +340,9 @@ const NO_WORKERS: SessionWorkerControl = {
 	pause: async () => {
 		throw new Error("no workers in a test host");
 	},
+	pauseChecked: async () => {
+		throw new Error("no workers in a test host");
+	},
 	retry: async () => ({ running: false, generation: 0, error: "no workers in a test host" }),
 	resume: async () => {},
 	stop: async () => {},
@@ -398,6 +402,8 @@ export type TestHost = {
 export async function testHost(options: {
 	readonly address?: Address;
 	readonly kind?: "server" | "worker";
+	readonly store?: HostOptions["store"];
+	readonly telemetry?: HostOptions["telemetry"];
 	readonly principal?: P2Principal;
 	readonly facets: readonly Facet[];
 	readonly stubs?: readonly Stub[];
@@ -412,6 +418,8 @@ export async function testHost(options: {
 	const host = createHost({
 		address: options.address ?? Server(),
 		principal: worker ? HOST : SERVER,
+		store: options.store,
+		telemetry: options.telemetry,
 		onError: reportTo((error) => errors.push(error)),
 	});
 	const base = defineFacet((facet, self) => {

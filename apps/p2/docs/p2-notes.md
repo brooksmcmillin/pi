@@ -395,7 +395,8 @@ p2 runs on Chord v2 (`packages/chord`, `docs/design.md` there); the port's notes
   server is a `local` one (`SessionOperations`, `SearchIndex`, `ConversationBroker`). Code outside Chord calls (a
   Durable tool, a route) uses `serverOf(self)().root(fn, context)` / `workerOf(self)().root(fn, context)`, which take
   a required context: a method passes `withoutAbortSignal(ctx)` (the call chain is kept, a caller giving up does not
-  cut it off), a tool its Durable context. Revocation is Chord's (`revokedBy`: a device, remote owners, a guest).
+  cut it off), a tool its Durable context. Revocation is Chord's (`revokedBy`: a device, a local session,
+  remote or local owners, a guest).
 - **Rules this code follows** (the p2 cleanup, `packages/chord/docs/decisions.md` "App authoring rules confirmed by
   the p2 audit"): state outside Chord is followed (`self.follow` of a synchronous observer: `Hosts.workers` follows
   the workers component, status follows Durable's task graph), never copied by a listener; a method awaits its own
@@ -797,13 +798,14 @@ translated phone drawer and intercept chat taps.
     move goes to the target's root (with a notice when the subfolder is missing there). Then `/cd`'s flow (its
     confirmation, `Sessions.relocate`). Tests: `projects.test.ts`, `tui-projects.test.ts`.
 - **Principals** (`src/runtime/principals.ts`, typed: `P2Principal`, with Chord's API typed by it in
-  `src/runtime/chord.ts`): `owner` (a local owner session on loopback `access: "local"`, authenticated Radius `access: "relay"`, or a
-  signed owner cookie `access: "device"` with a device ID), `guest`, `worker` (stamped by the server's `session:` route
+  `src/runtime/chord.ts`): `owner` (a local owner session on loopback `access: "local"` with its `session` ID,
+  authenticated Radius `access: "relay"`, or a signed owner cookie `access: "device"` with a device ID), `guest`, `worker` (stamped by the server's `session:` route
   with the spawn generation), `server` (the server's own requests as a worker sees them, from the worker's `connect`)
-  and `host` (every host's own code, `createHost({ self })`). Object keys: `owner:local`, `owner:relay`,
-  `owner:device:<id>`, `guest:<id>:r<revision>`, `worker:<session>:<generation>`, `server`, `host`. Device IDs isolate
-  cookie holders so logout can revoke their live objects/links; "revoke all remote owners" is two propagating patterns
-  (`access: "relay"`, `access: "device"`). The owner's name on entries is settings.json `ownerName` (default "Owner"),
+  and `host` (every host's own code, `createHost({ self })`). Object keys: `owner:local:<session>`, `owner:relay`,
+  `owner:device:<id>`, `guest:<id>:r<revision>`, `worker:<session>:<generation>`, `server`, `host`. Local session and
+  device IDs isolate cookie holders so logout can revoke their live objects/links without ending another session.
+  `{ owners: "remote" }` revokes relay and device owners; `{ owners: "local" }` revokes every local session.
+  The owner's name on entries is settings.json `ownerName` (default "Owner"),
   read by the worker (`WorkerModels`, hot-reloaded) when it writes an entry; entries keep the name they got.
 - **Placement** (Chord's `host` on remote contracts, `src/runtime/chord.ts`): `serverHost` (the server) or
   `sessionHost` (`session:` + the input's `session`). No caller names a host (no `at`): `get`, `hold`, `useObject`
@@ -1156,8 +1158,10 @@ translated phone drawer and intercept chat taps.
   get it by local sign-in: `POST /owner/local/challenge` (one-time, one minute, in memory), then `POST
   /owner/local/claim` with HMAC-SHA256(owner-key, `p2-local-owner:<port>:<challenge>`), so the key never leaves the
   client and a process squatting on the port learns nothing usable at the real one. Each app page load renews the
-  session (same id, 30 more days; `PageCookies`). Sign-out of one local session revokes its id but leaves live local
-  links (one shared principal); sign-out of all devices rotates the key and revokes `{ owners: "local" }` too.
+  session (same id, 30 more days; `PageCookies`). Sign-out of one local session persists revocation through the
+  lifetime of every already-issued renewal and revokes `{ local: session.id }`: its tabs, live objects and forwarded
+  worker capabilities end, while other sessions remain usable. Sign-out of all devices rotates the key and revokes
+  both remote owners and `{ owners: "local" }`.
   Lax, not Strict: a link from another site (or Chrome launching an installed app) must arrive signed in; the server
   drops every cookie principal of another site's requests except top-level navigations to app pages (Fetch Metadata).
   A foreign navigation without a cookie gets the sign-in page, which loads itself once more from p2's origin (that

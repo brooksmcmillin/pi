@@ -3,10 +3,10 @@
 // and the owner's `Discord` view. Linking moves the session into a sandbox and locks it to the picked resources;
 // unlinking lifts the lock.
 import { join } from "node:path";
-import { obj } from "@earendil-works/pi-schema";
+import { int, obj } from "@earendil-works/pi-schema";
 import {
 	type AcceptsTable,
-	BACKGROUND_CONTEXT,
+	type Context,
 	type Ctx,
 	defineFacet,
 	defineState,
@@ -14,32 +14,69 @@ import {
 	followNative,
 	forbidden,
 	isOwner,
+	nativeOf,
 	type Ref,
 	record,
 	signalOf,
 	sleep,
+	withoutAbortSignal,
 } from "@p2/app/v1";
 import { optionalText, stripJsonComments } from "@p2/app/v1/node";
 import { Routes, Server, serverOf } from "@p2/app/v1/server";
 import { EnvService } from "../envs/contract.ts";
 import { isSandbox } from "../envs/schema.ts";
+import { ArchivedSessionChanges, PreparedSessionMoves } from "../sessions/contract.server.ts";
 import { Catalog, SessionLocks, SessionMoves } from "../sessions/contract.ts";
 import { StatusStore } from "../status/contract.ts";
-import { BindingSchema, Discord, DiscordIngress, DiscordStore, PendingSchema } from "./contract.ts";
+import {
+	type Binding,
+	Discord,
+	DiscordConfinement,
+	DiscordIngress,
+	DiscordStore,
+	type Pending,
+	PendingSchema,
+	type RelayBinding,
+	RelayBindingSchema,
+} from "./contract.ts";
 import { FIRST_BOT, Fleet } from "./fleet.ts";
 import { Relay, type RelayState, type SessionPort } from "./relay.ts";
 
-const State = defineState("p2.discord-bindings", {
-	schema: obj({ bindings: record(BindingSchema), pending: record(PendingSchema) }),
-	// 2: several bots; links and pending replies name theirs (the first release's one bot is `FIRST_BOT`).
-	version: 2,
-	initial: () => ({ bindings: {}, pending: {} }),
+export const DiscordState = defineState("p2.discord-bindings", {
+	schema: obj({
+		bindings: record(RelayBindingSchema),
+		pending: record(PendingSchema),
+		nextGeneration: int({ minimum: 0 }),
+	}),
+	// 3: durable link generations and retryable revocation.
+	version: 3,
+	initial: () => ({ bindings: {}, pending: {}, nextGeneration: 0 }),
 	migrate: (old, from) => {
-		if (from !== 1) throw new Error(`Unknown p2.discord-bindings version ${from}`);
-		const value = old as { bindings: Record<string, object>; pending: Record<string, object> };
-		const named = (entries: Record<string, object>) =>
-			Object.fromEntries(Object.entries(entries).map(([key, entry]) => [key, { ...entry, botId: FIRST_BOT }]));
-		return { bindings: named(value.bindings), pending: named(value.pending) } as never;
+		if (from !== 1 && from !== 2) throw new Error(`Unknown p2.discord-bindings version ${from}`);
+		// Stored versions have their declared shape; v1 predates botId.
+		const value = old as { bindings: Record<string, Binding>; pending: Record<string, Omit<Pending, "generation">> };
+		let nextGeneration = 0;
+		const bindings: Record<string, RelayBinding> = Object.fromEntries(
+			Object.entries(value.bindings).map(([key, binding]) => [
+				key,
+				{
+					...binding,
+					botId: from === 1 ? FIRST_BOT : binding.botId,
+					generation: ++nextGeneration,
+					phase: "linked" as const,
+				},
+			]),
+		);
+		const pending = Object.fromEntries(
+			Object.entries(value.pending).flatMap(([key, entry]) => {
+				const botId = from === 1 ? FIRST_BOT : entry.botId;
+				const binding = bindings[entry.channelId];
+				return binding && binding.botId === botId && binding.session === entry.session
+					? [[key, { ...entry, botId, generation: binding.generation }] as const]
+					: [];
+			}),
+		);
+		return { bindings, pending, nextGeneration };
 	},
 	persist: true,
 	checkpointWhen: () => true,
@@ -58,9 +95,12 @@ export default defineFacet((host) => {
 		const catalog = self.get(Catalog, {});
 		const envs = self.get(EnvService, {});
 		const locks = self.get(SessionLocks, {});
-		const moves = self.get(SessionMoves, {});
+		self.get(SessionMoves, {});
+		const moves = nativeOf(self, PreparedSessionMoves, "The prepared session moves");
+		const archivedChanges = nativeOf(self, ArchivedSessionChanges, "The archived session changes");
+		const reservedChannels = new Set<string>();
 		const statuses = self.get(StatusStore, {});
-		const state = self.state(State);
+		const state = self.state(DiscordState);
 		const dataDir = () => server.info.value.dataDir;
 		const fleet = self.open(
 			() => Fleet.open(dataDir()),
@@ -80,22 +120,57 @@ export default defineFacet((host) => {
 			return undefined;
 		};
 		const natives = serverOf(self);
+		const mutations = new Map<string, Promise<unknown>>();
+		const changeLink = <T>(session: string, caller: Ctx, change: (ctx: Context) => Promise<T>): Promise<T> => {
+			const done = (mutations.get(session) ?? Promise.resolve())
+				.catch(() => {})
+				.then(() => {
+					caller.abortSignal?.throwIfAborted();
+					// Keep the method's call chain while finishing accepted work after caller disconnect.
+					return change(withoutAbortSignal(caller));
+				});
+			mutations.set(session, done);
+			return done.finally(() => {
+				if (mutations.get(session) === done) mutations.delete(session);
+			});
+		};
 		/** One call of session `session`'s worker (started if needed) as the server, in a scope of its own. */
 		const ingress = <T>(
 			session: string,
 			call: (worker: Ref<typeof DiscordIngress>, ctx: Ctx) => Promise<T>,
+			context: Context,
 		): Promise<T> =>
 			// A root scope releases the worker's reference when the call ends; the live routine's would keep them all.
-			natives().root(async (ctx) => call(await ctx.get(DiscordIngress, { session }), ctx), BACKGROUND_CONTEXT);
+			natives().root(async (ctx) => call(await ctx.get(DiscordIngress, { session }), ctx), context);
+		const admit = <T>(
+			session: string,
+			generation: number,
+			call: (worker: Ref<typeof DiscordIngress>, ctx: Ctx) => Promise<T>,
+		): Promise<T> =>
+			ingress(
+				session,
+				(worker, ctx) => {
+					if (
+						!Object.values(state.value.bindings).some(
+							(binding) =>
+								binding.session === session && binding.generation === generation && binding.phase === "linked",
+						)
+					)
+						throw forbidden("The Discord link was revoked");
+					return call(worker, ctx);
+				},
+				during(),
+			);
 		const sessions: SessionPort = {
 			usable,
-			lock: (session) => locks.locks.value[session] ?? null,
-			deliver: (session, input) => ingress(session, (worker, ctx) => worker.deliver(input, ctx)),
-			turn: (session, submissionId) => ingress(session, (worker, ctx) => worker.turn({ submissionId }, ctx)),
-			thread: (session, name, before) => ingress(session, (worker, ctx) => worker.thread({ name, before }, ctx)),
-			command: (session, input) => ingress(session, (worker, ctx) => worker.command(input, ctx)),
+			deliver: (session, input) => admit(session, input.generation, (worker, ctx) => worker.deliver(input, ctx)),
+			turn: (session, submissionId) =>
+				ingress(session, (worker, ctx) => worker.turn({ submissionId }, ctx), during()),
+			thread: (session, name, before, generation) =>
+				admit(session, generation, (worker, ctx) => worker.thread({ name, before, generation }, ctx)),
+			command: (session, input) => admit(session, input.generation, (worker, ctx) => worker.command(input, ctx)),
 			read: (session, id, offset, length) =>
-				ingress(session, (worker, ctx) => worker.read({ id, offset, length }, ctx)),
+				ingress(session, (worker, ctx) => worker.read({ id, offset, length }, ctx), during()),
 		};
 		const relay = new Relay((bot) => fleet.value.connected(bot), sessions, {
 			// The state's drafts are the same JSON as the relay's plain records.
@@ -174,18 +249,26 @@ export default defineFacet((host) => {
 			return found;
 		};
 		/** Drops `session`'s link and lifts its lock; its agents stop being told they answer Discord. */
-		const unlink = async (session: string, ctx: Ctx): Promise<void> => {
+		const unlink = async (session: string, ctx: Context): Promise<void> => {
+			const binding = Object.values(state.value.bindings).find((entry) => entry.session === session);
+			if (!binding) return;
 			await state.change((draft) => {
-				for (const [channel, binding] of Object.entries(draft.bindings))
-					if (binding.session === session) delete draft.bindings[channel];
+				draft.bindings[binding.channelId]!.phase = "revoking";
+				for (const [id, reply] of Object.entries(draft.pending))
+					if (reply.generation === binding.generation) delete draft.pending[id];
 			}, ctx);
-			await locks.set({ session, lock: null }, ctx);
-			// A session that is gone or archived has no worker to tell (and none to start).
-			const row = catalog.sessions.value.find((entry) => entry.id === session);
-			if (row && row.archivedAt === null)
-				await ingress(session, (worker, scope) => worker.unlinked(scope)).catch((error: unknown) =>
-					console.error("p2 discord: telling the session it is unlinked failed:", errorText(error)),
-				);
+			const finish = async () => {
+				await locks.set({ session, lock: null }, ctx);
+				await state.change((draft) => {
+					if (draft.bindings[binding.channelId]?.generation === binding.generation)
+						delete draft.bindings[binding.channelId];
+				}, ctx);
+			};
+			// Catalog archival precedes shutdown. Sessions keeps restore excluded through publication.
+			if (await archivedChanges().whileArchived(session, finish, ctx)) return;
+			if (catalog.sessions.value.some((entry) => entry.id === session))
+				await ingress(session, (worker, scope) => worker.unlinked({ generation: binding.generation }, scope), ctx);
+			await finish();
 		};
 		return {
 			bots: followNative(
@@ -194,7 +277,9 @@ export default defineFacet((host) => {
 				() => fleet.value.views(),
 			),
 			bindings: deriveTyped(self, [state], ([value]) =>
-				Object.values(value.bindings).sort((a, b) => a.createdAt - b.createdAt),
+				Object.values(value.bindings)
+					.sort((a, b) => a.createdAt - b.createdAt)
+					.map(({ generation: _generation, phase: _phase, ...binding }) => binding),
 			),
 			addBot: async ({ token }) => ({ id: await fleet.value.add(token) }),
 			setBotToken: async ({ bot, token }) => {
@@ -203,7 +288,8 @@ export default defineFacet((host) => {
 			},
 			removeBot: async ({ bot }, ctx) => {
 				for (const binding of Object.values(state.value.bindings))
-					if (binding.botId === bot) await unlink(binding.session, ctx);
+					if (binding.botId === bot)
+						await changeLink(binding.session, ctx, (scope) => unlink(binding.session, scope));
 				await fleet.value.remove(bot);
 				return null;
 			},
@@ -212,56 +298,87 @@ export default defineFacet((host) => {
 				const text = await optionalText(join(dataDir(), "mcp.json"));
 				return text ? mcpServerNames(text) : [];
 			},
-			link: async ({ session, bot, guild, channel: channelId, wake, sandbox, lock }, ctx) => {
-				const bindings = Object.values(state.value.bindings);
-				if (bindings.some((binding) => binding.session === session))
-					throw new Error("This session is linked already: unlink it first");
-				if (state.value.bindings[channelId]) throw new Error("This channel is linked to another session");
-				const config = envs.configs.value[sandbox];
-				if (config?.type !== "gondolin") throw new Error(`No sandbox ${sandbox}`);
-				const row = catalog.sessions.value.find((entry) => entry.id === session);
-				if (!row || row.archivedAt !== null) throw new Error("No such session");
-				const channel = await connected(bot).channel(channelId);
-				if (channel.thread || channel.guildId !== guild) throw new Error("Pick a channel of the server");
-				// As the owner's Relocate: the session works in the sandbox from now on, and cannot leave it.
-				if (row.env !== sandbox) {
-					const cwd = config.mounts?.[0]?.guest ?? "/root";
-					const { refused } = await moves.relocate({ id: session, cwd, env: sandbox }, ctx);
-					if (refused) throw new Error(`The session could not move into ${sandbox}: ${refused}`);
-				}
-				await locks.set({ session, lock }, ctx);
-				await state.change((draft) => {
-					draft.bindings[channelId] = {
-						botId: bot,
-						channelId,
-						channelName: channel.name,
-						guildId: channel.guildId,
-						guildName: channel.guildName,
-						session,
-						wake,
-						// The first mention delivers what comes after linking.
-						cursor: channel.lastMessageId,
-						threads: {},
-						createdAt: Date.now(),
-					};
-				}, ctx);
-				return null;
-			},
-			unlink: async ({ session }, ctx) => {
-				await unlink(session, ctx);
-				return null;
-			},
-			updateLink: async ({ session, wake, lock }, ctx) => {
-				if (!Object.values(state.value.bindings).some((binding) => binding.session === session))
-					throw new Error("This session is not linked");
-				// Both apply at once: who may wake Pi is read at each message, the lock is mirrored into the session.
-				await locks.set({ session, lock }, ctx);
-				await state.change((draft) => {
-					for (const binding of Object.values(draft.bindings))
-						if (binding.session === session) binding.wake = wake;
-				}, ctx);
-				return null;
-			},
+			link: ({ session, bot, guild, channel: channelId, wake, sandbox, lock }, caller) =>
+				changeLink(session, caller, async (ctx) => {
+					const bindings = Object.values(state.value.bindings);
+					if (bindings.some((binding) => binding.session === session))
+						throw new Error("This session is linked already: unlink it first");
+					if (state.value.bindings[channelId]) throw new Error("This channel is linked to another session");
+					const config = envs.configs.value[sandbox];
+					if (config?.type !== "gondolin") throw new Error(`No sandbox ${sandbox}`);
+					const row = catalog.sessions.value.find((entry) => entry.id === session);
+					if (!row || row.archivedAt !== null) throw new Error("No such session");
+					if (reservedChannels.has(channelId)) throw new Error("This channel is being linked to another session");
+					reservedChannels.add(channelId);
+					try {
+						const channel = await connected(bot).channel(channelId);
+						if (channel.thread || channel.guildId !== guild) throw new Error("Pick a channel of the server");
+						const cwd = row.env === sandbox ? row.cwd : (config.mounts?.[0]?.guest ?? "/root");
+						await moves().withPreparedMove(
+							{ id: session, cwd, env: sandbox },
+							{
+								inspect: async (scope) => {
+									const checker = await scope.get(DiscordConfinement, { session });
+									return (await checker.check({ sandbox }, scope)).generation;
+								},
+								validate: () => {
+									connected(bot);
+									if (envs.configs.value[sandbox] !== config)
+										throw new Error("The sandbox configuration changed");
+									if (
+										state.value.bindings[channelId] ||
+										Object.values(state.value.bindings).some((binding) => binding.session === session)
+									)
+										throw new Error("The channel or session is linked already");
+								},
+								publish: async (scope) => {
+									await locks.set({ session, lock }, scope);
+									await state.change((draft) => {
+										draft.bindings[channelId] = {
+											generation: ++draft.nextGeneration,
+											phase: "linked",
+											botId: bot,
+											channelId,
+											channelName: channel.name,
+											guildId: channel.guildId,
+											guildName: channel.guildName,
+											session,
+											wake,
+											cursor: channel.lastMessageId,
+											threads: {},
+											createdAt: Date.now(),
+										};
+									}, scope);
+								},
+							},
+							ctx,
+						);
+						return null;
+					} finally {
+						reservedChannels.delete(channelId);
+					}
+				}),
+			unlink: ({ session }, caller) =>
+				changeLink(session, caller, async (ctx) => {
+					await unlink(session, ctx);
+					return null;
+				}),
+			updateLink: ({ session, wake, lock }, caller) =>
+				changeLink(session, caller, async (ctx) => {
+					if (
+						!Object.values(state.value.bindings).some(
+							(binding) => binding.session === session && binding.phase === "linked",
+						)
+					)
+						throw new Error("This session is not linked");
+					// Both apply at once: who may wake Pi is read at each message, the lock is mirrored into the session.
+					await locks.set({ session, lock }, ctx);
+					await state.change((draft) => {
+						for (const binding of Object.values(draft.bindings))
+							if (binding.session === session) binding.wake = wake;
+					}, ctx);
+					return null;
+				}),
 		};
 	});
 

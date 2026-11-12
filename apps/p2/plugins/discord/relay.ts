@@ -1,8 +1,14 @@
 // What happens between a Discord channel and its linked session (server): a mention by someone allowed to wake Pi, seen
 // by the link's bot, delivers the messages since the link's cursor (a thread's: to its forked subagent) as one input; a
 // pending reply is posted once its turn ended. Plain logic over ports, so tests run it with fake bots and sessions.
-import type { SessionLock } from "@p2/app/v1";
-import { type Binding, COMMANDS, type Command, type OfferedFile, type Pending, type Wake } from "./contract.ts";
+import {
+	type RelayBinding as Binding,
+	COMMANDS,
+	type Command,
+	type OfferedFile,
+	type Pending,
+	type Wake,
+} from "./contract.ts";
 
 /** A Discord message as the relay reads it. */
 export type DiscordMessage = {
@@ -60,25 +66,27 @@ export type TurnState =
 export type SessionPort = {
 	/** Whether the session exists, is not archived and works in a sandbox; why not otherwise. */
 	usable(session: string): Promise<string | undefined>;
-	lock(session: string): SessionLock | null;
 	deliver(
 		session: string,
 		input: {
+			generation: number;
 			conversation?: number;
 			requestId: string;
 			author: { id: string; name: string };
 			text: string;
 			context: { channel: string; guild: string; messages: number; thread?: string };
 			files: { url: string; name: string; size: number; key: string; ref: string }[];
-			lock: SessionLock | null;
 		},
 	): Promise<{ conversation: number; submissionId: number }>;
 	turn(session: string, submissionId: number): Promise<TurnState>;
-	thread(session: string, name: string, before: number): Promise<{ conversation: number }>;
+	thread(session: string, name: string, before: number, generation: number): Promise<{ conversation: number }>;
 	/** `length` bytes (at most 4 MiB) of offered file `id` from `offset`. */
 	read(session: string, id: string, offset: number, length: number): Promise<Uint8Array>;
 	/** Runs channel command `command` on `conversation` (default: the main one): the reply's text. */
-	command(session: string, input: { conversation?: number; command: Command }): Promise<{ text: string }>;
+	command(
+		session: string,
+		input: { generation: number; conversation?: number; command: Command },
+	): Promise<{ text: string }>;
 };
 
 /** The relay's persisted state: bindings by channel, pending replies by the Discord message that woke Pi. */
@@ -112,7 +120,7 @@ export class Relay {
 	 */
 	readonly #lanes = new Map<string, Promise<void>>();
 	/** Channels and threads with deliveries under way (how many), and their bots: "typing" from the first moment. */
-	readonly #delivering = new Map<string, { bot: string; count: number }>();
+	readonly #delivering = new Map<string, { bot: string; count: number; channelId: string; generation: number }>();
 	/** Per channel or thread, the turns bots started in a row since a person last wrote there (in memory). */
 	readonly #botStreaks = new Map<string, { turns: number; noticed: boolean }>();
 	/** Answers posted lately (session and entry): a run's other inputs, settled later, post nothing. */
@@ -131,6 +139,16 @@ export class Relay {
 		const port = this.#discord(bot);
 		if (!port) throw new Error("The Discord bot is not connected");
 		return port;
+	}
+
+	#current(link: { channelId: string; generation: number }): Binding | undefined {
+		const current = this.#state.value().bindings[link.channelId];
+		return current?.phase === "linked" && current.generation === link.generation ? current : undefined;
+	}
+
+	#mayWake(binding: Binding, message: DiscordMessage): boolean {
+		const current = this.#current(binding);
+		return current !== undefined && mayWake(current.wake, message.author.id, message.roles);
 	}
 
 	/**
@@ -154,11 +172,12 @@ export class Relay {
 			thread = channel;
 		}
 		// Another bot in the channel may be mentioned too: only the link's own bot listens.
-		if (binding.botId !== bot || !mayWake(binding.wake, message.author.id, message.roles)) return;
+		if (binding.botId !== bot || !this.#mayWake(binding, message)) return;
 		// A command runs now, never behind the delivery under way (a stop must reach the running turn).
 		const command = commandOf(message.text, port.botId);
 		if (command) await this.#command(binding, thread, message, command);
-		else if (this.#botTurnAllowed(port, message)) await this.deliver(binding.channelId, message, thread);
+		else if (this.#botTurnAllowed(port, message))
+			await this.deliver(binding.channelId, message, thread, binding.generation);
 	}
 
 	/** A person wrote in `target` (a channel or thread): bots may wake Pi there again. */
@@ -206,6 +225,7 @@ export class Relay {
 		const port = this.#port(binding.botId);
 		const where = thread?.id ?? binding.channelId;
 		const refusal = await this.#sessions.usable(binding.session);
+		if (!this.#mayWake(binding, message)) return;
 		if (refusal) return port.reply(where, message.id, `Pi is not listening here right now: ${refusal}`);
 		const conversation = thread ? binding.threads[thread.id]?.conversation : undefined;
 		if (thread && conversation === undefined)
@@ -217,13 +237,14 @@ export class Relay {
 		let text: string;
 		try {
 			({ text } = await this.#sessions.command(binding.session, {
+				generation: binding.generation,
 				...(conversation === undefined ? {} : { conversation }),
 				command,
 			}));
 		} catch (error) {
 			text = `Could not reach Pi: ${error instanceof Error ? error.message : String(error)}`;
 		}
-		await port.reply(where, message.id, text);
+		if (this.#mayWake(binding, message)) await port.reply(where, message.id, text);
 	}
 
 	/** Whether `message` is a channel command of `binding` (never delivered to the agent, nor caught up on). */
@@ -240,12 +261,21 @@ export class Relay {
 	 * then advances the cursor and records the pending reply. A session that cannot take it gets a notice instead. One
 	 * delivery at a time per channel or thread: a later one starts from the cursor the earlier one left.
 	 */
-	async deliver(channelId: string, trigger: DiscordMessage, thread: DiscordChannel | undefined): Promise<void> {
+	async deliver(
+		channelId: string,
+		trigger: DiscordMessage,
+		thread: DiscordChannel | undefined,
+		generation: number,
+	): Promise<void> {
+		const binding = this.#current({ channelId, generation });
+		if (!binding || !this.#mayWake(binding, trigger)) return;
 		const target = thread?.id ?? channelId;
 		// "Typing" at once, before the wait for an earlier delivery and the history's pages: `typing()` refreshes it
 		// until the delivery ends, then the pending reply keeps it on.
 		const stopTyping = this.#typingWhile(channelId, target, trigger);
-		const run = (this.#lanes.get(target) ?? Promise.resolve()).then(() => this.#deliver(channelId, trigger, thread));
+		const run = (this.#lanes.get(target) ?? Promise.resolve()).then(() =>
+			this.#deliver(channelId, trigger, thread, generation),
+		);
 		// The lane goes on whether this delivery failed or not; the caller still learns it failed.
 		const lane = run.catch(() => {});
 		this.#lanes.set(target, lane);
@@ -263,7 +293,11 @@ export class Relay {
 		const cursor = target === channelId ? binding?.cursor : binding?.threads[target]?.cursor;
 		if (!binding || (cursor && BigInt(trigger.id) <= BigInt(cursor))) return () => {};
 		const bot = binding.botId;
-		const active = this.#delivering.get(target) ?? { bot, count: 0 };
+		const previous = this.#delivering.get(target);
+		const active =
+			previous?.generation === binding.generation
+				? previous
+				: { bot, count: 0, channelId, generation: binding.generation };
 		active.count++;
 		this.#delivering.set(target, active);
 		void this.#discord(bot)
@@ -275,12 +309,19 @@ export class Relay {
 		};
 	}
 
-	async #deliver(channelId: string, trigger: DiscordMessage, thread: DiscordChannel | undefined): Promise<void> {
-		const binding = this.#state.value().bindings[channelId];
-		if (!binding) return;
+	async #deliver(
+		channelId: string,
+		trigger: DiscordMessage,
+		thread: DiscordChannel | undefined,
+		generation: number,
+	): Promise<void> {
+		const binding = this.#current({ channelId, generation });
+		if (!binding || !this.#mayWake(binding, trigger)) return;
+		const authorized = () => this.#mayWake(binding, trigger);
 		const port = this.#port(binding.botId);
 		const where = thread?.id ?? channelId;
 		const refusal = await this.#sessions.usable(binding.session);
+		if (!authorized()) return;
 		if (refusal) return port.reply(where, trigger.id, `Pi is not listening here right now: ${refusal}`);
 		let conversation: number | undefined;
 		let cursor = binding.cursor;
@@ -291,13 +332,16 @@ export class Relay {
 					binding.session,
 					thread.name,
 					thread.thread?.createdAt ?? Date.now(),
+					generation,
 				);
+				if (!authorized()) return;
 				known = { conversation: created.conversation, name: thread.name, cursor: null };
 				const value = known;
 				await this.#state.change((draft) => {
 					const current = draft.bindings[channelId];
-					if (current) current.threads[thread.id] = value;
+					if (current?.generation === generation && current.phase === "linked") current.threads[thread.id] = value;
 				});
+				if (!authorized()) return;
 			}
 			conversation = known.conversation;
 			cursor = known.cursor;
@@ -310,12 +354,13 @@ export class Relay {
 		const window = new BatchWindow(BATCH_CAP);
 		const before = thread?.thread && cursor === null ? thread.thread.createdId : undefined;
 		if (before !== undefined)
-			for await (const message of history(port, channelId, binding.cursor, before))
+			for await (const message of history(port, channelId, binding.cursor, authorized, before))
 				if (message.author.id !== port.botId && !this.#isCommand(binding, message, port.botId))
 					window.add("channel", message);
-		for await (const message of history(port, where, cursor, trigger.id))
+		for await (const message of history(port, where, cursor, authorized, trigger.id))
 			if (message.author.id !== port.botId && !this.#isCommand(binding, message, port.botId))
 				window.add("here", message);
+		if (!authorized()) return;
 		if (!window.has(trigger.id)) window.add("here", trigger);
 		const plural = (count: number) => `${count} message${count === 1 ? "" : "s"}`;
 		const left = window.omitted
@@ -338,6 +383,7 @@ export class Relay {
 		let delivered: { conversation: number; submissionId: number };
 		try {
 			delivered = await this.#sessions.deliver(binding.session, {
+				generation,
 				...(conversation === undefined ? {} : { conversation }),
 				requestId: `discord:${trigger.id}`,
 				author: { id: trigger.author.id, name: trigger.author.name },
@@ -349,9 +395,9 @@ export class Relay {
 					...(thread ? { thread: thread.name } : {}),
 				},
 				files: batch.files,
-				lock: this.#sessions.lock(binding.session),
 			});
 		} catch (error) {
+			if (!authorized()) return;
 			await port.reply(
 				where,
 				trigger.id,
@@ -361,12 +407,18 @@ export class Relay {
 		}
 		await this.#state.change((draft) => {
 			const current = draft.bindings[channelId];
-			if (!current) return;
+			if (
+				current?.generation !== generation ||
+				current.phase !== "linked" ||
+				!mayWake(current.wake, trigger.author.id, trigger.roles)
+			)
+				return;
 			if (thread) {
 				const known = current.threads[thread.id];
 				if (known) known.cursor = trigger.id;
 			} else current.cursor = trigger.id;
 			draft.pending[trigger.id] = {
+				generation,
 				botId: binding.botId,
 				session: binding.session,
 				channelId,
@@ -386,7 +438,7 @@ export class Relay {
 	async catchUp(bot: string): Promise<void> {
 		const port = this.#port(bot);
 		for (const binding of Object.values(this.#state.value().bindings)) {
-			if (binding.botId !== bot) continue;
+			if (binding.botId !== bot || !this.#current(binding)) continue;
 			const places: { id: string; cursor: string | null; thread: boolean }[] = [
 				{ id: binding.channelId, cursor: binding.cursor, thread: false },
 				...Object.entries(binding.threads).map(([id, known]) => ({ id, cursor: known.cursor, thread: true })),
@@ -394,20 +446,26 @@ export class Relay {
 			for (const place of places) {
 				try {
 					let newest: DiscordMessage | undefined;
-					for await (const message of history(port, place.id, place.cursor)) {
+					for await (const message of history(
+						port,
+						place.id,
+						place.cursor,
+						() => this.#current(binding) !== undefined,
+					)) {
 						if (message.author.id === port.botId) continue;
 						if (!message.author.bot) this.#personWrote(place.id);
 						// A missed command is stale: it neither runs nor triggers a delivery.
 						if (
 							message.mentionsBot &&
-							mayWake(binding.wake, message.author.id, message.roles) &&
+							this.#mayWake(binding, message) &&
 							!this.#isCommand(binding, message, port.botId)
 						)
 							newest = message;
 					}
-					if (!newest || !this.#botTurnAllowed(port, newest)) continue;
+					if (!newest || !this.#mayWake(binding, newest)) continue;
 					const thread = place.thread ? await port.channel(place.id) : undefined;
-					await this.deliver(binding.channelId, newest, thread);
+					if (!this.#mayWake(binding, newest) || !this.#botTurnAllowed(port, newest)) continue;
+					await this.deliver(binding.channelId, newest, thread, binding.generation);
 				} catch (error) {
 					// A channel or thread that went away (or a session that cannot take it) skips only itself.
 					console.error("p2 discord: catching up failed:", error instanceof Error ? error.message : error);
@@ -426,6 +484,13 @@ export class Relay {
 		const settled: { pending: Pending; turn: TurnState }[] = [];
 		try {
 			for (const pending of Object.values(this.#state.value().pending)) {
+				if (!this.#current(pending)) {
+					await this.#state.change((draft) => {
+						if (draft.pending[pending.messageId]?.generation === pending.generation)
+							delete draft.pending[pending.messageId];
+					});
+					continue;
+				}
 				if ((sessions && !sessions.has(pending.session)) || this.#checking.has(pending.messageId)) continue;
 				// A bot that is not connected (or was removed) keeps its replies until it is, or they time out.
 				if (!this.#discord(pending.botId) && now - pending.since < PENDING_TIMEOUT_MS) continue;
@@ -438,7 +503,7 @@ export class Relay {
 			for (const entry of settled) {
 				const key =
 					entry.turn.state === "answered"
-						? `${entry.pending.session}:${entry.turn.answer}`
+						? `${entry.pending.session}:${entry.pending.generation}:${entry.turn.answer}`
 						: entry.pending.messageId;
 				runs.set(key, [...(runs.get(key) ?? []), entry]);
 			}
@@ -471,7 +536,12 @@ export class Relay {
 			// A stopped turn posts nothing (the stop command answered already), nor does an answer posted before (an
 			// input of its run settled after the others were checked).
 			const turn = newest?.turn;
-			if (newest && (turn?.state === "answered" || turn?.state === "unanswered") && !this.#posted.includes(key)) {
+			if (
+				newest &&
+				this.#current(newest.pending) &&
+				(turn?.state === "answered" || turn?.state === "unanswered") &&
+				!this.#posted.includes(key)
+			) {
 				const port = this.#discord(newest.pending.botId);
 				if (!port) throw new Error("its bot is not connected");
 				// The oldest input's span covers the whole turn; files are listed once each.
@@ -487,7 +557,9 @@ export class Relay {
 			console.error("p2 discord: posting a reply failed:", error instanceof Error ? error.message : error);
 		}
 		await this.#state.change((draft) => {
-			for (const { pending } of run) delete draft.pending[pending.messageId];
+			for (const { pending } of run)
+				if (draft.pending[pending.messageId]?.generation === pending.generation)
+					delete draft.pending[pending.messageId];
 		});
 	}
 
@@ -498,16 +570,17 @@ export class Relay {
 
 	/**
 	 * Posts a finished turn's reply: its text split at 2000 characters, the first part replying to the waking message,
-	 * and the files the turn offered attached (at most 10 a message, together within the server's limit; larger ones
-	 * named only), the first ones on the last text part.
+	 * and files attached within Discord's limits. Every part rechecks the link before posting.
 	 */
 	async #reply(
 		port: DiscordPort,
 		pending: Pending,
 		turn: Extract<TurnState, { state: "answered" | "unanswered" }>,
 	): Promise<void> {
+		if (!this.#current(pending)) return;
 		let text = turn.state === "answered" ? turn.text : `(No answer: ${turn.reason})`;
 		const limit = turn.files.length ? await port.uploadLimit(pending.replyChannelId) : 0;
+		if (!this.#current(pending)) return;
 		const tooLarge = turn.files.filter((file) => file.size > limit);
 		if (tooLarge.length)
 			text += `${text ? "\n\n" : ""}Too large for Discord: ${tooLarge.map((file) => `${file.name} (${megabytes(file.size)})`).join(", ")}`;
@@ -525,10 +598,13 @@ export class Relay {
 			else posts.push({ text: "", files: group });
 		}
 		for (const [index, post] of posts.entries()) {
+			if (!this.#current(pending)) return;
 			const files: { name: string; data: Uint8Array }[] = [];
 			for (const file of post.files) {
 				try {
-					files.push({ name: file.name, data: await this.#readFile(pending.session, file) });
+					const data = await this.#readFile(pending, file);
+					if (!data) return;
+					files.push({ name: file.name, data });
 				} catch (error) {
 					console.error(
 						`p2 discord: reading ${file.name} failed:`,
@@ -536,16 +612,24 @@ export class Relay {
 					);
 				}
 			}
+			if (!this.#current(pending)) return;
 			if (!post.text && !files.length) continue;
 			await port.reply(pending.replyChannelId, index === 0 ? pending.messageId : undefined, post.text, files);
 		}
 	}
 
-	/** Offered file `file` of `session`, whole. */
-	async #readFile(session: string, file: OfferedFile): Promise<Uint8Array> {
+	/** Offered file `file`, only while its pending reply still has authority. */
+	async #readFile(pending: Pending, file: OfferedFile): Promise<Uint8Array | undefined> {
 		const parts: Uint8Array[] = [];
 		for (let offset = 0; offset < file.size; ) {
-			const part = await this.#sessions.read(session, file.id, offset, Math.min(READ_CHUNK, file.size - offset));
+			if (!this.#current(pending)) return undefined;
+			const part = await this.#sessions.read(
+				pending.session,
+				file.id,
+				offset,
+				Math.min(READ_CHUNK, file.size - offset),
+			);
+			if (!this.#current(pending)) return undefined;
 			if (!part.length) break;
 			parts.push(part);
 			offset += part.length;
@@ -558,14 +642,19 @@ export class Relay {
 	 * is pending, queued or not: it ends with the delivery's failure, or when the reply is posted, stopped or failed.
 	 */
 	async typing(): Promise<void> {
-		const channels = new Map<string, string>();
-		for (const [target, { bot }] of this.#delivering) channels.set(target, bot);
+		const channels = new Map<string, { bot: string; channelId: string; generation: number }>();
+		for (const [target, active] of this.#delivering) channels.set(target, active);
 		for (const pending of Object.values(this.#state.value().pending))
-			channels.set(pending.replyChannelId, pending.botId);
-		for (const [channel, bot] of channels)
-			await this.#discord(bot)
-				?.typing(channel)
-				.catch(() => {});
+			channels.set(pending.replyChannelId, {
+				bot: pending.botId,
+				channelId: pending.channelId,
+				generation: pending.generation,
+			});
+		for (const [channel, active] of channels)
+			if (this.#current(active))
+				await this.#discord(active.bot)
+					?.typing(channel)
+					.catch(() => {});
 	}
 }
 
@@ -577,11 +666,14 @@ async function* history(
 	port: DiscordPort,
 	channel: string,
 	cursor: string | null,
+	authorized: () => boolean,
 	until?: string,
 ): AsyncGenerator<DiscordMessage> {
 	let after = cursor ?? "0";
 	for (;;) {
+		if (!authorized()) return;
 		const page = await port.messages(channel, { after, limit: PAGE });
+		if (!authorized()) return;
 		for (const message of page) {
 			if (until !== undefined && BigInt(message.id) > BigInt(until)) return;
 			yield message;

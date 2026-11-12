@@ -2,23 +2,20 @@
 // state (`SessionLockDoc`), where the tool guard and the prompt read it at each use.
 import type { Harness } from "@earendil-works/pi-durable";
 import {
+	awaitWithContext,
 	type Context,
 	type Ctx,
 	expectVariant,
 	type FacetHost,
 	type SessionLock as Lock,
-	local,
 	untilAborted,
 } from "@p2/app/v1";
 import { durableContext } from "@p2/app/v1/node";
 import { harnessOf, SessionLockDoc } from "@p2/app/v1/worker";
-import { SessionLock } from "./contract.ts";
-
-/** The mirror (worker, host lifetime): no members, a routine. */
-const LockMirror = local("p2.session-lock-mirror", { version: 1, params: {}, members: {} });
+import { SessionLock, SessionLockMirror } from "./contract.ts";
 
 /** Commits `lock` as the session's lock unless it is that already. */
-export async function mirrorLock(durable: Harness, lock: Lock | null, context: Context): Promise<void> {
+async function mirrorLock(durable: Harness, lock: Lock | null, context: Context): Promise<void> {
 	const current = (await durable.snapshot(SessionLockDoc, context))?.lock ?? null;
 	if (JSON.stringify(current) === JSON.stringify(lock)) return;
 	await durable.commit(async (tx) => {
@@ -27,25 +24,46 @@ export async function mirrorLock(durable: Harness, lock: Lock | null, context: C
 }
 
 export function serveLockMirror(host: FacetHost): void {
-	host.serve(LockMirror, (_params, self) => {
+	host.serve(SessionLockMirror, (_params, self) => {
 		const harness = harnessOf(self);
 		const view = self.get(SessionLock, {});
+		const initialized = Promise.withResolvers<void>();
+		void initialized.promise.catch(report);
+		let chain: Promise<void> = Promise.resolve();
 		self.onLive(async (ctx: Ctx) => {
-			const watch = await expectVariant(view, "worker").lock.watch(ctx);
-			// One commit at a time, the newest value last.
-			let chain = mirrorLock(harness().durable, watch.value, durableContext(ctx)).catch(report);
-			watch.start(async (call) => {
-				if (call.kind !== "value") return;
-				const value = call.value;
-				chain = chain.then(() => mirrorLock(harness().durable, value, durableContext(ctx))).catch(report);
-			});
 			try {
-				await untilAborted(ctx);
-			} finally {
-				await watch.stop();
+				const watch = await expectVariant(view, "worker").lock.watch(ctx);
+				chain = mirrorLock(harness().durable, watch.value, durableContext(ctx));
+				void chain.catch(report);
+				initialized.resolve();
+				watch.start(async (call) => {
+					const commit = () => {
+						if (call.kind === "failed") throw call.error;
+						return mirrorLock(harness().durable, call.value, durableContext(ctx));
+					};
+					// Keep failure visible to admissions, but let the next authoritative update recover the queue.
+					chain = chain.then(commit, commit);
+					void chain.catch(report);
+				});
+				try {
+					await untilAborted(ctx);
+				} finally {
+					await watch.stop();
+				}
+			} catch (error) {
+				initialized.reject(error);
+				throw error;
 			}
 		});
-		return {};
+		return {
+			sync: async (ctx) => {
+				await awaitWithContext(initialized.promise, ctx);
+				await awaitWithContext(chain, ctx);
+				// A disconnected reference retains its last value; it is not current authority.
+				if (view.state.value.kind !== "live") throw new Error("Session lock authority is unavailable");
+				return null;
+			},
+		};
 	});
 }
 

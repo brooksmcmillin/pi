@@ -25,7 +25,7 @@ import { durableContext } from "../../src/runtime/durable.ts";
 import { chatModeHost } from "./chat-mode-host.ts";
 import { expectChord, holdIn, until } from "./helpers.ts";
 
-const OWNER = { kind: "owner", access: "local" } as const;
+const OWNER = { kind: "owner", access: "local", session: "test-owner" } as const;
 const ALICE = { kind: "guest", id: "alice", name: "Alice", home: "s1", sessions: { s1: "full" }, revision: 1 } as const;
 const BOB = { kind: "guest", id: "bob", name: "Bob", home: "s1", sessions: { s1: "view" }, revision: 1 } as const;
 const where = { session: "s1", conversation: 1 };

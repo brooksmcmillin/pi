@@ -19,7 +19,7 @@ import { Catalog, type Session, SessionLocks } from "../../plugins/sessions/cont
 import { ChildStore } from "../../plugins/subagents/contract.ts";
 import { APP, holdIn, TEST, testHost, until } from "./helpers.ts";
 
-const OWNER: P2Principal = { kind: "owner", access: "local" };
+const OWNER: P2Principal = { kind: "owner", access: "local", session: "test-owner" };
 const RELAY_OWNER: P2Principal = { kind: "owner", access: "relay" };
 const GUEST: P2Principal = {
 	kind: "guest",

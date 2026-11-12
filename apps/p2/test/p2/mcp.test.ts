@@ -34,7 +34,7 @@ const DAEMON =
 			import.meta.url,
 		),
 	);
-const OWNER: P2Principal = { kind: "owner", access: "local" };
+const OWNER: P2Principal = { kind: "owner", access: "local", session: "test-owner" };
 const GUEST: P2Principal = {
 	kind: "guest",
 	id: "g1",

@@ -28,14 +28,19 @@ The Session sheet's **Discord** row shows the session's channel, or "Not linked"
   channels; one linked to another session shows as taken), **who may wake Pi** (anyone in the channel, or members
   with picked roles, plus optional user IDs), the **sandbox** (existing ones), and **what the session may use** (MCP
   servers of `mcp.json`, the project's MCP servers, the global instructions, forwarding ports, messaging other
-  sessions). **Link** stays disabled and says what is still to pick. Linking moves the session into the sandbox (as
-  the owner's Relocate does, into the sandbox's first folder, else `/root`; a busy session refuses, nothing changes),
-  stores its lock and the link, and starts listening after the channel's newest message.
+  sessions). **Link** stays disabled and says what is still to pick. Linking checks the idle worker, starting it if
+  needed, and refuses any existing agent whose own or inherited location is outside the selected sandbox (including
+  archived agents). Refusal leaves the location, lock, link and agents unchanged. Followers move into the sandbox's
+  first folder, else `/root`; agents already placed in that sandbox keep their own directories. A session already in
+  the sandbox is still checked and keeps its current directory. The checked worker stops while the location, lock
+  and link are published, then restarts; listening begins after the channel's newest message.
 - Linked: the bot, server › channel and sandbox (fixed), then who may wake Pi and what the session may use, editable:
   **Save** (enabled once something changed and someone may still wake Pi) stores them in place (`Discord.updateLink`,
   contract version 3; version 2 pages still bind) and they apply at once: who may wake Pi is read at each message, the
-  lock is mirrored into the running session. **Unlink** stops listening and lifts the lock; the session stays in its
-  sandbox.
+  lock is mirrored into the running session. **Unlink** revokes the old link's pending input and replies before
+  lifting the lock; already-submitted agent work continues, and the session stays in its sandbox. Requests already
+  sent to Discord cannot be recalled. For an archived session, unlink waits for archival shutdown before unlocking;
+  restore waits until that cleanup finishes. Failed cleanup keeps the link locked for retry.
 - **The agent knows:** a linked session's main agent and its threads' subagents get a two-sentence `discord` prompt
   section: their input comes from the channel (or thread), their final answer of each turn is posted there as the
   reply with the files offered with `send_file` during the turn attached, and nothing else is posted (intermediate
@@ -126,7 +131,7 @@ In a locked session the lock replaces the "a turn the owner started" check, for 
 - `<data>/discord.json`: the bots' tokens (above).
 - The bots' avatars reach the sheets through `GET /discord/avatar?bot=<id>` (owner only, fetched from Discord's CDN by
   the server and kept per avatar): the page's CSP loads only its own images.
-- Server state `p2.discord-bindings` (persisted; version 2 adds the bot): links by channel (bot, session, who may wake
+- Server state `p2.discord-bindings` (persisted; version 3 adds link generations and retryable revocation): links by channel (bot, session, who may wake
   Pi, cursor, threads with their subagent conversation and cursor) and pending replies by waking message (bot,
   session, reply channel, submission).
 - The bots (discord.js, a server host package: plugins cannot bundle from the app's hoisted `node_modules`) run in the

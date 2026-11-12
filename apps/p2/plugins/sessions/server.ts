@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { arr, bool, nul, obj, str, union, unknown } from "@earendil-works/pi-schema";
+import { arr, bool, int, nul, obj, opt, str, union, unknown } from "@earendil-works/pi-schema";
 import {
 	type AcceptsTable,
 	type Context,
@@ -26,6 +26,7 @@ import {
 	type Ref,
 	type SessionInit,
 	serveKeyed,
+	serveNative,
 	type Tx,
 	until,
 	WorkerBoundary,
@@ -33,9 +34,11 @@ import {
 } from "@p2/app/v1";
 import { Server, serverOf, WorkerInitValues } from "@p2/app/v1/server";
 import { EnvManagers, EnvService } from "../envs/contract.ts";
+import { isSandbox } from "../envs/schema.ts";
 import { ModelConfig, ModelResources } from "../models/contract.ts";
 import { ChildStore } from "../subagents/contract.ts";
 import { CatalogDb } from "./catalog.ts";
+import { ArchivedSessionChanges, PreparedSessionMoves } from "./contract.server.ts";
 import {
 	ArchivedStarts,
 	Catalog,
@@ -182,6 +185,8 @@ const RelocateJob = defineJob("p2.sessions.relocate", {
 		env: union([str(), nul()]),
 		/** The owner's move (a refusal is a failed operation) or the agent's (`SessionMoves`: its tool reports it). */
 		by: union([literal("owner"), literal("agent")]),
+		// Old persisted agent jobs have no generation and are refused at execution.
+		generation: opt(int({ minimum: 1 })),
 	}),
 	result: obj({ refused: union([str(), nul()]) }),
 	persist: RERUN,
@@ -240,6 +245,8 @@ const ROW_WAIT_MS = 10_000;
 
 export default defineFacet((host) => {
 	serveLocks(host);
+	serveNative(host, PreparedSessionMoves);
+	serveNative(host, ArchivedSessionChanges);
 	serveKeyed(host, SessionArchived);
 	serveKeyed(host, SessionCopied);
 	host.serve(
@@ -331,7 +338,12 @@ export default defineFacet((host) => {
 		 * catalog moves and the worker follows in place (restarted from the catalog when it cannot). Returns why a busy
 		 * worker refused (nothing moved), else null.
 		 */
-		const relocate = async (id: string, location: Location, ctx: Ctx): Promise<string | null> => {
+		const relocate = async (
+			id: string,
+			location: Location,
+			authority: { kind: "owner" } | { kind: "worker"; generation: number | undefined },
+			ctx: Ctx,
+		): Promise<string | null> => {
 			let refused: string | null = null;
 			const boundary = () => ctx.get(WorkerBoundary, { session: id });
 			try {
@@ -342,6 +354,19 @@ export default defineFacet((host) => {
 						return refusal;
 					},
 					update: async () => {
+						// Authorization belongs to execution, after this move's queue and worker-preparation awaits.
+						if (authority.kind === "worker") {
+							const workers = natives().workers;
+							if (
+								authority.generation === undefined ||
+								workers.generation(id) !== authority.generation ||
+								!workers.running().includes(id)
+							)
+								throw forbidden("stale worker");
+							const from = catalog.sessions.value.find((row) => row.id === id)?.env;
+							if (from && from !== location.env && isSandbox(envService.configs.value, from))
+								throw forbidden(`this session works in sandbox ${from} and cannot leave it`);
+						}
 						await catalog.update({ id, ...location }, ctx);
 					},
 					move: async () => {
@@ -362,7 +387,14 @@ export default defineFacet((host) => {
 		};
 
 		const relocations = self.job(RelocateJob, {
-			run: async ({ id, cwd, env }, ctx) => ({ refused: await relocate(id, { cwd, env }, ctx) }),
+			run: async ({ id, cwd, env, by, generation }, ctx) => ({
+				refused: await relocate(
+					id,
+					{ cwd, env },
+					by === "owner" ? { kind: "owner" } : { kind: "worker", generation },
+					ctx,
+				),
+			}),
 			finish: async (outcome, tx) => {
 				const error =
 					outcome.kind === "failed"
@@ -479,6 +511,29 @@ export default defineFacet((host) => {
 			},
 		});
 
+		const archiveChanges = new Map<string, Promise<unknown>>();
+		const changeArchive = <T>(id: string, change: () => Promise<T>): Promise<T> => {
+			// A failed change must not prevent a later restore or cleanup retry.
+			const done = (archiveChanges.get(id) ?? Promise.resolve()).catch(() => {}).then(change);
+			archiveChanges.set(id, done);
+			return done.finally(() => {
+				if (archiveChanges.get(id) === done) archiveChanges.delete(id);
+			});
+		};
+		self.contribute(ArchivedSessionChanges, {
+			whileArchived: (id, work, context) =>
+				changeArchive(id, async () => {
+					const row = catalog.sessions.value.find((session) => session.id === id);
+					if (!row || row.archivedAt === null) return false;
+					// Reuse the keyed, idempotent archive job, including after a failed or interrupted archive.
+					const run = await archives.start({ id }, context, { key: id });
+					const outcome = await run.outcome(context);
+					if (outcome.kind === "failed") throw new Error(failureText(outcome.error));
+					await work();
+					return true;
+				}),
+		});
+
 		const operations = deriveTyped(
 			self,
 			[relocations.running, clones.running, forks.running, archives.running, failed],
@@ -520,6 +575,35 @@ export default defineFacet((host) => {
 			if (session.archivedAt !== null) throw new Error("Session is archived");
 			return session;
 		};
+		self.contribute(PreparedSessionMoves, {
+			withPreparedMove: (target, transition, context) =>
+				natives().root(async (ctx) => {
+					await liveSession(target.id, ctx);
+					const location = await destination(target);
+					await natives().workers.pauseChecked(
+						target.id,
+						async () => {
+							const refusal = await fenceWorker(
+								catalog,
+								children,
+								target.id,
+								"changing directory",
+								ctx,
+								location,
+							);
+							if (refusal !== undefined) return { kind: "refused", reason: refusal };
+							return { kind: "prepared", generation: await transition.inspect(ctx) };
+						},
+						async () => {
+							await liveSession(target.id, ctx);
+							transition.validate();
+							await catalog.update({ id: target.id, ...location }, ctx);
+							await transition.publish(ctx);
+						},
+						context,
+					);
+				}, context),
+		});
 		/** A copy's catalog entry: the source's place, model and level under a marked title. */
 		const copyOf = (source: Session, id: string, mark: string, ctx: Ctx) =>
 			catalog.create(
@@ -620,10 +704,10 @@ export default defineFacet((host) => {
 					ctx,
 				);
 			},
-			move: async ({ id, ...target }, ctx) => {
+			move: async ({ id, generation, ...target }, ctx) => {
 				await liveSession(id, ctx);
 				const location = await destination(target);
-				const run = await relocations.start({ id, ...location, by: "agent" }, ctx);
+				const run = await relocations.start({ id, ...location, by: "agent", generation }, ctx);
 				const outcome = await run.outcome(ctx);
 				if (outcome.kind === "failed") throw new Error(failureText(outcome.error));
 				return outcome.result;
@@ -648,20 +732,22 @@ export default defineFacet((host) => {
 				);
 				return startCopy(source, copy, "fork", () => forks.start({ id, copy, entries }, ctx, { key: copy }), ctx);
 			},
-			archive: async ({ id }, ctx) => {
-				await catalog.update({ id, archived: true }, ctx);
-				await archives.start({ id }, ctx, { key: id });
-				return null;
-			},
-			restore: async ({ id }, ctx) => {
-				// After a running archive of it: its worker stop must not land after the restore.
-				const archiving = archives.running.value.find((run) => run.phase !== "blocked" && run.key === id);
-				if (archiving) await archives.outcome(archiving.id, ctx).catch(() => {});
-				await catalog.update({ id, archived: false }, ctx);
-				// A start refused while archived left the worker failed or suspended: its holders start it again.
-				await natives().workers.resume(id);
-				return null;
-			},
+			archive: ({ id }, ctx) =>
+				changeArchive(id, async () => {
+					await catalog.update({ id, archived: true }, ctx);
+					await archives.start({ id }, ctx, { key: id });
+					return null;
+				}),
+			restore: ({ id }, ctx) =>
+				changeArchive(id, async () => {
+					// After a running archive of it: its worker stop must not land after the restore.
+					const archiving = archives.running.value.find((run) => run.phase !== "blocked" && run.key === id);
+					if (archiving) await archives.outcome(archiving.id, ctx).catch(() => {});
+					await catalog.update({ id, archived: false }, ctx);
+					// A start refused while archived left the worker failed or suspended: its holders start it again.
+					await natives().workers.resume(id);
+					return null;
+				}),
 			dismiss: async ({ operation }, ctx) => {
 				await failed.change((draft) => {
 					draft.list = draft.list.filter((each) => each.id !== operation);
