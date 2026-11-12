@@ -32,7 +32,7 @@ type Outcome<P extends Principal> =
 	| { readonly kind: "built"; readonly base: BaseBundle; readonly published: PublishedScripts<P> }
 	| { readonly kind: "failed"; readonly error: unknown };
 
-/** The set the scripts object shows before the build: no client holds it then (the page and the start wait). */
+/** The pre-build set: reconnecting clients ignore it until the first built set is published. */
 const UNBUILT: ScriptSet = { base: "", combined: "", plugins: [] };
 
 /** A surface's base bundle and first set, built once, after the server's load. */

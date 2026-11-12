@@ -313,6 +313,53 @@ describe("a failed update (audit F7)", () => {
 	});
 });
 
+describe("a surface still building", () => {
+	it.each(["B1", "B2"])("keeps the client across an unbuilt reconnect until base %s is published", async (base) => {
+		const a1 = script("@test/a", "d1", "hello");
+		const a2 = script("@test/a", "d2", "hello again");
+		const styles: string[] = [];
+		const { client, server, outdated, sockets, fetched } = await setup([a1], [a2], {
+			styles: {
+				prepare: async () => {
+					styles.push("prepare");
+				},
+				settle: () => {
+					styles.push("settle");
+				},
+			},
+		});
+		try {
+			const greeting = await client.host.get(Greeting, {}, context);
+			const scripts = await client.host.get(WebScripts, {}, context);
+			await publishTo(server, "web", { base: "", combined: "", plugins: [] }, context);
+			await until(() => scripts.set.value.base === "");
+			sockets[0]!.link.close();
+			await until(() => sockets.length === 2 && scripts.state.value.kind === "live");
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(outdated).toEqual([]);
+			expect(fetched).toEqual([]);
+			expect(styles).toEqual([]);
+			expect(greeting.text.value).toBe("hello");
+
+			await publishTo(server, "web", setOf(base, [a2]), context);
+			if (base === "B1") {
+				await until(() => greeting.text.value === "hello again");
+				expect(styles).toEqual(["prepare", "settle"]);
+				expect(outdated).toEqual([]);
+			} else {
+				await until(() => outdated.length === 1);
+				expect(greeting.text.value).toBe("hello");
+				expect(styles).toEqual([]);
+			}
+			scripts.release();
+			greeting.release();
+		} finally {
+			await client.stop(context);
+			await server.close(context);
+		}
+	});
+});
+
 describe("outdated clients", () => {
 	it("calls outdated for a set with another base", async () => {
 		const { client, server, outdated } = await setup([]);

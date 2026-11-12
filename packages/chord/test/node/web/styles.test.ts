@@ -93,6 +93,11 @@ describe.skipIf(CHROMIUM === undefined)("a page's plugin stylesheets", () => {
 
 	beforeAll(async () => {
 		browser = await Browser.start();
+		// Frame sampling and unstyled colors must not depend on window focus or the OS theme.
+		await browser.call("Emulation.setFocusEmulationEnabled", { enabled: true });
+		await browser.call("Emulation.setEmulatedMedia", {
+			features: [{ name: "prefers-color-scheme", value: "light" }],
+		});
 	}, 120_000);
 
 	afterAll(async () => {
@@ -247,6 +252,7 @@ describe.skipIf(CHROMIUM === undefined)("a page's plugin stylesheets", () => {
 					'globalThis.errors.filter((error) => error.kind === "stylesheet_failed").map(({ plugin, reason }) => [plugin, reason])',
 				),
 			).toEqual([["@test/e", "error"]]);
+			await browser.wait(`(${linksOf("e")}).length === 1`);
 			expect(await browser.evaluate<string>(color("part-e"))).toBe("rgb(0, 0, 0)");
 			// The server is reachable again; another plugin's update loads `e`'s stylesheet (the same URL) again.
 			await release();

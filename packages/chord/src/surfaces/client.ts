@@ -300,6 +300,8 @@ class Updates<P extends Principal> {
 	 */
 	async #apply(set: ScriptSet, context: Context): Promise<boolean> {
 		const options = this.#options;
+		// A reconnect can observe the server's unbuilt set before its surface is ready.
+		if (set.base === "") return true;
 		if (set.base !== options.base) {
 			options.outdated();
 			return true;
