@@ -58,7 +58,7 @@ export default defineFacet((host) => {
 					const from = catalog.sessions.value.find((entry) => entry.id === session)?.env;
 					if (from && from !== env && isSandbox(envs.configs.value, from))
 						throw forbidden(`this session works in sandbox ${from} and cannot leave it`);
-					return moves.relocate({ id: session, env, cwd }, ctx);
+					return moves.relocate({ id: session, generation, env, cwd }, ctx);
 				},
 			},
 		};

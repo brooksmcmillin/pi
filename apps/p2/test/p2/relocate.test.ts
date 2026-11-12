@@ -507,7 +507,7 @@ describe("session relocation (fake provider)", () => {
 					await sessions.relocate({ id: s.session.id, cwd, env: null }, ctx);
 				},
 				withAbortSignal(controller.signal, BACKGROUND_CONTEXT),
-				{ principal: { kind: "owner", access: "local" } },
+				{ principal: { kind: "owner", access: "local", session: "test-owner" } },
 			);
 			setTimeout(() => controller.abort(), delay);
 			await call.catch(() => {});

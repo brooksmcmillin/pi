@@ -1,11 +1,14 @@
-// Tests of a client host with its plugins (slice 11 §2, §4, decisions "Slice 11, P4" to "P6"), over an in-memory link
-// to a server serving the scripts object: the initial scripts loaded with the core facets, a new set applied in place
-// (only changed scripts fetched; a failed one keeps its old facet), a new base or an outdated server ending the client.
+// Tests of a client host with its plugins (slice 11 §2, §4, decisions "Slice 11, P4" to "P6", p3 step 0a), over an
+// in-memory link to a server serving the scripts object: the initial scripts loaded with the core facets, a new set
+// applied in place (only changed scripts fetched; a failed one keeps its old facet and is tried again by the next set
+// that has it), the stylesheets loaded before the reload and settled after it, a new base or an outdated server ending
+// the client.
 
 import { describe, expect, it } from "vitest";
 import { BACKGROUND_CONTEXT as context } from "../../src/context/index.ts";
 import * as chordNext from "../../src/index.ts";
 import {
+	type ClientStyles,
 	constant,
 	createHost,
 	defineFacet,
@@ -25,13 +28,17 @@ type TestPrincipal = { readonly kind: "server" } | { readonly kind: "user"; read
 
 const Greeting = local("test.greeting", { version: 1, params: {}, members: { text: str() } });
 
-/** A registered script of plugin `plugin` (digest `digest`) serving `Greeting` with `text`; `broken` throws instead. */
-function script(plugin: string, digest: string, text: string): RegisteredScript {
+/**
+ * A registered script of plugin `plugin` (digest `digest`) serving `Greeting` with `text`; `broken` throws instead,
+ * and its first `failing` runs throw too.
+ */
+function script(plugin: string, digest: string, text: string, failing = 0): RegisteredScript {
+	let fails = failing;
 	return {
 		plugin,
 		digest,
 		run: (require, module) => {
-			if (text === "broken") throw new Error("broken plugin");
+			if (text === "broken" || fails-- > 0) throw new Error("broken plugin");
 			const chord = require("@test/chord") as typeof chordNext;
 			const facet = chord.defineFacet((host) => host.serve(Greeting, () => ({ text: chord.constant(text) })));
 			Object.assign(module, { exports: { default: facet } });
@@ -39,12 +46,17 @@ function script(plugin: string, digest: string, text: string): RegisteredScript 
 	};
 }
 
-/** The set of `scripts` under base `base`. */
+/** The set of `scripts` under base `base`, each with a stylesheet named after its digest. */
 function setOf(base: string, scripts: readonly RegisteredScript[]): ScriptSet {
 	return {
 		base,
 		combined: "/combined.js",
-		plugins: scripts.map(({ plugin, digest }) => ({ name: plugin, digest, url: `/${plugin}.${digest}.js` })),
+		plugins: scripts.map(({ plugin, digest }) => ({
+			name: plugin,
+			digest,
+			url: `/${plugin}.${digest}.js`,
+			css: `/${plugin}.${digest}.css`,
+		})),
 	};
 }
 
@@ -58,7 +70,7 @@ type ManualTimer = { readonly ms: number; readonly fire: () => void };
 async function setup(
 	initial: readonly RegisteredScript[],
 	available: readonly RegisteredScript[] = [],
-	more: { readonly failing?: number; readonly manual?: ManualTimer[] } = {},
+	more: { readonly failing?: number; readonly manual?: ManualTimer[]; readonly styles?: ClientStyles } = {},
 ) {
 	let failing = more.failing ?? 0;
 	const server = createHost<TestPrincipal>({
@@ -102,6 +114,7 @@ async function setup(
 		},
 		serverBase: async () => serverBase,
 		outdated: () => outdated.push("outdated"),
+		...(more.styles === undefined ? {} : { styles: more.styles }),
 		environment: {
 			now: () => Date.now(),
 			after: (ms, callback) => {
@@ -180,6 +193,83 @@ describe("applying a new set in place", () => {
 	});
 });
 
+describe("the script each plugin runs (p3 step 0a)", () => {
+	it("tries a failed plugin's script again when a reconnect's snapshot has it, not taken as applied", async () => {
+		const a1 = script("@test/a", "d1", "hello");
+		const flaky = script("@test/a", "d2", "hello again", 1);
+		const { client, server, errors, fetched, sockets } = await setup([a1], [flaky]);
+		const greeting = await client.host.get(Greeting, {}, context);
+		await publishTo(server, "web", setOf("B1", [flaky]), context);
+		await until(() => errors.some(({ kind }) => kind === "plugins"));
+		expect(greeting.text.value).toBe("hello");
+		sockets[0]!.link.close();
+		await until(() => greeting.text.value === "hello again");
+		expect(fetched).toEqual(["/@test/a.d2.js", "/@test/a.d2.js"]);
+		await client.stop(context);
+		await server.close(context);
+	});
+});
+
+describe("stylesheets around an update (p3 step 0a)", () => {
+	/** A `ClientStyles` writing what it is asked into `calls`, its loads finishing when the test says. */
+	function recording() {
+		const calls: string[] = [];
+		let loaded = (): void => {};
+		const styles: ClientStyles = {
+			prepare: async (set) => {
+				calls.push(`prepare ${set.plugins.map(({ css }) => css).join(" ")}`);
+				await new Promise<void>((resolve) => {
+					loaded = resolve;
+				});
+			},
+			settle: (set, kept) => calls.push(`settle ${set.plugins.length} kept [${[...kept].join(" ")}]`),
+		};
+		return { calls, styles, load: () => loaded() };
+	}
+
+	it("loads the new stylesheets before the reload, then settles them with the plugins that kept their old code", async () => {
+		const a1 = script("@test/a", "d1", "hello");
+		const a2 = script("@test/a", "d2", "hello again");
+		const broken = script("@test/b", "e2", "broken");
+		const { calls, styles, load } = recording();
+		const { client, server } = await setup([a1, script("@test/b", "e1", "b")], [a2, broken], { styles });
+		const greeting = await client.host.get(Greeting, {}, context);
+		await publishTo(server, "web", setOf("B1", [a2, broken]), context);
+		await until(() => calls.length === 1);
+		// The new code waits for its stylesheets.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(greeting.text.value).toBe("hello");
+		load();
+		await until(() => calls.length === 2);
+		expect(calls).toEqual(["prepare /@test/a.d2.css /@test/b.e2.css", "settle 2 kept [@test/b]"]);
+		await client.stop(context);
+		await server.close(context);
+	});
+
+	it("ends the wait for stylesheets at the client's stop: the update stops there", async () => {
+		const a1 = script("@test/a", "d1", "hello");
+		const a2 = script("@test/a", "d2", "hello again");
+		const calls: string[] = [];
+		const styles: ClientStyles = {
+			prepare: (set, signal) =>
+				new Promise<void>((resolve) => {
+					calls.push(`prepare ${set.plugins.length}`);
+					signal.addEventListener("abort", () => resolve());
+				}),
+			settle: () => calls.push("settle"),
+		};
+		const { client, server } = await setup([a1], [a2], { styles });
+		const greeting = await client.host.get(Greeting, {}, context);
+		await publishTo(server, "web", setOf("B1", [a2]), context);
+		await until(() => calls.length === 1);
+		expect(greeting.text.value).toBe("hello");
+		await client.stop(context);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(calls).toEqual(["prepare 1"]);
+		await server.close(context);
+	});
+});
+
 describe("a failed update (audit F7)", () => {
 	it("tries a set whose script did not load again after 1 s, then 2 s, until it applies", async () => {
 		const a1 = script("@test/a", "d1", "hello");
@@ -220,6 +310,53 @@ describe("a failed update (audit F7)", () => {
 		expect(fetched).toEqual(["/@test/a.d2.js", "/@test/a.d3.js"]);
 		await client.stop(context);
 		await server.close(context);
+	});
+});
+
+describe("a surface still building", () => {
+	it.each(["B1", "B2"])("keeps the client across an unbuilt reconnect until base %s is published", async (base) => {
+		const a1 = script("@test/a", "d1", "hello");
+		const a2 = script("@test/a", "d2", "hello again");
+		const styles: string[] = [];
+		const { client, server, outdated, sockets, fetched } = await setup([a1], [a2], {
+			styles: {
+				prepare: async () => {
+					styles.push("prepare");
+				},
+				settle: () => {
+					styles.push("settle");
+				},
+			},
+		});
+		try {
+			const greeting = await client.host.get(Greeting, {}, context);
+			const scripts = await client.host.get(WebScripts, {}, context);
+			await publishTo(server, "web", { base: "", combined: "", plugins: [] }, context);
+			await until(() => scripts.set.value.base === "");
+			sockets[0]!.link.close();
+			await until(() => sockets.length === 2 && scripts.state.value.kind === "live");
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(outdated).toEqual([]);
+			expect(fetched).toEqual([]);
+			expect(styles).toEqual([]);
+			expect(greeting.text.value).toBe("hello");
+
+			await publishTo(server, "web", setOf(base, [a2]), context);
+			if (base === "B1") {
+				await until(() => greeting.text.value === "hello again");
+				expect(styles).toEqual(["prepare", "settle"]);
+				expect(outdated).toEqual([]);
+			} else {
+				await until(() => outdated.length === 1);
+				expect(greeting.text.value).toBe("hello");
+				expect(styles).toEqual([]);
+			}
+			scripts.release();
+			greeting.release();
+		} finally {
+			await client.stop(context);
+			await server.close(context);
+		}
 	});
 });
 

@@ -15,13 +15,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
-
-/// After the program exits, output still arriving is collected until this much silence, as for `exec`.
-const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 
 /// Input for a program's stdin, in arrival order.
 enum Input {
@@ -108,6 +104,7 @@ pub fn run(
     let pid = child.id();
     groups.lock().unwrap().insert(pid);
     let stop = Arc::new(AtomicBool::new(false));
+    let drain = Arc::new(AtomicBool::new(false));
     // A thread that cannot start (a task limit) fails the request; the started program is killed and reaped. Threads
     // already running see `stop` within 100 ms.
     let abandon = |mut child: Child, error: std::io::Error| {
@@ -133,6 +130,7 @@ pub fn run(
         sender.clone(),
         stop.clone(),
         Some(output.clone()),
+        Some(drain.clone()),
     ) {
         return Err(abandon(child, error));
     }
@@ -143,6 +141,7 @@ pub fn run(
         sender.clone(),
         stop.clone(),
         Some(output.clone()),
+        Some(drain.clone()),
     ) {
         return Err(abandon(child, error));
     }
@@ -189,10 +188,26 @@ pub fn run(
         json!({ "kind": "started", "pid": pid }),
     ));
 
+    let result = collect_output(id, receiver, output, control, groups, pid, &drain);
+    stop.store(true, Ordering::SeqCst);
+    processes.lock().unwrap().remove(&id);
+    groups.lock().unwrap().remove(&pid);
+    result
+}
+
+// Only readers can distinguish an idle pipe from delayed delivery or output backpressure.
+fn collect_output(
+    id: u32,
+    receiver: Receiver<Message>,
+    output: &Output,
+    control: &Control,
+    groups: &Groups,
+    pid: u32,
+    drain: &AtomicBool,
+) -> Result<Value, Failure> {
     let names = ["stdout", "stderr"];
     let mut ended = [false, false];
     let mut status: Option<Result<ExitStatus, String>> = None;
-    let mut idle_until: Option<Instant> = None;
     let mut aborted = false;
     let mut killed = false;
     let kill = |killed: &mut bool| {
@@ -212,18 +227,7 @@ pub fn run(
         if status.is_some() && ended[0] && ended[1] {
             break;
         }
-        let wait = match idle_until {
-            Some(idle) => {
-                let now = Instant::now();
-                if now >= idle {
-                    // A descendant may hold the pipes open after the program exited; stop waiting for it.
-                    break;
-                }
-                idle - now
-            }
-            None => Duration::from_secs(3600),
-        };
-        match receiver.recv_timeout(wait) {
+        match receiver.recv() {
             Ok(Message::Data(stream, bytes)) => {
                 output.bulk(
                     Frame::with_payload(
@@ -234,35 +238,26 @@ pub fn run(
                     ),
                     None,
                 );
-                if status.is_some() {
-                    idle_until = Some(Instant::now() + EXIT_STDIO_GRACE);
-                }
             }
             Ok(Message::Eof(stream)) => ended[stream] = true,
             Ok(Message::Exit(exit)) => {
                 // The waiter already ended the group; nothing is left to kill.
                 killed = true;
                 status = Some(Ok(exit));
-                idle_until = Some(Instant::now() + EXIT_STDIO_GRACE);
+                drain.store(true, Ordering::SeqCst);
             }
             Ok(Message::WaitFailed(error)) => {
                 status = Some(Err(error));
-                idle_until = Some(Instant::now());
+                drain.store(true, Ordering::SeqCst);
             }
             Ok(Message::Cancel) => {
                 aborted = true;
                 kill(&mut killed);
             }
             Ok(Message::Kill) => kill(&mut killed),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         }
     }
-    // Readers and the writer stop within 100 ms, also when a descendant still holds a pipe; removing the program
-    // drops its input channel, which ends a writer waiting for input.
-    stop.store(true, Ordering::SeqCst);
-    processes.lock().unwrap().remove(&id);
-    groups.lock().unwrap().remove(&pid);
     if aborted {
         return Err(Failure::new("aborted", "aborted"));
     }
@@ -273,5 +268,61 @@ pub fn run(
             "spawn_error",
             "process did not report its exit",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::read_frame;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn waits_for_delayed_reader_delivery_after_exit() {
+        for stream in [0, 1] {
+            let (sender, receiver) = mpsc::channel();
+            let (finished, completion) = mpsc::channel();
+            let output = Arc::new(Output::default());
+            let drain = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let output = output.clone();
+                let drain = drain.clone();
+                thread::spawn(move || {
+                    let result = collect_output(
+                        1,
+                        receiver,
+                        &output,
+                        &Control::default(),
+                        &Groups::default(),
+                        0,
+                        &drain,
+                    );
+                    finished.send(result).unwrap();
+                })
+            };
+            sender.send(Message::Exit(ExitStatus::default())).unwrap();
+            sender.send(Message::Eof(1 - stream)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !drain.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            // Hold the final chunk past the former 100 ms collector deadline, after exit was processed.
+            let early = completion.recv_timeout(Duration::from_millis(250));
+            let bytes = vec![120; 64 * 1024];
+            let delivered = sender.send(Message::Data(stream, bytes.clone()));
+            let eof = sender.send(Message::Eof(stream));
+            worker.join().unwrap();
+            assert!(drain.load(Ordering::SeqCst));
+            assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+            delivered.unwrap();
+            eof.unwrap();
+            assert_eq!(completion.recv().unwrap().unwrap()["exitCode"], 0);
+            output.close();
+            let mut wire = Vec::new();
+            output.run(&mut wire);
+            let frame = read_frame(&mut wire.as_slice()).unwrap().unwrap();
+            assert_eq!(frame.json["stream"], ["stdout", "stderr"][stream]);
+            assert_eq!(frame.payload, bytes);
+        }
     }
 }

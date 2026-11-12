@@ -15,7 +15,7 @@ import { ModelConfig, ModelResources } from "../../plugins/models/contract.ts";
 import { Resources } from "../../plugins/models/resources.ts";
 import { nativeFacet, poll, settled, testHost, until } from "./helpers.ts";
 
-const DEVICE = { kind: "owner", access: "local" } as const;
+const DEVICE = { kind: "owner", access: "local", session: "test-owner" } as const;
 const LAPTOP = { kind: "owner", access: "device", device: "laptop" } as const;
 
 test("a provider login belongs to the owner that started it", async (t) => {

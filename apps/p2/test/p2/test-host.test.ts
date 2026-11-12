@@ -29,7 +29,7 @@ import {
 	workerFacet,
 } from "./helpers.ts";
 
-const OWNER = { kind: "owner", access: "local" } as const;
+const OWNER = { kind: "owner", access: "local", session: "test-owner" } as const;
 const ALICE = {
 	kind: "guest",
 	id: "alice",

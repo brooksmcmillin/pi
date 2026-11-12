@@ -51,7 +51,7 @@ export async function topology(
 		ready?: Promise<void>;
 	},
 ) {
-	const owner = { kind: "owner", access: "local" } as const;
+	const owner = { kind: "owner", access: "local", session: "test-owner" } as const;
 	const worker = await testHost({
 		address: SessionHost({ id: "s" }),
 		kind: "worker",

@@ -2,8 +2,11 @@
 
 /** The person running this p2 (one today). */
 export type OwnerPrincipal =
-	/** A browser on this machine (loopback), with or without the loopback owner cookie. */
-	| { readonly kind: "owner"; readonly access: "local" }
+	/**
+	 * A local owner session on loopback: a client that proved to run as the server's user, or a browser that redeemed an
+	 * owner link on loopback. Its local-only powers (minting owner links, loopback provider sign-ins) rest on that proof.
+	 */
+	| { readonly kind: "owner"; readonly access: "local"; readonly session: string }
 	/** Through Radius, authenticated by the relay. */
 	| { readonly kind: "owner"; readonly access: "relay" }
 	/** An associated device's owner cookie, on any address (also on loopback). Revoked per device. */
@@ -33,10 +36,14 @@ export type HostPrincipal = { readonly kind: "host" };
 export type P2Principal = OwnerPrincipal | GuestPrincipal | WorkerPrincipal | ServerPrincipal | HostPrincipal;
 
 /**
- * What revokes principals (`host.revoke`, the same on every host): one associated device's owner, every remote owner
- * (relay and devices: "sign out all devices"), or one guest (all revisions of its grant).
+ * What revokes principals (`host.revoke`, the same on every host): one device or local session, every remote owner
+ * (relay and devices), every local session ("sign out all devices" revokes both), or one guest (all grant revisions).
  */
-export type Revocation = { readonly device: string } | { readonly owners: "remote" } | { readonly guest: string };
+export type Revocation =
+	| { readonly device: string }
+	| { readonly local: string }
+	| { readonly owners: "remote" | "local" }
+	| { readonly guest: string };
 
 /** The revocations that end `principal`'s objects and links. */
 export function revokedBy(principal: P2Principal): Revocation[] {
@@ -46,7 +53,7 @@ export function revokedBy(principal: P2Principal): Revocation[] {
 				? [{ device: principal.device }, { owners: "remote" }]
 				: principal.access === "relay"
 					? [{ owners: "remote" }]
-					: [];
+					: [{ local: principal.session }, { owners: "local" }];
 		case "guest":
 			return [{ guest: principal.id }];
 		default:
@@ -73,11 +80,15 @@ export const canView = (principal: P2Principal | undefined, session: string): bo
 export const canSend = (principal: P2Principal | undefined, session: string): boolean =>
 	isOwner(principal) || (isGuest(principal) && principal.sessions[session] === "full");
 
-/** Object key per principal: owner tabs of one access share objects, each worker generation and guest grant its own. */
+/** Object key per principal: owner tabs of one session share objects, each worker generation and guest grant its own. */
 export function principalKey(principal: P2Principal): string {
 	switch (principal.kind) {
 		case "owner":
-			return principal.access === "device" ? `owner:device:${principal.device}` : `owner:${principal.access}`;
+			return principal.access === "device"
+				? `owner:device:${principal.device}`
+				: principal.access === "local"
+					? `owner:local:${principal.session}`
+					: "owner:relay";
 		case "guest":
 			return `guest:${principal.id}:r${principal.revision}`;
 		case "worker":

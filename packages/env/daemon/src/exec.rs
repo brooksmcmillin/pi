@@ -298,16 +298,17 @@ pub fn running<T>(
 }
 
 /// Read one pipe on its own thread until it ends or `stop` is set. With `output`, reading waits while too much output
-/// is unsent.
+/// is unsent. Setting `drain` ends the reader after its next idle pipe wait, not during delivery or backpressure.
 pub fn spawn_reader(
     stream: usize,
     pipe: impl sys::Pipe + Send + 'static,
     sender: Sender<Message>,
     stop: Arc<AtomicBool>,
     output: Option<Arc<Output>>,
+    drain: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new().spawn(move || {
-        sys::read_pipe(pipe, &stop, |bytes| {
+        sys::read_pipe(pipe, &stop, drain.as_deref(), |bytes| {
             let delivered = sender.send(Message::Data(stream, bytes.to_vec())).is_ok();
             if let Some(output) = &output {
                 output.wait_for_room(&stop);
@@ -408,11 +409,11 @@ pub fn run(
         Failure::new("spawn_error", error.to_string())
     };
     let stdout = child.stdout.take().unwrap();
-    if let Err(error) = spawn_reader(0, stdout, sender.clone(), stop.clone(), gate.clone()) {
+    if let Err(error) = spawn_reader(0, stdout, sender.clone(), stop.clone(), gate.clone(), None) {
         return Err(abandon(child, error));
     }
     let stderr = child.stderr.take().unwrap();
-    if let Err(error) = spawn_reader(1, stderr, sender.clone(), stop.clone(), gate) {
+    if let Err(error) = spawn_reader(1, stderr, sender.clone(), stop.clone(), gate, None) {
         return Err(abandon(child, error));
     }
     if let Err((child, error)) = start_waiter(child, None, sender.clone()) {

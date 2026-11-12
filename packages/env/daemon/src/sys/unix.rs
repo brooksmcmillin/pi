@@ -154,8 +154,13 @@ pub trait Pipe: io::Read + std::os::fd::AsRawFd {}
 impl<T: io::Read + std::os::fd::AsRawFd> Pipe for T {}
 
 /// Read `pipe` until it ends, `on_data` returns false, or `stop` is set (looked at every 100 ms, also while no output
-/// arrives); the pipe closes when this returns.
-pub fn read_pipe(mut pipe: impl Pipe, stop: &AtomicBool, mut on_data: impl FnMut(&[u8]) -> bool) {
+/// arrives). Once `drain` is set, a 100 ms idle poll also ends the reader, after buffered bytes are read.
+pub fn read_pipe(
+    mut pipe: impl Pipe,
+    stop: &AtomicBool,
+    drain: Option<&AtomicBool>,
+    mut on_data: impl FnMut(&[u8]) -> bool,
+) {
     let fd = pipe.as_raw_fd();
     // SAFETY: fcntl on a descriptor this thread owns.
     unsafe {
@@ -171,9 +176,13 @@ pub fn read_pipe(mut pipe: impl Pipe, stop: &AtomicBool, mut on_data: impl FnMut
         };
         // SAFETY: one valid pollfd.
         let ready = unsafe { libc::poll(&mut poll, 1, 100) };
-        if ready == 0
-            || (ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted)
-        {
+        if ready == 0 {
+            if drain.is_some_and(|drain| drain.load(Ordering::SeqCst)) {
+                return;
+            }
+            continue;
+        }
+        if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
         }
         if ready < 0 {
@@ -428,6 +437,50 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn drain_reads_buffered_bytes_before_ending_an_idle_open_pipe() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::{Arc, mpsc};
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let (entered, ready) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let drain = Arc::new(AtomicBool::new(false));
+        let worker_drain = drain.clone();
+        let worker = std::thread::spawn(move || {
+            let mut result = Vec::new();
+            read_pipe(
+                reader,
+                &AtomicBool::new(false),
+                Some(&worker_drain),
+                |bytes| {
+                    let first = result.is_empty();
+                    result.extend_from_slice(bytes);
+                    if first {
+                        entered.send(()).unwrap();
+                        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    true
+                },
+            );
+            finished.send(result).unwrap();
+        });
+        writer.write_all(b"first").unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.write_all(b"last").unwrap();
+        drain.store(true, Ordering::SeqCst);
+        let early = completion.recv_timeout(Duration::from_millis(250));
+        release.send(()).unwrap();
+        let result = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(result, b"firstlast");
+        // `writer` is still open: the reader ended on actual pipe silence, not EOF.
+        drop(writer);
+    }
 
     #[test]
     fn ending_a_group_kills_what_the_program_left_running() {

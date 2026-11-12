@@ -9,7 +9,9 @@ import {
 	method,
 	param,
 	propertiesOf,
+	record,
 	remote,
+	SessionLockSchema,
 	serverHost,
 	sessionHost,
 	ThinkingLevelSchema,
@@ -315,18 +317,26 @@ export const Sessions = evolve(SessionsV5, (e) =>
 );
 
 const Location = obj({ id: str(), cwd: str({ minLength: 1 }), env: union([str(), nul()]) });
+const WorkerMove = obj({ ...propertiesOf(Location), generation: int({ minimum: 1 }) });
 
 /**
- * The sessions' lifecycle operations (server, host-internal; a host-lifetime object, so its job runs persist): each
- * method answers once its visible effect committed and runs the rest as a job (`operations`). `move` is the agent's
+ * The sessions' creation and lifecycle operations (server, host-internal; a host-lifetime object, so its job runs
+ * persist): each lifecycle method answers once its visible effect committed and runs the rest as a job (`operations`). `move` is the agent's
  * relocation (`SessionMoves`): it waits for the job and answers why a busy worker refused (nothing recorded).
+ * Version 2 requires the requesting worker generation for `move`; owner relocation is unchanged.
  */
 export const SessionOperations = local("p2.session-operations", {
-	version: 1,
+	version: 2,
 	params: {},
 	members: {
 		operations: arr(OperationSchema),
-		move: method(Location, obj({ refused: union([str(), nul()]) })),
+		/**
+		 * A new session's row (`Sessions.create` for the owner, the conversations tool's `create`): the location checked
+		 * (`~` expanded, a directory, `createDirectory` makes it), the default model unless one is given. A chosen ID
+		 * already in the catalog is a retry of the same request: its row is the answer.
+		 */
+		create: method(CreateArgsSchema, SessionSchema),
+		move: method(WorkerMove, obj({ refused: union([str(), nul()]) })),
 		relocate: method(Location),
 		clone: method(obj({ id: str(), copy: SessionIdSchema }), SessionSchema),
 		fork: method(
@@ -340,23 +350,15 @@ export const SessionOperations = local("p2.session-operations", {
 });
 
 /**
- * Moving a session to another location (server, host-internal): `Sessions.relocate` for the owner, and the locations
- * plugin's `location_move` once the main agent's turn has ended. Validates the destination (throws when it is not a
- * directory or its environment is not configured), then moves the catalog entry and the running worker in place.
- * `refused` is why a busy worker could not be fenced (nothing moved; try again once it is idle), else null.
+ * Agent-requested movement (server, host-internal), after the main agent's turn ends. Validates the destination,
+ * then moves the catalog and running worker in place. Version 2 carries worker generation: stale authority or an
+ * outward sandbox move throws at execution. `refused` reports a busy worker, else null. Owners use `Sessions.relocate`.
  */
 export const SessionMoves = local("p2.session-moves", {
-	version: 1,
+	version: 2,
 	params: {},
 	members: {
-		relocate: method(
-			obj({
-				id: str(),
-				cwd: str({ minLength: 1 }),
-				env: union([str(), nul()]),
-			}),
-			obj({ refused: union([str(), nul()]) }),
-		),
+		relocate: method(WorkerMove, obj({ refused: union([str(), nul()]) })),
 	},
 });
 
@@ -387,5 +389,44 @@ export const SessionTransfer = remote("p2.session-transfer", {
 				copyFiles: method(obj({ to: str() })),
 			},
 		},
+	},
+});
+
+/** The worker's single session-lock mirror; admissions wait for initialization and already-observed updates. */
+export const SessionLockMirror = local("p2.session-lock-mirror", {
+	version: 2,
+	params: {},
+	members: {
+		/** Waits for the initial lock and queued mirror commits; failed synchronization refuses admission. */
+		sync: method(),
+	},
+});
+
+const LockOrNone = union([SessionLockSchema, nul()]);
+
+/** Every session's lock (server, host-internal, persisted): set by the owner, followed by MCP placement and workers. */
+export const SessionLocks = local("p2.session-locks", {
+	version: 1,
+	params: {},
+	members: {
+		locks: record(SessionLockSchema),
+		set: method(obj({ session: str(), lock: LockOrNone })),
+	},
+});
+
+/**
+ * A session's lock as the owner and the session's worker see it: the owner reads and sets every session's; a worker
+ * reads its own session's (its principal names it).
+ */
+export const SessionLock = remote("p2.session-lock", {
+	version: 1,
+	params: {},
+	hostAddress: serverHost,
+	variants: {
+		owner: {
+			state: { locks: record(SessionLockSchema) },
+			methods: { set: method(obj({ session: str(), lock: LockOrNone })) },
+		},
+		worker: { state: { lock: LockOrNone } },
 	},
 });
