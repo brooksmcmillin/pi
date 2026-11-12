@@ -36,6 +36,12 @@ own location still works on that machine. Open chats stay connected. Subagents s
 where they are, on their machine, and keep running their tools there. Terminals already running stay on the machine
 they were started on; new ones open where the viewed conversation works.
 
+Discord linking is stricter than ordinary Relocate: it refuses existing own or inherited agent locations outside the
+selected sandbox instead of moving or deleting those agents. This includes archived and nested agents, even when the
+session itself is already in that sandbox. Agent-requested session moves recheck their worker generation and current
+sandbox restriction when executed, so an outward move queued before linking cannot escape afterward. Explicit owner
+Relocate retains its ordinary behavior.
+
 ## Sandboxes
 
 A sandbox is a Gondolin VM (earendil-works/gondolin: QEMU with KVM, host-side network policy) on an SSH environment,
@@ -89,6 +95,16 @@ starts, stops and deletes sandboxes, in the Envs sheet; plugins pick an existing
   p2 installation's machine and data directory), copies the daemon into the VM and passes its stdin and stdout through.
   Tools, the workspace, terminals, uploads and `send_file` then work as on any remote environment. Hosts must be
   Linux. Connections to a sandbox are keyed by its configuration and its host's: editing either opens new ones.
+- **Secrets:** per sandbox, in `<data>/sandbox-secrets.json` (0600, `plugins/envs/secrets.ts`; Envs sheet → the
+  sandbox → Secrets, presets for GitHub, Radius, npm and any header). Each has a name (the VM's environment variable),
+  the hosts it is sent to (which must be allowed hosts) and a value. The VM sees only Gondolin placeholders; its HTTP
+  proxy replaces them with the value in requests to those hosts. Presets add aliases (`GH_TOKEN` for GitHub) and a git
+  credential helper (`GIT_CONFIG_*`, nothing written in the VM). Values reach the launcher only on `start`'s stdin and
+  the supervisor in its environment, never a command line; the configuration names each secret with a version, so a
+  change makes the running VM out of date (**Save and restart**). `daemon` refuses to start a supervisor for a
+  configuration with secrets: `start` runs first. Values are redacted from logs. Verified in a real VM
+  (`P2_TEST_GONDOLIN=1`, `test/p2/sandboxes.test.ts`): processes pi-env starts see the placeholder, alias and helper
+  variables, never the value; requests to the secret's host carry the value.
 - **Confinement:** a conversation whose environment is a sandbox cannot leave it. `location_envs` shows only the
   sandbox; `location_dirs` and `location_move` take paths inside it; `subagent` spawn/configure place subagents only
   in it; one-shot agents (`tools.agent`) inherit their caller's location (the `p2.inherited-location` document), so a

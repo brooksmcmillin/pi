@@ -46,6 +46,38 @@ function setup() {
 }
 
 describe("managed search tool lifetimes", () => {
+	// Regression for #11807: search-root globs must retain managed process settlement.
+	it("grep runs inside the search root while retaining ownership until close", async () => {
+		const { dir, child, spawned } = setup();
+		const searchRoot = join(dir, "repo");
+		mkdirSync(searchRoot);
+		const owner = new OwnerActivity();
+		const result = owner.submit(
+			owner.snapshot,
+			() => true,
+			true,
+			async () => {
+				await createGrepTool(dir).execute("grep", {
+					pattern: "needle",
+					path: "repo",
+					glob: "src/*.ts",
+				});
+			},
+		);
+		if (result.status !== "running") throw new Error(result.reason);
+		await spawned;
+		expect(childProcesses.spawn).toHaveBeenCalledWith(
+			expect.any(String),
+			expect.arrayContaining(["--glob", "src/*.ts", "--", "needle", "."]),
+			{ cwd: searchRoot, stdio: ["ignore", "pipe", "pipe"] },
+		);
+		child.emit("exit", 1, null);
+		expect(owner.busy).toBe(true);
+		child.emit("close", 1, null);
+		await result.completion;
+		expect(await result.settlement).toBe("settled");
+	});
+
 	it("find cancellation may return early but cannot release the owner before process acknowledgement", async () => {
 		const { dir, child, spawned } = setup();
 		const tool = createFindTool(dir);

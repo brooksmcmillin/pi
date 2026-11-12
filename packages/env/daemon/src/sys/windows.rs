@@ -296,6 +296,7 @@ impl Overlapped {
     fn run(
         &self,
         stop: &AtomicBool,
+        drain: Option<&AtomicBool>,
         start: impl FnOnce(*mut OVERLAPPED) -> BOOL,
     ) -> io::Result<Option<u32>> {
         // SAFETY: a zeroed OVERLAPPED is valid; only its event is set.
@@ -313,15 +314,19 @@ impl Overlapped {
             if waited == WAIT_OBJECT_0 {
                 return self.result(&overlapped, FALSE).map(Some);
             }
-            if waited == WAIT_TIMEOUT && !stop.load(Ordering::SeqCst) {
+            if waited == WAIT_TIMEOUT
+                && !stop.load(Ordering::SeqCst)
+                && !drain.is_some_and(|drain| drain.load(Ordering::SeqCst))
+            {
                 continue;
             }
             let failure = (waited != WAIT_TIMEOUT).then(io::Error::last_os_error);
             // SAFETY: cancels only this operation, then waits for it to finish before `overlapped` and the caller's
             // buffer go away.
             unsafe { CancelIoEx(self.handle, &overlapped) };
-            let _ = self.result(&overlapped, TRUE);
-            return failure.map_or(Ok(None), Err);
+            let completed = self.result(&overlapped, TRUE);
+            // A read may complete between the idle timeout and cancellation; preserve its bytes.
+            return failure.map_or_else(|| Ok(completed.ok()), Err);
         }
     }
 
@@ -337,14 +342,19 @@ impl Overlapped {
 }
 
 /// Read `pipe` until it ends, `on_data` returns false, or `stop` is set (looked at every 100 ms, also while no output
-/// arrives); the pipe closes when this returns.
-pub fn read_pipe(pipe: impl Pipe, stop: &AtomicBool, mut on_data: impl FnMut(&[u8]) -> bool) {
+/// arrives). Once `drain` is set, a 100 ms idle read also ends the reader, after buffered bytes are read.
+pub fn read_pipe(
+    pipe: impl Pipe,
+    stop: &AtomicBool,
+    drain: Option<&AtomicBool>,
+    mut on_data: impl FnMut(&[u8]) -> bool,
+) {
     let Ok(io) = Overlapped::new(&pipe) else {
         return;
     };
     let mut buffer = vec![0u8; 64 * 1024];
     while !stop.load(Ordering::SeqCst) {
-        let read = io.run(stop, |overlapped| {
+        let read = io.run(stop, drain, |overlapped| {
             // SAFETY: the buffer outlives the operation, which `run` completes or cancels before returning.
             unsafe {
                 ReadFile(
@@ -379,7 +389,7 @@ pub fn write_pipe(pipe: &mut impl WritePipe, mut bytes: &[u8], stop: &AtomicBool
             return false;
         }
         let length = bytes.len().min(u32::MAX as usize) as u32;
-        let written = io.run(stop, |overlapped| {
+        let written = io.run(stop, None, |overlapped| {
             // SAFETY: `bytes` outlives the operation, which `run` completes or cancels before returning.
             unsafe {
                 WriteFile(

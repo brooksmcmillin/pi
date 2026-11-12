@@ -18,13 +18,13 @@ export async function resolveSearchTool(tool: "rg" | "fd", customOperations: boo
 }
 
 /** Supervise one audited leaf search process. This is not a general shell or process-tree backend. */
-export function spawnSearchProcess(command: string, args: string[], signal?: AbortSignal) {
+export function spawnSearchProcess(command: string, args: string[], signal?: AbortSignal, cwd?: string) {
 	const owner = OwnerActivity.current;
 	owner?.assertCurrent();
 	if (owner?.maintenance) throw new Error("Cache maintenance cannot start subprocesses");
 	signal?.throwIfAborted();
 	owner?.dispatch();
-	const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+	const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
 	const { promise: settlement, resolve } = Promise.withResolvers<Settlement>();
 	let terminal = false;
 	let exited = false;

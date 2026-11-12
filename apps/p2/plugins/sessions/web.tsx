@@ -1,7 +1,7 @@
 // The mobile drawer's component tree, with catalog/status/subagent/search handles supplying its data, and the owner's
 // session actions on its rows.
 
-import { Access, BACKGROUND_CONTEXT, contribute, defineFacet, type HeldIn, liveIn, whenLive } from "@p2/app/v1";
+import { Access, BACKGROUND_CONTEXT, contribute, defineFacet, type HeldIn, keptIn, liveIn, whenLive } from "@p2/app/v1";
 import {
 	ChevronIcon,
 	closeLayers,
@@ -13,6 +13,7 @@ import {
 	rememberMains,
 	type SessionSummary,
 	Slot,
+	SlotList,
 	Slots,
 	toggleSidebar,
 	useComposerState,
@@ -36,6 +37,7 @@ import { Subagents } from "../subagents/contract.ts";
 import { SessionTree } from "../tree/contract.ts";
 import { BranchSheet } from "./BranchSheet.tsx";
 import { type Operation, type Session, Sessions } from "./contract.ts";
+import { type DrawerRows, DrawerRowsContext } from "./contract.web.tsx";
 import { SessionSheet } from "./SessionSheet.tsx";
 
 const subscribeVisibility = (listener: () => void) => {
@@ -90,6 +92,7 @@ function FooterMenu() {
 				<Slot name="sidebar-foot:envs" />
 				<Slot name="sidebar-foot:devices" />
 				<Slot name="sidebar-foot:ports" />
+				<Slot name="sidebar-foot:discord" />
 				<Slot name="sidebar-foot:voice" />
 				<Slot name="sidebar-foot:logs" />
 			</div>
@@ -98,6 +101,8 @@ function FooterMenu() {
 }
 
 const footer = <FooterMenu />;
+/** Entries above the folders, e.g. the Familiar's. */
+const head = <SlotList prefix="drawer-head" />;
 
 /** What a row says about a lifecycle operation (`Sessions.operations`), by kind: running, and failed. */
 const OPERATION_LABELS: Record<Operation["kind"], { running: string; failed: string }> = {
@@ -135,7 +140,8 @@ const applyRow = (rows: Session[] | undefined, { id, change }: RowGuess): Sessio
 /**
  * The drawer, and the owner's session actions on its rows: rename, pin, archive and restore (the Session sheet is
  * rendered here, opened from the top bar's button), switching and renaming `/tree` branches. Each action shows its
- * effect on the rows at once (`useOptimisticCall`); a refused one rolls back and the toast says why.
+ * effect on the rows at once (`useOptimisticCall`); a refused one rolls back and the toast says why. Reads use
+ * `keptIn`: while the connection is down the rows stay as last seen; actions need the live catalog.
  */
 function Sidebar() {
 	const connected = useConnected();
@@ -144,13 +150,13 @@ function Sidebar() {
 	const service = useObject(Sessions, {});
 	const catalog = liveIn(service, "owner");
 	const access = useObject(Access, {});
-	const guest = useReadable(liveIn(access, "guest")?.grant);
+	const guest = useReadable(keptIn(access, "guest")?.grant);
 	// As the server last said (kept across starts): unread marks and search hold without waiting for Access.
 	const owner = useOwner();
-	const status = liveIn(useObject(SessionStatus, {}), "reader");
-	const agents = liveIn(useObject(Subagents, {}), "reader");
+	const status = keptIn(useObject(SessionStatus, {}), "reader");
+	const agents = keptIn(useObject(Subagents, {}), "reader");
 	const { fail } = useComposerState();
-	const [list, edit] = useOptimisticCall(useReadable(liveIn(service, "owner", "guest")?.sessions), applyRow, fail);
+	const [list, edit] = useOptimisticCall(useReadable(keptIn(service, "owner", "guest")?.sessions), applyRow, fail);
 	const statuses = useReadable(status?.statuses);
 	const children = useReadable(agents?.children);
 	useEffect(() => {
@@ -162,7 +168,7 @@ function Sidebar() {
 	const reads = useReadable(marks?.reads);
 	// Dismissing a failed operation removes its line at once.
 	const [operations, dismissing] = useOptimisticCall(
-		useReadable(catalog?.operations) ?? [],
+		useReadable(keptIn(service, "owner")?.operations) ?? [],
 		(list, operation: string) => list.filter((each) => each.id !== operation),
 		fail,
 	);
@@ -190,6 +196,17 @@ function Sidebar() {
 			}),
 		[list, statuses, children, answers, reads, operations, dismiss],
 	);
+	// Sessions a `drawer-head` entry shows are left out of the folders.
+	const [apart, setApart] = useState<Readonly<Record<string, readonly string[]>>>({});
+	const listApart = useCallback(
+		(key: string, ids: readonly string[]) => setApart((current) => ({ ...current, [key]: ids })),
+		[],
+	);
+	const rows = useMemo<DrawerRows>(() => ({ sessions, listApart }), [sessions, listApart]);
+	const folders = useMemo(() => {
+		const hidden = new Set(Object.values(apart).flat());
+		return hidden.size ? sessions.filter((session) => !hidden.has(session.id)) : sessions;
+	}, [sessions, apart]);
 	// The open session's main conversation, shown on a visible page, is read through its latest answer.
 	const visible = usePageVisible();
 	const viewed = list?.find((session) => session.id === route.session);
@@ -296,9 +313,9 @@ function Sidebar() {
 		[setLocation, onNew],
 	);
 	return (
-		<>
+		<DrawerRowsContext.Provider value={rows}>
 			<Drawer
-				sessions={sessions}
+				sessions={folders}
 				guest={guest}
 				sandboxes={sandboxes}
 				activeId={route.session}
@@ -312,6 +329,7 @@ function Sidebar() {
 				onCollapse={toggleSidebar}
 				onSearch={search ? onSearch : undefined}
 				onRestore={onRestore}
+				head={head}
 				footer={footer}
 				onProviders={() => openLayer({ kind: "sheet", name: "providers" }, { fromDrawer: true })}
 				onEnvs={() => openLayer({ kind: "sheet", name: "envs" }, { fromDrawer: true })}
@@ -356,7 +374,7 @@ function Sidebar() {
 					}}
 				/>
 			)}
-		</>
+		</DrawerRowsContext.Provider>
 	);
 }
 

@@ -105,6 +105,7 @@ import {
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
+import { compareProviders } from "../../core/preferred-providers.ts";
 import { findMatchingProviders } from "../../core/provider-matching.ts";
 import { RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import { planRadiusMcpServer } from "../../core/radius-mcp.ts";
@@ -411,7 +412,7 @@ function getLoginProviderCompletionOptions(
 			subscription: provider.subscription,
 		});
 	}
-	return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
+	return Array.from(byId.values()).sort(compareProviders);
 }
 
 function getLoginProviderSearchText(provider: LoginProviderCompletionOption): string {
@@ -6030,7 +6031,8 @@ export class InteractiveMode {
 				});
 			}
 		}
-		return options.sort((a, b) => a.name.localeCompare(b.name));
+		// The sort is stable, so a provider's account option stays above its API key option.
+		return options.sort(compareProviders);
 	}
 
 	private async getLogoutProviderOptions(): Promise<AuthSelectorProvider[]> {
@@ -6045,7 +6047,7 @@ export class InteractiveMode {
 					subscription: provider?.auth.oauth?.isSubscription === true,
 				};
 			})
-			.sort((a, b) => a.name.localeCompare(b.name));
+			.sort(compareProviders);
 	}
 
 	private async handleLoginCommand(providerRef?: string): Promise<void> {
@@ -6198,8 +6200,9 @@ export class InteractiveMode {
 					}
 				},
 				initialSearchInput,
+				this.ui,
 			);
-			return { component: selector, focus: selector };
+			return { component: selector, focus: selector, dispose: () => selector.dispose() };
 		});
 	}
 
@@ -6258,8 +6261,10 @@ export class InteractiveMode {
 					done();
 					this.ui.requestRender();
 				},
+				undefined,
+				this.ui,
 			);
-			return { component: selector, focus: selector };
+			return { component: selector, focus: selector, dispose: () => selector.dispose() };
 		});
 	}
 

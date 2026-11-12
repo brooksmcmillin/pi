@@ -15,6 +15,7 @@ export {
 } from "./Detail.tsx";
 export {
 	type Described,
+	type Detail,
 	detailsOf,
 	failureOf,
 	fileName,
@@ -22,7 +23,9 @@ export {
 	type Kind,
 	type Label,
 	lastLine,
+	parsedArgs,
 	plainText,
+	type ResultPlacement,
 	type Step,
 	type StepStatus,
 	sentence,

@@ -106,7 +106,11 @@ for (const access of ["local", "relay", "device"] as const)
 				await rm(directory, { recursive: true, force: true });
 			});
 			const owner = fixture.client(
-				access === "device" ? { kind: "owner", access, device: "laptop" } : { kind: "owner", access },
+				access === "device"
+					? { kind: "owner", access, device: "laptop" }
+					: access === "local"
+						? { kind: "owner", access, session: "test-owner" }
+						: { kind: "owner", access },
 			);
 			const login = owner.hold(ProviderLogin, {}, BACKGROUND_CONTEXT);
 			await whenLive(login);

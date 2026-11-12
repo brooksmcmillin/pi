@@ -52,8 +52,8 @@ export const Server = local("p2.server", {
 	params: {},
 	members: {
 		info: ServerInfoSchema,
-		/** Ends remote owners' live links and objects (one device, or every remote owner). */
-		revokeOwners: method(obj({ device: opt(str()) })),
+		/** Ends owners' live links and objects: one device's, one local session's, or every owner's. */
+		revokeOwners: method(obj({ device: opt(str()), local: opt(str()) })),
 		revokeGuests: method(obj({ id: str() })),
 	},
 });
@@ -70,6 +70,9 @@ export type RelocationSteps = {
 	readonly move: () => Promise<void>;
 	readonly cancel: () => Promise<void>;
 };
+
+/** A refusal, or the generation whose idle fence and caller-owned checks succeeded. */
+export type PausePreparation = { kind: "refused"; reason: string } | { kind: "prepared"; generation: number };
 
 /** The session workers (the server's `SessionWorkers`): their generations, and the lifecycle steps plugins run. */
 export interface SessionWorkerControl {
@@ -88,6 +91,13 @@ export interface SessionWorkerControl {
 		prepare: () => Promise<string | undefined>,
 		work: () => Promise<void>,
 		doing: string,
+	): Promise<void>;
+	/** Checks even cold workers, then excludes starts through `work`; preparation must lift its fence on refusal. */
+	pauseChecked(
+		session: string,
+		prepare: () => Promise<PausePreparation>,
+		work: () => Promise<void>,
+		context: Context,
 	): Promise<void>;
 	/**
 	 * Owner-requested retry: stops the previous instance, clears the failure and starts the worker again, resolving with
@@ -126,7 +136,7 @@ export type ServerParts = {
 	 */
 	readonly root: <T>(fn: (ctx: Ctx) => Promise<T>, context: Context) => Promise<T>;
 };
-export const ServerNatives = defineRegistry<ServerParts, ServerParts | undefined>("p2.server-natives", { version: 1 });
+export const ServerNatives = defineRegistry<ServerParts, ServerParts | undefined>("p2.server-natives", { version: 2 });
 
 /** The server's natives for a factory (the core contributes them before anything activates). */
 export function serverOf(self: Self): () => ServerParts {
@@ -177,6 +187,13 @@ export type RouteHandler = (
 ) => void | Promise<void>;
 export const Routes = keyedRegistry<RouteHandler>("p2.routes");
 
+/**
+ * `Set-Cookie` values for an owner's app page load (`/`, `/s/…`), or undefined. Example: the devices plugin renews a
+ * local owner session, so a browser in use stays signed in.
+ */
+export type PageCookie = (request: IncomingMessage, access: RequestAccess) => string | undefined;
+export const PageCookies = keyedRegistry<PageCookie>("p2.page-cookies");
+
 /** Authorized WebSocket upgrades by exact path. Plugins own their byte channels, not the server host. */
 export type UpgradeHandler = (
 	request: IncomingMessage,
@@ -204,7 +221,7 @@ export function findRoute(
 }
 
 /**
- * Authenticates requests from tunnel hosts (loopback is the device owner): the first principal returned wins.
+ * Authenticates requests (loopback and tunnel hosts): an owner returned wins, else the first principal returned.
  * Example: the sharing plugin maps a guest cookie to its current grant.
  */
 export type Authenticator = (
@@ -275,6 +292,7 @@ export function serveServerRegistries(facet: FacetHost): void {
 	for (const registry of [
 		RequestResolvers,
 		Routes,
+		PageCookies,
 		Upgrades,
 		Authenticators,
 		ShareUrls,
@@ -295,9 +313,13 @@ export function serverCore(host: Host, info: ServerInfo, parts: ServerParts): Fa
 		self.contribute(ServerNatives, parts);
 		facet.serve(Server, () => ({
 			info: constant(info),
-			revokeOwners: async ({ device }, ctx) => {
+			revokeOwners: async ({ device, local }, ctx) => {
 				if (device !== undefined) host.revoke({ device }, ctx);
-				else host.revoke({ owners: "remote" }, ctx);
+				else if (local !== undefined) host.revoke({ local }, ctx);
+				else {
+					host.revoke({ owners: "remote" }, ctx);
+					host.revoke({ owners: "local" }, ctx);
+				}
 				return null;
 			},
 			revokeGuests: async ({ id }, ctx) => {
