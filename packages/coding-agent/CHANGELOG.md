@@ -6,6 +6,10 @@
 
 - Added default-disabled `session.guardedOwner` / `ctx.guardedOwner` capabilities for host-attested cooperative submission, with session/generation binding, prompt-scoped cancellation and independent settlement acknowledgements.
 
+### Changed
+
+- Harness documentation guidance now permits targeted API/topic and example reads, retains relevant safety and cross-reference requirements, and reuses unchanged documentation coverage instead of requiring full manuals by default. See the [local selection comparison](docs/doc-loading-benchmark.md).
+
 ## [1.5.1] - 2026-11-09
 
 ### New Features

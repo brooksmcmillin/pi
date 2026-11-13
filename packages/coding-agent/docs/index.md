@@ -27,6 +27,7 @@ Use the [Quickstart customization chooser](quickstart.md#choose-how-to-customize
 - Use [JSON event stream mode](json.md) to consume structured events from one run.
 - Use [RPC mode](rpc.md) to control a separate Pi process.
 - Use the [TypeScript SDK](sdk.md) to run Pi inside an application.
+- See the [documentation-selection comparison](doc-loading-benchmark.md) for a bounded example of targeted API and safety reading.
 
 ## Find reference and setup information
 

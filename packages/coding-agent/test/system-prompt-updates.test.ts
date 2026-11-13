@@ -46,6 +46,9 @@ describe("system prompt updates", () => {
 			if (head?.role !== "system") throw new Error("expected system message");
 			expect(head.content).toBe("");
 			expect(Object.keys(head.sections ?? {})).toEqual(["preamble", "tools", "rules", "docs", "cwd"]);
+			expect(head.sections?.docs).toBe(buildSystemPromptSections({ cwd: "/tmp" }).docs);
+			expect(head.sections?.docs).toContain("a full-manual read is not the default");
+			expect(head.sections?.docs).not.toContain("read the relevant docs and examples in full");
 			expect(head.toolsAdded?.map((tool) => tool.name)).toEqual(["read", "bash", "edit", "write"]);
 			expect(getSystemMessageText(head)).toBe(harness.session.systemPrompt);
 		} finally {
