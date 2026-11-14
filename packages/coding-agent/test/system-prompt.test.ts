@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { Skill } from "../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
-import { buildSystemPrompt } from "../src/core/system-prompt.ts";
+import { buildSystemPrompt, buildSystemPromptSections, buildSystemPromptState } from "../src/core/system-prompt.ts";
 
 const testSkill: Skill = {
 	name: "test-skill",
@@ -121,9 +121,28 @@ describe("buildSystemPrompt", () => {
 				"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
 			);
 			expect(prompt).toContain("environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md)");
+		});
+	});
+
+	describe("documentation loading", () => {
+		test.each([
+			["rendered prompt", () => buildSystemPrompt({ cwd: "/tmp" })],
+			["structured sections", () => buildSystemPromptSections({ cwd: "/tmp" }).docs],
+			["transcript state", () => buildSystemPromptState({ cwd: "/tmp" }).sections?.docs],
+		] as const)("permits targeted reads with safety and expansion guidance in %s", (_name, build) => {
+			const prompt = build();
+			expect(prompt).toContain("read the relevant API/topic sections and matching examples");
+			expect(prompt).toContain("including applicable safety constraints and required cross-references");
+			expect(prompt).toContain("a full-manual read is not the default");
 			expect(prompt).toContain(
-				"Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.",
+				"Reuse already-read sections when their content and documentation version are unchanged",
 			);
+			expect(prompt).toContain("refresh affected sections when either changes or prior coverage is unavailable");
+			expect(prompt).toContain(
+				"Expand to surrounding sections or the whole document when required cross-references, missing contracts, uncertainty, or broad changes demand it",
+			);
+			expect(prompt).toContain("Do not skip relevant API contracts, lifecycle constraints, or safety guidance");
+			expect(prompt).not.toContain("read the relevant docs and examples in full");
 		});
 	});
 

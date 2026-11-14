@@ -503,6 +503,10 @@ describe("AgentSession compaction characterization", () => {
 				tools: [largeTool],
 				extensionFactories: [
 					(pi) => {
+						// Keep the threshold fixture independent of default documentation prompt size.
+						pi.on("before_agent_start", (event) => {
+							event.systemPromptOptions.customPrompt = "Test compaction.";
+						});
 						pi.on("session_before_compact", (event) => {
 							order.push("compaction");
 							observedSettings.push(event.preparation.settings);

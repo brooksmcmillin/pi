@@ -165,7 +165,9 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 - Examples: ${getExamplesPath()} (extensions, custom tools, SDK)
 - When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory
 - When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)
-- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.`;
+- Before implementing harness changes, use the topic map above to read the relevant API/topic sections and matching examples, including applicable safety constraints and required cross-references; a full-manual read is not the default.
+- Reuse already-read sections when their content and documentation version are unchanged; refresh affected sections when either changes or prior coverage is unavailable.
+- Expand to surrounding sections or the whole document when required cross-references, missing contracts, uncertainty, or broad changes demand it. Do not skip relevant API contracts, lifecycle constraints, or safety guidance.`;
 	}
 
 	if (appendSystemPrompt) promptSections.addendum = appendSystemPrompt;
