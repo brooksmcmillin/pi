@@ -194,6 +194,8 @@ export function watchLocalPreferences(
 		}, 100);
 	};
 	arm();
+	// Reconcile writes around registration even if the native watcher misses the first event.
+	schedule();
 	return () => {
 		closed = true;
 		clearTimeout(timer);

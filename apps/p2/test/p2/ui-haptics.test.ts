@@ -61,6 +61,8 @@ describe("haptics", { skip: !browserTests }, () => {
 		await until(chat.view, (view) => !live(view)?.run && JSON.stringify(view).includes("Echo: codemode"), 30_000);
 		chat.release();
 		await browser.wait("document.querySelector('[data-testid=activity][data-state=done]')");
+		// Run completion precedes the drum's animation and its detent effects.
+		await browser.wait("window.__haptics.filter((call) => call === 'selectionChanged').length >= 2");
 		// The send's tap, then the selection generator prepared once and a tick per step rolling in.
 		const rolled = await browser.evaluate<string[]>("window.__haptics");
 		assert.equal(rolled[0], "impact:LIGHT");

@@ -755,7 +755,7 @@ test("A brain whose data directory cannot hold its name still gets the device's"
 test("Radius status lines as Pi Mobile logs them, retries with their error", () => {
 	assert.equal(
 		radiusStatusText({ status: "connected", serverId: "brain-1", organizationId: "org", name: "Studio" }),
-		'connected as brain "Studio" (brain-1)',
+		"connected as brain Studio",
 	);
 	assert.equal(
 		radiusStatusText({ status: "connected", serverId: "brain-1", organizationId: "org" }),

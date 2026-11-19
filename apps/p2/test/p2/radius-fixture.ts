@@ -1,6 +1,7 @@
 // A local stand-in for Radius and a p2 server connected to it as a brain, for the Radius tests. Never contacts Radius.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
@@ -12,6 +13,8 @@ import { type WebSocket, WebSocketServer } from "ws";
 import { ForwardsNative } from "../../plugins/ports/contract.ts";
 import { writeRadiusConfig } from "../../plugins/radius/brain.ts";
 import { RadiusConnections } from "../../plugins/radius/contract.ts";
+import { connectRunningTerminalHost } from "../../plugins/terminals/detached.ts";
+import { encodeFrame } from "../../plugins/terminals/protocol.ts";
 import { startServer } from "../../src/hosts/server.ts";
 import { defineFacet } from "../../src/runtime/chord.ts";
 import { isOwner } from "../../src/runtime/principals.ts";
@@ -179,7 +182,16 @@ export async function radiusFixture(
 ) {
 	const directory = await mkdtemp(join(tmpdir(), "p2-radius-"));
 	const radius = await fakeRadius(relay);
+	let server: Awaited<ReturnType<typeof startServer>> | undefined;
 	t.after(async () => {
+		await server?.close();
+		const terminal = await connectRunningTerminalHost(directory);
+		if (terminal) {
+			const closed = once(terminal, "close");
+			terminal.resume();
+			terminal.write(encodeFrame({ type: "shutdown" }));
+			await closed;
+		}
 		await radius.close();
 		await rm(directory, { recursive: true, force: true });
 	});
@@ -217,14 +229,13 @@ export async function radiusFixture(
 			},
 		}),
 	);
-	const server = await startServer({
+	server = await startServer({
 		dataDir: directory,
 		port: 0,
 		fake: true,
 		web: false,
 		facets: [{ name: "radius-probe", facet: probe }],
 	});
-	t.after(() => server.close());
 	await radius.hostReady;
 	// The natives the radius and ports plugins contribute once open (their objects live from the load).
 	const natives = await Promise.all([

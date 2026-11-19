@@ -380,8 +380,7 @@ describe("Pi Mobile audit fixes in the browser", { skip: !browserTests }, () => 
 			// The reader scrolls up once there is something to scroll (the dock's padding has settled): the chat stops
 			// following.
 			await browser.wait(`(e => e.scrollHeight > e.clientHeight + 100)(document.querySelector('.scroller'))`);
-			await browser.evaluate(toTop);
-			await browser.wait(`document.querySelector('.to-bottom')`);
+			await browser.wait(`${toTop} && document.querySelector('.to-bottom')`);
 			await browser.click('button[aria-label="Workspace files and changes"]');
 			await browser.wait(
 				`[...document.querySelectorAll('.workspace-name')].some((e) => e.textContent === 'hello.ts')`,
@@ -429,8 +428,8 @@ describe("Pi Mobile audit fixes in the browser", { skip: !browserTests }, () => 
 			await browser.metrics(1280, 900);
 			await browser.open(url(`/s/${session.id}`));
 			await browser.wait(`${messages}.includes('Echo: slow long answer') && !document.querySelector('.offline')`);
-			await browser.evaluate(toTop);
-			await browser.wait(`document.querySelector('.to-bottom')`);
+			await browser.wait(`(e => e.scrollHeight > e.clientHeight + 100)(document.querySelector('.scroller'))`);
+			await browser.wait(`${toTop} && document.querySelector('.to-bottom')`);
 			await browser.evaluate(input(".composer textarea", "Next question"));
 			const rows = await browser.evaluate<number>(`Number(document.querySelector('.rows').dataset.rows)`);
 			await browser.click("button[aria-label=Send]");

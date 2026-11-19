@@ -2,6 +2,7 @@
 // host running older code, which does not know `closeSession`, has them closed with the viewer protocol (list, then
 // attach and force-close each). The old host here is a fake speaking that protocol.
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -9,8 +10,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { connectRunningTerminalHost, terminalHostAddress } from "../../plugins/terminals/detached.ts";
 import { encodeFrame, readFrames, type TerminalInfo, type TerminalRequest } from "../../plugins/terminals/protocol.ts";
-import { TerminalService } from "../../plugins/terminals/service.ts";
-import { APP } from "./helpers.ts";
+import { TerminalService, TerminalView } from "../../plugins/terminals/service.ts";
+import { APP, poll } from "./helpers.ts";
 
 const terminal = (id: string, sessionId: string): TerminalInfo => ({
 	id,
@@ -81,3 +82,63 @@ test("closing a session starts no host, and closes an outdated host's terminals 
 	await service.closeSession("s3");
 	assert.deepEqual(requests, [{ type: "list", sessionId: "s3" }]);
 });
+
+test("closing a service fences opens and calls still loading the host version", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "p2-terminal-service-"));
+	const service = new TerminalService(directory, APP);
+	t.after(async () => {
+		await service.close();
+		const host = await connectRunningTerminalHost(directory);
+		if (host) {
+			const closed = once(host, "close");
+			host.resume();
+			host.write(encodeFrame({ type: "shutdown" }));
+			await closed;
+		}
+		await rm(directory, { recursive: true, force: true });
+	});
+	const rejected = Promise.all([
+		assert.rejects(service.open("s1"), /closed/),
+		assert.rejects(service.call({ op: "list", sessionId: "s1" }), /closed/),
+	]);
+	const closing = service.close();
+	assert.equal(service.close(), closing, "concurrent close callers join the same work");
+	await closing;
+	await rejected;
+	await assert.rejects(service.open("late"), /closed/);
+	await assert.rejects(service.call({ op: "list", sessionId: "late" }), /closed/);
+	assert.equal(await connectRunningTerminalHost(directory), undefined, "closure must not start a host");
+});
+
+test(
+	"closing a view joins pending attachment startup but preserves the detached host",
+	{ timeout: 20_000 },
+	async (t) => {
+		const directory = await mkdtemp(join(tmpdir(), "p2-terminal-service-"));
+		const view = new TerminalView(directory, APP, "s1", "test-version");
+		t.after(async () => {
+			await view.close();
+			let host: Socket | undefined;
+			await poll(
+				async () => {
+					host = await connectRunningTerminalHost(directory);
+					return Boolean(host);
+				},
+				10_000,
+				"started terminal host",
+			);
+			const closed = once(host!, "close");
+			host!.resume();
+			host!.write(encodeFrame({ type: "shutdown" }));
+			await closed;
+			await rm(directory, { recursive: true, force: true });
+		});
+		const rejected = assert.rejects(view.ready(), /disconnected|closed/);
+		await view.close();
+		await rejected;
+		await assert.rejects(view.ready(), /closed/);
+		const host = await connectRunningTerminalHost(directory);
+		assert.ok(host, "close joins connection startup rather than leaving it to finish later");
+		host.destroy();
+	},
+);

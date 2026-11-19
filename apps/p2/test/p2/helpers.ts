@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
@@ -20,6 +21,8 @@ import {
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { NativeWatchable, Watchable } from "@earendil-works/chord/watch";
 import { WebSocket as NodeWebSocket } from "ws";
+import { connectRunningTerminalHost } from "../../plugins/terminals/detached.ts";
+import { encodeFrame } from "../../plugins/terminals/protocol.ts";
 import type { WebManifest } from "../../src/hosts/bundles.ts";
 import { type P2Server, type ServerOptions, startServer } from "../../src/hosts/server.ts";
 import { WEB_MANIFEST_PATH } from "../../src/hosts/web.ts";
@@ -188,6 +191,13 @@ export async function startFixture(options: ServerOptions = {}): Promise<Fixture
 		close: async () => {
 			for (const browser of browsers) await browser.close(TEST).catch(() => {});
 			await server.close();
+			const terminal = await connectRunningTerminalHost(dataDir);
+			if (terminal) {
+				const closed = once(terminal, "close");
+				terminal.resume();
+				terminal.write(encodeFrame({ type: "shutdown" }));
+				await closed;
+			}
 			rmSync(root, { recursive: true, force: true });
 		},
 	};

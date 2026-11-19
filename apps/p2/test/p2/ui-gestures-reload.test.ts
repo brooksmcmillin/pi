@@ -74,7 +74,8 @@ describe("phone gestures across a live plugin reload", { skip: !browserTests }, 
 		);
 		await sleep(300);
 		// The drawer: a swipe toward the inline end on the chat opens it, one back on the drawer closes it.
-		await drag(60, 400, 330, 400);
+		// Start below the wheel, which owns its touch-action:none drags.
+		await drag(60, 600, 330, 600);
 		await browser
 			.wait("document.querySelector('.app.drawer-open') && !document.querySelector('.drawer').style.transform")
 			.catch(() => assert.fail(`${when}: the swipe opens the drawer`));
@@ -146,13 +147,18 @@ describe("phone gestures across a live plugin reload", { skip: !browserTests }, 
 		// here; a new version of the code in the owner's case): the restored layer names a row the page no longer has.
 		writeFileSync(settings, JSON.stringify({ ...base, detail: 3 }));
 		await browser.open(`http://127.0.0.1:${fixture.server.port}/s/${session}`);
-		await browser.wait("document.querySelector('[data-testid=activity][data-state=done]')");
+		// File watching is asynchronous: open the sheet only after detail 3's separate thought row appears.
+		await browser.wait(
+			"document.querySelector('[data-testid=activity][data-state=done]') && document.querySelector('.rows [data-testid=thought]')",
+		);
 		await sleep(2500);
 		await tap("[data-testid=activity] .el-ticker");
 		await browser.wait(sheet);
 		writeFileSync(settings, JSON.stringify(base));
-		await browser.evaluate("location.reload()");
-		await browser.wait("document.querySelector('[data-testid=activity][data-state=done]')");
+		await browser.evaluate("(window.__beforeSheetReload = true, location.reload())");
+		await browser.wait(
+			"!window.__beforeSheetReload && document.querySelector('[data-testid=activity][data-state=done]') && !document.querySelector('.rows [data-testid=thought]')",
+		);
 		// Nothing shows the layer: the drawer does not wait for it, and it leaves the route (Back stays one step).
 		assert.equal(await browser.evaluate<boolean>(`!${sheet}`), true);
 		await gestures("after a reload that dropped the open sheet's row");

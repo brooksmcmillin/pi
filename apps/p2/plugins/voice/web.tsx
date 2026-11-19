@@ -296,7 +296,7 @@ function VoiceChip() {
 	}, [on, engine]);
 
 	const toggle = useCallback(() => {
-		if (!engine) return;
+		if (!engine || (!engine.running && !setMode)) return;
 		// The tap the blocked audio waits for.
 		if (engine.running && engine.audioBlocked) {
 			engine.unblock();
@@ -333,6 +333,7 @@ function VoiceChip() {
 			<button
 				type="button"
 				className={`chip toggle voice-chip ${on ? "on" : ""}`}
+				disabled={!on && !setMode}
 				aria-pressed={on}
 				aria-label={
 					!on
