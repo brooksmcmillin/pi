@@ -173,6 +173,35 @@ test("launcher reads pi's files and p2 prefs, validates themes and hot-reloads c
 	assert.match(view.theme.current.fg("accent", "x"), /38;2;101;67;33/);
 });
 
+test("preference watcher reconciles startup writes without native events and cancels on stop", (t) => {
+	const directory = mkdtempSync(join(tmpdir(), "p2-tui-startup-"));
+	t.after(() => rmSync(directory, { recursive: true, force: true }));
+	const sources = { agentDir: directory, configDir: directory };
+	const file = join(directory, "prefs.json");
+	writeFileSync(file, JSON.stringify({ theme: "dark" }));
+	const updates: TuiLocalPreferences[] = [];
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const stop = watchLocalPreferences(sources, (next) => updates.push(next));
+	t.after(stop);
+	writeFileSync(file, JSON.stringify({ theme: "light" }));
+	// No event-loop yield: only the startup timer can discover this write.
+	t.mock.timers.tick(100);
+	assert.deepEqual(
+		updates.map((next) => next.theme),
+		["light"],
+	);
+	stop();
+	const stopBeforeRead = watchLocalPreferences(sources, (next) => updates.push(next));
+	t.after(stopBeforeRead);
+	stopBeforeRead();
+	writeFileSync(file, JSON.stringify({ theme: "dark" }));
+	t.mock.timers.tick(1000);
+	assert.deepEqual(
+		updates.map((next) => next.theme),
+		["light"],
+	);
+});
+
 test("terminal color probe consumes replies, never forwards them, and tracks scheme reports", () => {
 	const written: string[] = [];
 	const states: TerminalState[] = [];

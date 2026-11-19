@@ -5,10 +5,12 @@ import assert from "node:assert/strict";
 import { renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT, follow } from "@p2/app/v1";
 import { Chat } from "../../plugins/chat/contract.ts";
 import { Sessions } from "../../plugins/sessions/contract.ts";
 import { VoiceMode } from "../../plugins/voice/contract.ts";
+import { buildBrowserScript } from "../../src/hosts/bundles.ts";
 import { Browser, browserTests } from "./browser.ts";
 import { type Fixture, holdIn, poll, startFixture, until } from "./helpers.ts";
 import { fakeSpeechService } from "./voice-service.ts";
@@ -21,9 +23,19 @@ describe("voice mode in the browser", { skip: !browserTests }, () => {
 		fixture = await startFixture({ web: true });
 		speech = await fakeSpeechService("token", { utterance: "What time is it?" });
 		writeFileSync(join(fixture.dataDir, "voice.json"), JSON.stringify({ url: speech.url, token: "token" }));
+		// A fixed WAV avoids depending on Chromium's default fake-audio source.
+		const microphone = join(fixture.dataDir, "microphone.wav");
+		const audio = await fetch(`${speech.url}/speak`, {
+			method: "POST",
+			headers: { Authorization: "Bearer token" },
+			body: "{}",
+		});
+		assert.equal(audio.status, 200);
+		writeFileSync(microphone, Buffer.from(await audio.arrayBuffer()));
 		browser = await Browser.start([
 			"--use-fake-ui-for-media-stream",
 			"--use-fake-device-for-media-stream",
+			`--use-file-for-fake-audio-capture=${microphone}`,
 			"--autoplay-policy=no-user-gesture-required",
 		]);
 		await browser.signIn(fixture.owner);
@@ -32,6 +44,43 @@ describe("voice mode in the browser", { skip: !browserTests }, () => {
 		await browser?.close();
 		speech?.close();
 		await fixture?.close();
+	});
+
+	it("waits for the remote switch before starting the microphone", async () => {
+		const owner = fixture.browser();
+		const session = await (await holdIn(owner, Sessions, {}, "owner")).create(
+			{ cwd: fixture.workspace },
+			BACKGROUND_CONTEXT,
+		);
+		const mode = await holdIn(owner, VoiceMode, { session: session.id, conversation: 1 }, "owner");
+		const { identifier } = (await browser.call("Page.addScriptToEvaluateOnNewDocument", {
+			source: await buildBrowserScript(fileURLToPath(new URL("../fixtures/delayed-voice-mode.ts", import.meta.url))),
+		})) as { identifier: string };
+		try {
+			await browser.open(`http://127.0.0.1:${fixture.server.port}/s/${session.id}`);
+			await browser.wait("window.voiceHoldsWaiting() > 0 && document.querySelector('.voice-chip')");
+			await browser.evaluate("document.querySelector('.voice-chip').click()");
+			await browser.wait("document.querySelector('.voice-chip').disabled || document.querySelector('.voice-orb')");
+			assert.equal(
+				await browser.evaluate("Boolean(document.querySelector('.voice-orb'))"),
+				false,
+				"a pending remote switch must not start local audio",
+			);
+			assert.equal(await browser.evaluate("document.querySelector('.voice-chip').disabled"), true);
+			await browser.evaluate("window.releaseVoiceHolds()");
+			await browser.wait("!document.querySelector('.voice-chip').disabled");
+			assert.equal(await browser.evaluate("Boolean(document.querySelector('.voice-orb'))"), false);
+			await browser.click(".voice-chip");
+			await until(mode.enabled, (enabled) => enabled);
+			await browser.wait("document.querySelector('.voice-orb')");
+			await browser.click(".voice-chip");
+			await until(mode.enabled, (enabled) => !enabled);
+			await browser.wait("!document.querySelector('.voice-orb')");
+		} finally {
+			await browser.call("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+			await browser.evaluate("window.releaseVoiceHolds?.()");
+			mode.release();
+		}
 	});
 
 	it("sends what it hears and reads the answer aloud", async () => {

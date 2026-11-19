@@ -144,8 +144,10 @@ describe("detail in the browser", { skip: !browserTests }, () => {
 		const base = JSON.parse(readFileSync(settings, "utf8")) as Record<string, unknown>;
 		writeFileSync(settings, JSON.stringify({ ...base, detail: 1 }));
 		await browser.open(`http://127.0.0.1:${fixture.server.port}/s/${session}`);
-		// Detail 1 applied: no thought or text rows, only wheels and answers.
-		await browser.wait(`!${ROWS}.split(',').some((kind) => kind === 'thought' || kind === 'text')`);
+		// Wait for the loaded transcript, not an empty DOM that also has no thought/text rows.
+		await browser.wait(
+			`document.querySelector('.rows [data-testid=activity]') && !${ROWS}.split(',').some((kind) => kind === 'thought' || kind === 'text')`,
+		);
 		// Every row the transcript adds from now on: whether it is an answer, and whether it fades in.
 		await browser.evaluate(`(() => {
 			window.__added = [];

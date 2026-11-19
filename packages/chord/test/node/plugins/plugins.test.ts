@@ -391,11 +391,12 @@ describe("current sets (slice 10 D11)", () => {
 });
 
 describe("installs through the component", () => {
-	it("clears the plugin's install mark and dirties it", async () => {
+	it("clears the plugin's install mark and dirties it", async ({ onTestFinished }) => {
 		const root = await tempRoot();
 		await itemPlugin(root, "a", "a1");
 		const tools = await tempRoot();
 		await writeFiles(tools, { "npm.mjs": "process.exit(0);" });
+		await settleFileEvents();
 		const reported: unknown[] = [];
 		const plugins = createPlugins(
 			{
@@ -406,6 +407,8 @@ describe("installs through the component", () => {
 			},
 			context,
 		);
+		onTestFinished(() => plugins.close());
+		await settleFileEvents();
 		await plugins.build([], context);
 		await writeFile(
 			join(root, "a", "package.json"),
@@ -415,7 +418,6 @@ describe("installs through the component", () => {
 		await plugins.installDependencies("@test/a", context);
 		expect(plugins.state.value).toMatchObject({ install: [], dirty: ["@test/a"] });
 		expect(reported).toEqual([]);
-		plugins.close();
 	});
 });
 

@@ -152,6 +152,8 @@ describe("the watcher's marks", () => {
 describe("the watcher and single-file plugins (slice 12 §4)", () => {
 	it("dirties a single-file plugin for a change of its file; a file appearing or disappearing at a root's top sets set", async () => {
 		const { root, watcher } = await watched();
+		// This case drives marks explicitly; native notifications are covered separately.
+		watcher.close();
 		await writeFiles(root, { "hello.server.ts": "" });
 		watcher.mark(join(root, "hello.server.ts"));
 		expect(watcher.value).toMatchObject({ set: true, dirty: [] });
@@ -168,7 +170,6 @@ describe("the watcher and single-file plugins (slice 12 §4)", () => {
 		await rm(join(root, "hello.server.ts"));
 		watcher.mark(join(root, "hello.server.ts"));
 		expect(watcher.value).toMatchObject({ set: true, dirty: ["hello"] });
-		watcher.close();
 	});
 });
 

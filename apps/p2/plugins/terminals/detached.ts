@@ -104,8 +104,8 @@ export type TerminalAttachment = {
 	/** Resolves once the host said hello; rejects when it could not be reached or the socket closed before. */
 	readonly ready: Promise<void>;
 	write(message: object | Uint8Array): void;
-	/** Closes the socket; `onDetached` is not called for it. */
-	detach(): void;
+	/** Closes the socket and joins pending connection setup; does not stop the host or call `onDetached`. */
+	detach(): Promise<void>;
 };
 
 /**
@@ -130,7 +130,7 @@ export function attachTerminalHost(
 		ready.reject(new Error("Terminal host is disconnected"));
 		if (notify) onDetached();
 	};
-	void connectTerminalHost(directory, app).then(
+	const connecting = connectTerminalHost(directory, app).then(
 		(connected) => {
 			if (ended) {
 				connected.destroy();
@@ -159,6 +159,9 @@ export function attachTerminalHost(
 			}
 			socket.write(encodeFrame(message));
 		},
-		detach: () => end(false),
+		detach: () => {
+			end(false);
+			return connecting;
+		},
 	};
 }

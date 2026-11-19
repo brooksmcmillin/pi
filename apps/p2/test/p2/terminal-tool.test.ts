@@ -18,10 +18,9 @@ import { Sessions } from "../../plugins/sessions/contract.ts";
 import { Sharing } from "../../plugins/sharing/contract.ts";
 import { AgentTerminals, TerminalServices, Terminals } from "../../plugins/terminals/contract.ts";
 import { localSystem, terminalDaemon } from "../../plugins/terminals/daemon.ts";
-import { connectTerminalHost } from "../../plugins/terminals/detached.ts";
-import { encodeFrame, type TerminalEvent, type TerminalInfo } from "../../plugins/terminals/protocol.ts";
+import type { TerminalEvent, TerminalInfo } from "../../plugins/terminals/protocol.ts";
 import { Hosts } from "../../src/runtime/server.ts";
-import { APP, expectChord, holdIn, http, poll, startFixture, until } from "./helpers.ts";
+import { expectChord, holdIn, http, poll, startFixture, until } from "./helpers.ts";
 
 let unavailable: string | undefined;
 try {
@@ -54,10 +53,6 @@ test(
 		const fixture = await startFixture({ allowedHosts: ["share.test"] });
 		t.after(async () => {
 			await fixture.close();
-			const host = await connectTerminalHost(fixture.dataDir, APP);
-			host.resume();
-			host.write(encodeFrame({ type: "shutdown" }));
-			await new Promise((resolve) => host.once("close", resolve));
 			if (shell === undefined) delete process.env.SHELL;
 			else process.env.SHELL = shell;
 		});
@@ -84,7 +79,11 @@ test(
 		};
 		// The owner's terminal panel: its byte channel hears the session's terminals change.
 		const view = await holdIn(owner, Terminals, { session: session.id, view: randomUUID() }, "owner");
-		const bytes = await byteChannel(fixture.server.port, (await view.channel({}, BACKGROUND_CONTEXT)).token);
+		const bytes = await byteChannel(
+			fixture.server.port,
+			(await view.channel({}, BACKGROUND_CONTEXT)).token,
+			fixture.owner.cookie,
+		);
 		t.after(() => bytes.socket.terminate());
 		await view.list({}, BACKGROUND_CONTEXT);
 		const listed = () =>
@@ -238,8 +237,8 @@ test(
 		await t.test("archiving the session closes its terminals", async () => {
 			await sessions.archive({ id: session.id }, BACKGROUND_CONTEXT);
 			const service = (await fixture.server.host.registry(TerminalServices, BACKGROUND_CONTEXT)).value!.service;
-			assert.deepEqual(await service.call({ op: "list", sessionId: session.id }), { kind: "list", windows: [] });
 			await poll(() => listed().length === 0);
+			assert.deepEqual(await service.call({ op: "list", sessionId: session.id }), { kind: "list", windows: [] });
 		});
 
 		await t.test("without code mode, tool_search loads the tool for the model", async () => {
@@ -262,8 +261,10 @@ test(
 	},
 );
 
-async function byteChannel(port: number, token: string) {
-	const socket = new WebSocket(`ws://127.0.0.1:${port}/terminal?${new URLSearchParams({ token })}`);
+async function byteChannel(port: number, token: string, cookie: string) {
+	const socket = new WebSocket(`ws://127.0.0.1:${port}/terminal?${new URLSearchParams({ token })}`, {
+		headers: { Cookie: cookie },
+	});
 	const events: TerminalEvent[] = [];
 	socket.on("message", (data, binary) => {
 		if (!binary) {
