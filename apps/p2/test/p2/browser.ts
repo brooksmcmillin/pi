@@ -28,6 +28,10 @@ export class Browser {
 		this.process = process;
 		this.profile = profile;
 		this.socket = socket;
+		socket.on("close", () => {
+			for (const request of this.pending.values()) request.reject(new Error("DevTools socket closed"));
+			this.pending.clear();
+		});
 		socket.on("message", (raw) => {
 			const message = JSON.parse(raw.toString()) as {
 				id?: number;
@@ -68,30 +72,92 @@ export class Browser {
 			],
 			{ stdio: "ignore" },
 		);
-		await poll(() => existsSync(join(profile, "DevToolsActivePort")), 20_000, "Chromium debugging port");
-		const port = readFileSync(join(profile, "DevToolsActivePort"), "utf8").split("\n")[0];
-		const targets = (await (await fetch(`http://127.0.0.1:${port}/json`)).json()) as {
-			type: string;
-			webSocketDebuggerUrl: string;
-		}[];
-		// Google Chrome also lists its component extensions' background pages; drive the tab.
-		const page = targets.find((target) => target.type === "page") ?? targets[0]!;
-		const socket = new WebSocket(page.webSocketDebuggerUrl);
-		await new Promise<void>((resolve, reject) => {
-			socket.once("open", resolve);
-			socket.once("error", reject);
+		let socket: WebSocket | undefined;
+		let startupError: Error | undefined;
+		process.once("error", (error) => {
+			startupError = error;
 		});
-		const browser = new Browser(process, profile, socket);
-		await browser.call("Page.enable");
-		await browser.call("Page.setLifecycleEventsEnabled", { enabled: true });
-		return browser;
+		const exited = () => process.pid === undefined || process.exitCode !== null || process.signalCode !== null;
+		try {
+			let port = "";
+			await poll(
+				() => {
+					if (startupError) throw startupError;
+					if (exited()) throw new Error("Chromium exited during startup");
+					const path = join(profile, "DevToolsActivePort");
+					if (!existsSync(path)) return false;
+					const contents = readFileSync(path, "utf8");
+					// Chrome creates the file before writing it; an empty port would connect to port 80.
+					if (!contents.includes("\n")) return false;
+					port = contents.split("\n")[0]!;
+					return /^\d+$/.test(port) && Number(port) > 0 && Number(port) <= 65535;
+				},
+				20_000,
+				"Chromium debugging port",
+			);
+			let debuggerUrl = "";
+			await poll(
+				async () => {
+					const targets = (await (
+						await fetch(`http://127.0.0.1:${port}/json`, {
+							signal: AbortSignal.timeout(20_000),
+						})
+					).json()) as { type: string; webSocketDebuggerUrl: string }[];
+					// The port can precede the tab; never drive an extension's background page instead.
+					debuggerUrl = targets.find((target) => target.type === "page")?.webSocketDebuggerUrl ?? "";
+					return debuggerUrl !== "";
+				},
+				20_000,
+				"Chromium page target",
+			);
+			socket = new WebSocket(debuggerUrl, { handshakeTimeout: 20_000 });
+			await new Promise<void>((resolve, reject) => {
+				socket!.once("open", resolve);
+				socket!.once("error", reject);
+			});
+			const browser = new Browser(process, profile, socket);
+			await browser.call("Page.enable");
+			await browser.call("Page.setLifecycleEventsEnabled", { enabled: true });
+			return browser;
+		} catch (error) {
+			socket?.terminate();
+			if (!exited()) {
+				process.kill("SIGTERM");
+				try {
+					await poll(exited, 5000, "Chromium startup cleanup");
+				} catch {
+					process.kill("SIGKILL");
+					await poll(exited, 5000, "Chromium startup termination");
+				}
+			}
+			rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+			throw error;
+		}
 	}
 	/** Sends a DevTools command to the page, or to an attached target's flat session (`evaluateInFrame`). */
 	call(method: string, params: object = {}, sessionId?: string): Promise<unknown> {
+		if (this.socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error("DevTools socket closed"));
 		return new Promise((resolve, reject) => {
 			const id = ++this.id;
-			this.pending.set(id, { resolve, reject });
-			this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+			const timer = setTimeout(() => {
+				this.pending.delete(id);
+				reject(new Error(`DevTools ${method} timed out after 30000ms`));
+			}, 30_000);
+			this.pending.set(id, {
+				resolve: (value) => {
+					clearTimeout(timer);
+					resolve(value);
+				},
+				reject: (error) => {
+					clearTimeout(timer);
+					reject(error);
+				},
+			});
+			this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }), (error) => {
+				if (!error) return;
+				this.pending.get(id)?.reject(error);
+				this.pending.delete(id);
+			});
 		});
 	}
 	/**

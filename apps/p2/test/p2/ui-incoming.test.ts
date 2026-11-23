@@ -156,8 +156,10 @@ describe("incoming messages", { skip: !browserTests }, () => {
 		await browser.wait(
 			`${long}.querySelector('.incoming-body').textContent.includes('Line 30') && !${long}.querySelector('.incoming-body.clamped')`,
 		);
-		// The headers open where the message came from.
+		// Expanding the long body can move earlier headers outside the viewport.
+		await browser.evaluate(`document.querySelector('[data-from=agent]').scrollIntoView({ block: "center" })`);
 		await browser.click("[data-from=agent] button.incoming-from");
+		await browser.evaluate(`document.querySelector('[data-from=session]').scrollIntoView({ block: "center" })`);
 		await browser.click("[data-from=session] button.incoming-from");
 		assert.deepEqual(await browser.evaluate("window.opened"), ["conversation:2", "session:session-b"]);
 	});

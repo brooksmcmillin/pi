@@ -410,7 +410,7 @@ test(
 			const serverPid = await removedServer.pid(BACKGROUND_CONTEXT);
 			const removedPid = await removedWorker.pid(BACKGROUND_CONTEXT);
 			assert.equal(await removedUnseen.label(BACKGROUND_CONTEXT), "removable-plugin");
-			assert.equal((await http(port, "/__dev_removable")).body, "removable");
+			assert.equal((await http(port, "/__dev_removable", { headers: await local(port) })).body, "removable");
 			await chat.send({ text: "slow plugin-removal-sentinel", requestId: "plugin-removal" }, BACKGROUND_CONTEXT);
 			await until(status.statuses, (value) => value?.[first.id]?.busy.includes(1) === true);
 			let revision = (await devState()).revision;
@@ -420,7 +420,11 @@ test(
 			const removedRefs = [removedServer, removedWorker, removedUnseen];
 			await poll(() => removedRefs.every((ref) => statusOf(ref) === "failed"));
 			for (const ref of removedRefs) ref.release();
-			assert.equal((await http(port, "/__dev_removable")).status, 404, "registration was removed");
+			assert.equal(
+				(await http(port, "/__dev_removable", { headers: await local(port) })).status,
+				404,
+				"registration was removed",
+			);
 			for (const pid of [serverPid, removedPid, secondPid])
 				await poll(
 					async () =>
@@ -472,7 +476,11 @@ test(
 			const addedSecond = browser.hold(Added.worker, { session: second.id }, BACKGROUND_CONTEXT);
 			assert.equal(await addedSecond.label(BACKGROUND_CONTEXT), "added-plugin");
 			addedSecond.release();
-			assert.equal((await http(port, "/__dev_added")).body, "added", "new host object activated");
+			assert.equal(
+				(await http(port, "/__dev_added", { headers: await local(port) })).body,
+				"added",
+				"new host object activated",
+			);
 			assert.equal(await workerProbe.pid(BACKGROUND_CONTEXT), firstPid);
 			await until(status.statuses, (value) => value?.[first.id]?.busy.includes(1) === true);
 			await until(chat.view, (value) =>
@@ -495,7 +503,7 @@ test(
 			await poll(() => statusOf(addedServer) === "failed" && statusOf(addedWorker) === "failed");
 			addedServer.release();
 			addedWorker.release();
-			assert.equal((await http(port, "/__dev_added")).status, 404);
+			assert.equal((await http(port, "/__dev_added", { headers: await local(port) })).status, 404);
 			assert.equal(ports().length, 1, "add/remove never restarts the backend");
 			assert(!log.includes("Unknown p2 plugin: dev-removable"));
 			await chat.send({ text: "slow restart-stream-sentinel", requestId: "restart-stream" }, BACKGROUND_CONTEXT);

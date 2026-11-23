@@ -41,6 +41,7 @@ export class TerminalView {
 	#queued = 0;
 	#list?: ReturnType<typeof Promise.withResolvers<TerminalInfo[]>>;
 	#serial: Promise<unknown> = Promise.resolve();
+	#detaching: Promise<void> = Promise.resolve();
 	#closed = false;
 
 	constructor(directory: string, app: string, session: string, version: string) {
@@ -51,6 +52,7 @@ export class TerminalView {
 	}
 
 	ready(): Promise<void> {
+		if (this.#closed) return Promise.reject(new Error("Terminal view is closed"));
 		if (!this.#attachment) {
 			const attachment = attachTerminalHost(
 				this.#directory,
@@ -68,10 +70,11 @@ export class TerminalView {
 	}
 
 	/** Detaches from the host (it and its programs live on). */
-	#detach(): void {
+	#detach(): Promise<void> {
 		const attachment = this.#attachment;
 		this.#attachment = undefined;
-		attachment?.detach();
+		if (attachment) this.#detaching = Promise.all([this.#detaching, attachment.detach()]).then(() => {});
+		return this.#detaching;
 	}
 
 	#write(message: object | Uint8Array): void {
@@ -181,7 +184,7 @@ export class TerminalView {
 		this.#list?.reject(new Error("Terminal view closed"));
 		this.#socket?.terminate();
 		this.#socket = undefined;
-		this.#detach();
+		await this.#detach();
 	}
 }
 
@@ -269,12 +272,13 @@ export class HostCalls {
 		this.#pending.clear();
 	}
 
-	close(): void {
+	async close(): Promise<void> {
 		this.#closed = true;
 		const attachment = this.#attachment;
 		this.#attachment = undefined;
-		attachment?.detach();
+		const detached = attachment?.detach();
 		this.#fail(new Error("The terminal service is closed"));
+		await detached;
 	}
 }
 
@@ -286,6 +290,8 @@ export class TerminalService {
 	readonly #views = new Set<TerminalView>();
 	readonly #tokens = new Map<string, { view: TerminalView; expires: number }>();
 	#calls: Promise<HostCalls> | undefined;
+	#closed = false;
+	#closing: Promise<void> | undefined;
 
 	constructor(directory: string, app: string) {
 		this.directory = directory;
@@ -294,8 +300,11 @@ export class TerminalService {
 
 	/** One call to the terminal host (starting it when none runs); `signal` cancels it. */
 	async call(call: HostCall, signal?: AbortSignal): Promise<HostResult> {
+		if (this.#closed) throw new Error("The terminal service is closed");
 		this.#calls ??= terminalHostVersion(this.app).then((version) => new HostCalls(this.directory, this.app, version));
-		return (await this.#calls).call(call, signal);
+		const calls = await this.#calls;
+		if (this.#closed) throw new Error("The terminal service is closed");
+		return calls.call(call, signal);
 	}
 
 	/**
@@ -319,7 +328,10 @@ export class TerminalService {
 	}
 
 	async open(session: string): Promise<TerminalView> {
-		const view = new TerminalView(this.directory, this.app, session, await terminalHostVersion(this.app));
+		if (this.#closed) throw new Error("The terminal service is closed");
+		const version = await terminalHostVersion(this.app);
+		if (this.#closed) throw new Error("The terminal service is closed");
+		const view = new TerminalView(this.directory, this.app, session, version);
 		this.#views.add(view);
 		try {
 			await view.ready();
@@ -351,15 +363,19 @@ export class TerminalService {
 	}
 
 	async release(view: TerminalView): Promise<void> {
-		this.#views.delete(view);
 		for (const [token, entry] of this.#tokens) if (entry.view === view) this.#tokens.delete(token);
 		await view.close();
+		this.#views.delete(view);
 	}
 
-	async close(): Promise<void> {
-		void this.#calls?.then((calls) => calls.close());
-		await Promise.all([...this.#views].map((view) => this.release(view)));
-		await new Promise<void>((resolve) => this.#sockets.close(() => resolve()));
+	close(): Promise<void> {
+		this.#closed = true;
+		this.#closing ??= (async () => {
+			await this.#calls?.then((calls) => calls.close());
+			await Promise.all([...this.#views].map((view) => this.release(view)));
+			await new Promise<void>((resolve) => this.#sockets.close(() => resolve()));
+		})();
+		return this.#closing;
 	}
 }
 

@@ -11,7 +11,7 @@ export const MAX_UNSENT_BYTES = 4 * 1024 * 1024;
 /**
  * The socket Chord's link sees for one client connection (Chord queues calls behind its own window).
  *
- * - Errors (an oversized frame) terminate the socket instead of crashing the server.
+ * - Errors close the socket without crashing the server or discarding a protocol close frame.
  * - Output: before each send, data still buffered beyond the largest unfinished frame (one snapshot may itself be
  *   large) must stay under `MAX_UNSENT_BYTES`, or the socket is terminated; the client reconnects from snapshots.
  *   chord2's flow control normally keeps a reading client far below it; this catches clients that stop reading.
@@ -19,7 +19,10 @@ export const MAX_UNSENT_BYTES = 4 * 1024 * 1024;
 export function limitedSocket(socket: WebSocket): WebSocketLike {
 	// A protocol error (an oversized frame: "Max payload size exceeded") is emitted as an `error` event, which would
 	// crash the server without a listener. The socket closes (1009); the link sees the close.
-	socket.on("error", () => socket.terminate());
+	socket.on("error", () => {
+		// ws has already queued the protocol close frame; let that handshake finish.
+		if (socket.readyState !== socket.CLOSING) socket.terminate();
+	});
 	const unsent = new Set<{ readonly bytes: number }>();
 	const send = (data: Uint8Array<ArrayBuffer>): void => {
 		if (socket.readyState !== socket.OPEN) return;
