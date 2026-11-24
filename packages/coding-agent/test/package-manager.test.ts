@@ -1,8 +1,23 @@
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { PassThrough } from "node:stream";
+import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -26,6 +41,7 @@ class MockSpawnedProcess extends EventEmitter {
 }
 
 interface PackageManagerInternals {
+	lockGitCheckout(state: string): () => void;
 	runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
 	getPackageManagerName(): string;
 	getGitDependencyInstallArgs(): string[];
@@ -816,6 +832,17 @@ Content`,
 	});
 
 	describe("npmCommand", () => {
+		function mockGitCheckout(targetDir: string) {
+			mkdirSync(join(targetDir, ".git"), { recursive: true });
+			const manager = packageManager as unknown as PackageManagerInternals;
+			return vi.spyOn(manager, "runCommand").mockImplementation(async (command, args, options) => {
+				if (command === "git" && args.includes("reset") && options?.cwd) {
+					const manifest = join(targetDir, "package.json");
+					if (existsSync(manifest)) writeFileSync(join(options.cwd, "package.json"), readFileSync(manifest));
+				}
+			});
+		}
+
 		it("should use npmCommand argv for npm installs", async () => {
 			settingsManager = SettingsManager.inMemory({
 				npmCommand: ["mise", "exec", "node@20", "--", "npm"],
@@ -1006,20 +1033,24 @@ Content`,
 				}
 				throw new Error(`Unexpected runCommandCapture args: ${args.join(" ")}`);
 			});
-			const runCommandSpy = vi.spyOn(managerWithInternals, "runCommand").mockResolvedValue(undefined);
+			const runCommandSpy = mockGitCheckout(targetDir);
 
 			await packageManager.install(source);
 
 			expect(runCommandSpy).toHaveBeenCalledWith("git", ["fetch", "origin", "v2"], { cwd: targetDir });
-			expect(runCommandSpy).toHaveBeenCalledWith("git", ["reset", "--hard", "FETCH_HEAD^{commit}"], {
-				cwd: targetDir,
-			});
-			expect(runCommandSpy).toHaveBeenCalledWith("git", ["clean", "-fdx"], { cwd: targetDir });
+			expect(runCommandSpy).toHaveBeenCalledWith(
+				"git",
+				["--git-dir=.git", "--work-tree=.", "reset", "--hard", "new-head"],
+				{
+					cwd: expect.stringContaining(".repo.pi-update-"),
+				},
+			);
+			expect(runCommandSpy).not.toHaveBeenCalledWith("git", ["clean", "-fdx"], { cwd: targetDir });
 			expect(runCommandSpy).toHaveBeenCalledWith(
 				"npm",
 				["install", "--omit=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"],
 				{
-					cwd: targetDir,
+					cwd: expect.stringContaining(".repo.pi-update-"),
 				},
 			);
 		});
@@ -1045,15 +1076,19 @@ Content`,
 				}
 				throw new Error(`Unexpected runCommandCapture args: ${args.join(" ")}`);
 			});
-			const runCommandSpy = vi.spyOn(managerWithInternals, "runCommand").mockResolvedValue(undefined);
+			const runCommandSpy = mockGitCheckout(targetDir);
 
 			await packageManager.install(source);
 
 			expect(runCommandSpy).toHaveBeenCalledWith("git", fetchArgs, { cwd: targetDir });
-			expect(runCommandSpy).toHaveBeenCalledWith("git", ["reset", "--hard", "origin/HEAD^{commit}"], {
-				cwd: targetDir,
-			});
-			expect(runCommandSpy).toHaveBeenCalledWith("git", ["clean", "-fdx"], { cwd: targetDir });
+			expect(runCommandSpy).toHaveBeenCalledWith(
+				"git",
+				["--git-dir=.git", "--work-tree=.", "reset", "--hard", "new-head"],
+				{
+					cwd: expect.stringContaining(".repo.pi-update-"),
+				},
+			);
+			expect(runCommandSpy).not.toHaveBeenCalledWith("git", ["clean", "-fdx"], { cwd: targetDir });
 		});
 
 		it("should prefer the package manager after a separator over the outer executable", () => {
@@ -1166,7 +1201,7 @@ Content`,
 				}
 				throw new Error(`Unexpected runCommandCapture args: ${args.join(" ")}`);
 			});
-			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockResolvedValue(undefined);
+			const runCommandSpy = mockGitCheckout(targetDir);
 
 			await packageManager.update(source);
 
@@ -1174,7 +1209,7 @@ Content`,
 				"npm",
 				["install", "--omit=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"],
 				{
-					cwd: targetDir,
+					cwd: expect.stringContaining(".repo.pi-update-"),
 				},
 			);
 		});
@@ -1197,6 +1232,11 @@ Content`,
 				fetchArgs,
 			});
 			vi.spyOn(managerWithInternals, "runCommandCapture").mockResolvedValue("current-head");
+			execFileSync("git", ["init", "-q"], { cwd: targetDir });
+			writeFileSync(join(targetDir, "tracked.txt"), "original");
+			execFileSync("git", ["add", "tracked.txt"], { cwd: targetDir });
+			writeFileSync(join(targetDir, "tracked.txt"), "local edit");
+			writeFileSync(join(targetDir, "local.txt"), "keep this untracked file");
 			const runCommandSpy = vi.spyOn(managerWithInternals, "runCommand").mockResolvedValue(undefined);
 
 			await packageManager.update(source);
@@ -1209,45 +1249,302 @@ Content`,
 				},
 			);
 			expect(runCommandSpy).not.toHaveBeenCalledWith("git", ["clean", "-fdx"], { cwd: targetDir });
+			expect(readFileSync(join(targetDir, "tracked.txt"), "utf8")).toBe("local edit");
+			expect(readFileSync(join(targetDir, "local.txt"), "utf8")).toBe("keep this untracked file");
 		});
 
-		// https://github.com/earendil-works/pi/issues/11597
-		it("should install git package dependencies when cleaning fails", async () => {
+		it.each([
+			"success",
+			"failure",
+			"competing update",
+			"blocked promotion",
+			"cross-device recovery",
+			"repair contention",
+		] as const)("keeps the old Git package usable during a staged %s", async (outcome) => {
 			const source = "git:github.com/user/repo";
 			const targetDir = join(agentDir, "git", "github.com", "user", "repo");
-			const fetchArgs = ["fetch", "--prune", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"];
-			mkdirSync(targetDir, { recursive: true });
-			writeFileSync(
-				join(targetDir, "package.json"),
-				JSON.stringify({ name: "repo", version: "1.0.0", dependencies: { dependency: "1.0.0" } }),
-			);
+			const remote = join(tempDir, "origin");
+			const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf-8" }).trim();
+			mkdirSync(remote);
+			git(remote, "init", "-b", "main");
+			git(remote, "config", "user.email", "pi-tests@example.com");
+			git(remote, "config", "user.name", "Pi Tests");
+			const writeVersion = (version: string, dependency: string) => {
+				writeFileSync(
+					join(remote, "package.json"),
+					JSON.stringify({
+						name: "repo",
+						version,
+						type: "module",
+						dependencies: { runtime: `file:../${dependency}` },
+						...(outcome === "failure" && version === "2.0.0"
+							? { scripts: { install: 'git checkout-index -f worker.js && node -e "process.exit(42)"' } }
+							: {}),
+					}),
+				);
+				writeFileSync(
+					join(remote, "worker.js"),
+					`import value from 'runtime'; console.log('${version}:' + value);`,
+				);
+				git(remote, "add", "package.json", "worker.js");
+				git(remote, "-c", "commit.gpgsign=false", "commit", "-m", version);
+			};
+			const writeRuntime = (version: string) => {
+				const path = join(dirname(targetDir), version);
+				mkdirSync(path);
+				writeFileSync(
+					join(path, "package.json"),
+					'{"name":"runtime","version":"1.0.0","type":"module","exports":"./index.js"}',
+				);
+				writeFileSync(join(path, "index.js"), `export default '${version}';`);
+			};
+			const npmArgs = ["--offline", "--ignore-scripts"];
+			const startWorker = () =>
+				execFileSync(process.execPath, [join(targetDir, "worker.js")], { encoding: "utf-8" }).trim();
+			writeVersion("1.0.0", "old");
+			git(tempDir, "clone", remote, targetDir);
+			const original = git(targetDir, "rev-parse", "HEAD");
+			if (outcome === "failure" || outcome === "success") {
+				git(targetDir, "config", "extensions.worktreeConfig", "true");
+				git(targetDir, "config", "--worktree", "core.worktree", targetDir);
+			}
+			writeRuntime("old");
+			writeRuntime("new");
+			const collidingSibling = join(dirname(targetDir), ".repo.pi-update-incomplete.previous");
+			mkdirSync(collidingSibling);
+			writeFileSync(join(collidingSibling, "index.ts"), "// unrelated checkout");
+			const manager = packageManager as unknown as PackageManagerInternals;
+			await manager.runCommand("npm", ["install", "--no-audit", "--no-fund", ...npmArgs], { cwd: targetDir });
 			settingsManager.setPackages([source]);
-
-			const managerWithInternals = packageManager as unknown as PackageManagerInternals;
-			vi.spyOn(managerWithInternals, "getLocalGitUpdateTarget").mockResolvedValue({
-				ref: "@{upstream}",
-				head: "new-head",
-				fetchArgs,
-			});
-			vi.spyOn(managerWithInternals, "runCommandCapture").mockImplementation(async (_command, args) =>
-				args[1] === "HEAD" ? "old-head" : "new-head",
-			);
-			const runCommandSpy = vi
-				.spyOn(managerWithInternals, "runCommand")
-				.mockImplementation(async (_command, args) => {
-					if (args[0] === "clean") throw new Error("simulated clean failure");
+			const runCommand = manager.runCommand.bind(manager);
+			if (outcome === "repair contention") {
+				rmSync(join(targetDir, "node_modules"), { recursive: true });
+				vi.spyOn(manager, "runCommand").mockImplementation(async (command, args, options) => {
+					if (command !== "npm") return runCommand(command, args, options);
+					expect(options?.cwd).toBe(targetDir);
+					writeVersion("2.0.0", "new");
+					const competitor = new DefaultPackageManager({ cwd: tempDir, agentDir, settingsManager });
+					await expect(competitor.update(source)).rejects.toMatchObject({ code: "ELOCKED" });
+					return runCommand(command, [...args, ...npmArgs], options);
 				});
+				await packageManager.update(source);
+				expect(startWorker()).toBe("1.0.0:old");
+				expect(git(targetDir, "rev-parse", "HEAD")).toBe(original);
+				return;
+			}
+			writeVersion("2.0.0", "new");
+			const install = vi.spyOn(manager, "runCommand").mockImplementation(async (command, args, options) => {
+				if (command !== "npm") return runCommand(command, args, options);
+				const staged = options?.cwd;
+				if (!staged) throw new Error("Expected npm install cwd");
+				expect(staged).not.toBe(targetDir);
+				expect(startWorker()).toBe("1.0.0:old");
+				expect(git(targetDir, "rev-parse", "HEAD")).toBe(original);
+				await runCommand(
+					command,
+					[...args, ...(outcome === "failure" ? ["--offline", "--ignore-scripts=false"] : npmArgs)],
+					options,
+				);
+				if (outcome === "competing update") {
+					writeVersion("3.0.0", "new");
+					const competitor = new DefaultPackageManager({ cwd: tempDir, agentDir, settingsManager });
+					const internals = competitor as unknown as PackageManagerInternals;
+					const run = internals.runCommand.bind(internals);
+					vi.spyOn(internals, "runCommand").mockImplementation((cmd, argv, opts) =>
+						run(cmd, cmd === "npm" ? [...argv, ...npmArgs] : argv, opts),
+					);
+					await competitor.update(source);
+				}
+				if (outcome === "blocked promotion") {
+					// Remove staging after preparation to force the second rename to fail.
+					const lock = manager.lockGitCheckout.bind(manager);
+					vi.spyOn(manager, "lockGitCheckout").mockImplementationOnce((state) => {
+						const release = lock(state);
+						rmSync(staged, { recursive: true });
+						return release;
+					});
+				}
+			});
 
-			await packageManager.update(source);
-
-			expect(runCommandSpy).toHaveBeenCalledWith(
-				"npm",
-				["install", "--omit=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"],
-				{
-					cwd: targetDir,
-				},
+			if (outcome === "cross-device recovery") {
+				if (!existsSync("/dev/shm") || statSync("/dev/shm").dev === statSync(targetDir).dev) return;
+				const external = mkdtempSync("/dev/shm/pi-update-test-");
+				try {
+					symlinkSync(external, join(agentDir, "git", ".git-update-state"), "dir");
+					await expect(packageManager.update(source)).rejects.toThrow("on the same filesystem");
+					expect(startWorker()).toBe("1.0.0:old");
+					expect(install.mock.calls.some(([command]) => command === "npm")).toBe(false);
+				} finally {
+					rmSync(external, { recursive: true, force: true });
+				}
+				return;
+			}
+			if (outcome === "competing update") {
+				await expect(packageManager.update(source)).rejects.toThrow("changed during update");
+				expect(startWorker()).toBe("3.0.0:new");
+			} else if (outcome === "failure" || outcome === "blocked promotion") {
+				await expect(packageManager.update(source)).rejects.toThrow(
+					outcome === "failure" ? "code 42" : "close processes using it and retry",
+				);
+				expect(startWorker()).toBe("1.0.0:old");
+				expect(git(targetDir, "rev-parse", "HEAD")).toBe(original);
+			} else {
+				await packageManager.update(source);
+				expect(startWorker()).toBe("2.0.0:new");
+				if (outcome === "success") {
+					expect(git(targetDir, "config", "--worktree", "core.worktree")).toBe(targetDir);
+				}
+				expect(git(targetDir, "rev-parse", "HEAD")).toBe(git(remote, "rev-parse", "HEAD"));
+				expect(git(targetDir, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
+				await packageManager.update(source);
+			}
+			git(agentDir, "init", "-q");
+			expect(git(agentDir, "check-ignore", "git/.git-update-state/backup.previous")).toBe(
+				"git/.git-update-state/backup.previous",
 			);
+			expect(install.mock.calls.filter(([command]) => command === "npm")).toHaveLength(1);
+			expect(readdirSync(dirname(targetDir)).sort()).toEqual([
+				".repo.pi-update-incomplete.previous",
+				"new",
+				"old",
+				"repo",
+			]);
+			expect(readFileSync(join(collidingSibling, "index.ts"), "utf8")).toBe("// unrelated checkout");
 		});
+
+		it.skipIf(process.platform === "win32")(
+			"restores an interrupted temporary Git checkout from its private cache",
+			async () => {
+				const source = "git:github.com/user/repo";
+				const manager = packageManager as unknown as PackageManagerInternals;
+				const parsed = manager.parseSource(source);
+				if (parsed.type !== "git") throw new Error("Expected Git source");
+				const target = manager.getGitInstallPath(parsed, "temporary");
+				const cache = join(agentDir, "tmp", "extensions");
+				mkdirSync(dirname(target), { recursive: true });
+				const key = createHash("sha256")
+					.update(join(realpathSync(dirname(target)), "repo"))
+					.digest("hex");
+				const previous = join(cache, ".git-update-state", `${key}.previous`);
+				const extension = join(target, "extensions", "worker.ts");
+				mkdirSync(dirname(previous), { recursive: true });
+				mkdirSync(dirname(extension), { recursive: true });
+				writeFileSync(extension, "export default function() {}\n");
+				renameSync(target, previous);
+				expect(statSync(cache).mode & 0o777).toBe(0o700);
+				process.env.PI_OFFLINE = "1";
+
+				const resources = await packageManager.resolveExtensionSources([source], { temporary: true });
+				expect(resources.extensions.some((entry) => entry.path === extension && entry.enabled)).toBe(true);
+				expect(existsSync(previous)).toBe(false);
+			},
+		);
+
+		it("does not remove the backup while promotion holds the checkout lock", async () => {
+			const source = "git:github.com/user/repo";
+			const target = join(agentDir, "git", "github.com", "user", "repo");
+			mkdirSync(dirname(target), { recursive: true });
+			const key = createHash("sha256")
+				.update(join(realpathSync(dirname(target)), "repo"))
+				.digest("hex");
+			const state = join(agentDir, "git", ".git-update-state", key);
+			const previous = `${state}.previous`;
+			mkdirSync(previous, { recursive: true });
+			writeFileSync(join(previous, "worker.js"), "// live backup");
+			const release = lockfile.lockSync(state, { realpath: false });
+			try {
+				await expect(packageManager.remove(source)).rejects.toMatchObject({ code: "ELOCKED" });
+				expect(readFileSync(join(previous, "worker.js"), "utf8")).toBe("// live backup");
+			} finally {
+				release();
+			}
+			await packageManager.remove(source);
+			expect(existsSync(previous)).toBe(false);
+		});
+
+		it.skipIf(process.platform === "win32")(
+			"waits for removal before restoring through an agent directory alias",
+			async () => {
+				const source = "git:github.com/user/repo";
+				const target = join(agentDir, "git", "github.com", "user", "repo");
+				const alias = join(tempDir, "agent-alias");
+				symlinkSync(agentDir, alias, "dir");
+				mkdirSync(dirname(target), { recursive: true });
+				const key = createHash("sha256")
+					.update(join(realpathSync(dirname(target)), "repo"))
+					.digest("hex");
+				const state = join(agentDir, "git", ".git-update-state", key);
+				const previous = `${state}.previous`;
+				mkdirSync(join(previous, "extensions"), { recursive: true });
+				writeFileSync(join(previous, "extensions", "worker.ts"), "export default function() {}\n");
+				settingsManager.setPackages([source]);
+				process.env.PI_OFFLINE = "1";
+				const aliasedManager = new DefaultPackageManager({ cwd: tempDir, agentDir: alias, settingsManager });
+				const release = lockfile.lockSync(state, { realpath: false });
+				let resolving: ReturnType<DefaultPackageManager["resolve"]>;
+				try {
+					resolving = aliasedManager.resolve();
+					await new Promise((resolve) => setTimeout(resolve, 50));
+					expect(existsSync(previous)).toBe(true);
+					expect(existsSync(target)).toBe(false);
+					rmSync(previous, { recursive: true });
+				} finally {
+					release();
+				}
+				expect((await resolving).extensions.some((entry) => entry.metadata.source === source)).toBe(false);
+				expect(existsSync(target)).toBe(false);
+			},
+		);
+
+		it("restores an interrupted Git package update during offline resolution", async () => {
+			const source = "git:github.com/user/repo";
+			const target = join(agentDir, "git", "github.com", "user", "repo");
+			mkdirSync(dirname(target), { recursive: true });
+			const key = createHash("sha256")
+				.update(join(realpathSync(dirname(target)), "repo"))
+				.digest("hex");
+			const previous = join(agentDir, "git", ".git-update-state", `${key}.previous`);
+			mkdirSync(dirname(previous), { recursive: true });
+			const extension = join(target, "extensions", "worker.ts");
+			mkdirSync(dirname(extension), { recursive: true });
+			writeFileSync(extension, "export default function() {}\n");
+			renameSync(target, previous);
+			settingsManager.setPackages([source]);
+			process.env.PI_OFFLINE = "1";
+
+			const resources = await packageManager.resolve();
+			expect(resources.extensions.some((entry) => entry.path === extension && entry.enabled)).toBe(true);
+			expect(readFileSync(extension, "utf8")).toContain("export default function");
+			expect(existsSync(previous)).toBe(false);
+		});
+
+		it.skipIf(process.platform === "win32")(
+			"reports a blocked Git recovery without dropping other packages",
+			async () => {
+				const failed = "git:github.com/user/repo";
+				const good = "git:github.com/user/other";
+				const target = join(agentDir, "git", "github.com", "user", "repo");
+				mkdirSync(dirname(target), { recursive: true });
+				const key = createHash("sha256")
+					.update(join(realpathSync(dirname(target)), "repo"))
+					.digest("hex");
+				const previous = join(agentDir, "git", ".git-update-state", `${key}.previous`);
+				const goodExtension = join(dirname(target), "other", "extensions", "worker.ts");
+				mkdirSync(previous, { recursive: true });
+				mkdirSync(dirname(goodExtension), { recursive: true });
+				writeFileSync(goodExtension, "export default function() {}\n");
+				symlinkSync(join(tempDir, "missing"), target);
+				settingsManager.setPackages([failed, good]);
+				process.env.PI_OFFLINE = "1";
+
+				const resources = await packageManager.resolve();
+				expect(resources.installFailures).toEqual([
+					{ source: failed, scope: "user", message: expect.stringContaining(previous) },
+				]);
+				expect(resources.extensions.some((entry) => entry.path === goodExtension && entry.enabled)).toBe(true);
+				expect(existsSync(previous)).toBe(true);
+			},
+		);
 
 		it("should disable peer installation through wrapped pnpm when updating git dependencies", async () => {
 			settingsManager = SettingsManager.inMemory({
@@ -1278,7 +1575,7 @@ Content`,
 				}
 				throw new Error(`Unexpected runCommandCapture args: ${args.join(" ")}`);
 			});
-			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockResolvedValue(undefined);
+			const runCommandSpy = mockGitCheckout(targetDir);
 
 			await packageManager.update(source);
 
@@ -1295,7 +1592,7 @@ Content`,
 					"--config.strict-peer-dependencies=false",
 					"--config.strict-dep-builds=false",
 				],
-				{ cwd: targetDir },
+				{ cwd: expect.stringContaining(".repo.pi-update-") },
 			);
 		});
 

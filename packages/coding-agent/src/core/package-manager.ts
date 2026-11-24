@@ -2,12 +2,16 @@ import type { ChildProcess, ChildProcessByStdio } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	cpSync,
 	existsSync,
 	globSync,
+	lstatSync,
 	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -37,6 +41,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { Readable } from "node:stream";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
+import lockfile from "proper-lockfile";
 import { gt, maxSatisfying, rcompare, satisfies, valid, validRange } from "semver";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import { spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
@@ -1501,7 +1506,14 @@ export class DefaultPackageManager implements PackageManager {
 
 			if (parsed.type === "git") {
 				const installedPath = this.getGitInstallPath(parsed, resolvedScope);
-				if (!existsSync(installedPath)) {
+				let present: boolean;
+				try {
+					present = await this.recoverGitCheckout(installedPath, resolvedScope);
+				} catch (error) {
+					installFailures.push({ source: resolvedSource, scope: resolvedScope, message: String(error) });
+					continue;
+				}
+				if (!present) {
 					const installed = await installMissing();
 					if (!installed) continue;
 				} else if (resolvedScope === "temporary" && !isOfflineModeEnabled()) {
@@ -2068,13 +2080,13 @@ export class DefaultPackageManager implements PackageManager {
 
 	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitInstallPath(source, scope);
-		if (existsSync(targetDir)) {
+		if (await this.recoverGitCheckout(targetDir, scope)) {
 			if (source.ref) {
-				await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
+				await this.ensureGitRef(targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
 				return;
 			}
 			const target = await this.getLocalGitUpdateTarget(targetDir);
-			await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+			await this.ensureGitRef(targetDir, scope, target.fetchArgs, target.ref);
 			return;
 		}
 		const gitRoot = this.getGitInstallRoot(scope);
@@ -2082,7 +2094,8 @@ export class DefaultPackageManager implements PackageManager {
 			this.ensureGitIgnore(gitRoot);
 		}
 		mkdirSync(dirname(targetDir), { recursive: true });
-		rmSync(this.getGitUpdateMarkerPath(targetDir), { force: true });
+		const markerPath = this.getGitUpdateMarkerPath(targetDir);
+		if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
 
 		try {
 			await this.runCommand("git", ["clone", source.repo, targetDir]);
@@ -2102,18 +2115,18 @@ export class DefaultPackageManager implements PackageManager {
 
 	private async updateGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitInstallPath(source, scope);
-		if (!existsSync(targetDir)) {
+		if (!(await this.recoverGitCheckout(targetDir, scope))) {
 			await this.installGit(source, scope);
 			return;
 		}
 
 		if (source.ref) {
-			await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
+			await this.ensureGitRef(targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
 			return;
 		}
 
 		const target = await this.getLocalGitUpdateTarget(targetDir);
-		await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+		await this.ensureGitRef(targetDir, scope, target.fetchArgs, target.ref);
 	}
 
 	private hasMissingGitDependencies(targetDir: string): boolean {
@@ -2141,44 +2154,37 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async repairMissingGitDependencies(targetDir: string): Promise<void> {
-		if (!this.hasMissingGitDependencies(targetDir)) return;
-		await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
-	}
-
 	private getGitUpdateMarkerPath(targetDir: string): string {
 		return join(dirname(targetDir), `.${basename(targetDir)}.pi-update-incomplete`);
 	}
 
-	private async cleanAndInstallGitDependencies(targetDir: string, markerPath: string): Promise<void> {
-		// Clean untracked files (extensions should be pristine). On Windows, files loaded by
-		// another process (e.g. a native module of this extension in another pi session) cannot
-		// be deleted, so git clean fails. Still install dependencies for the new commit, but keep
-		// the marker so the next update retries the clean.
-		let cleaned = true;
-		try {
-			await this.runCommand("git", ["clean", "-fdx"], { cwd: targetDir });
-		} catch (error) {
-			cleaned = false;
-			const reason = error instanceof Error ? error.message : String(error);
-			this.emitProgress({
-				type: "progress",
-				action: "update",
-				source: targetDir,
-				message: `Could not remove all untracked files in ${targetDir} (${reason}). Files may be in use by another pi session; close it and run the update again.`,
-			});
-		}
+	private getGitUpdateStatePath(targetDir: string, scope: SourceScope): string {
+		const packageRoot = this.getGitInstallRoot(scope);
+		const stateRoot = join(packageRoot ?? getExtensionTempFolder(this.agentDir), ".git-update-state");
+		const parent = dirname(targetDir);
+		const identity = join(existsSync(parent) ? realpathSync(parent) : parent, basename(targetDir));
+		return join(
+			stateRoot,
+			createHash("sha256")
+				.update(process.platform === "win32" ? identity.toLowerCase() : identity)
+				.digest("hex"),
+		);
+	}
 
-		const packageJsonPath = join(targetDir, "package.json");
-		if (existsSync(packageJsonPath)) {
-			await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
-		}
-		if (cleaned) {
-			rmSync(markerPath, { force: true });
+	private lockGitCheckout(state: string): () => void {
+		this.ensureGitIgnore(dirname(state));
+		return lockfile.lockSync(state, { realpath: false, lockfilePath: `${state}.lock` });
+	}
+
+	private assertSameGitCheckout(targetDir: string, installed: { dev: number; ino: number }): void {
+		const current = statSync(targetDir, { throwIfNoEntry: false });
+		if (current?.dev !== installed.dev || current.ino !== installed.ino) {
+			throw new Error(`Git package ${targetDir} changed during update; retry the update.`);
 		}
 	}
 
-	private async ensureGitRef(targetDir: string, fetchArgs: string[], ref: string): Promise<void> {
+	private async ensureGitRef(targetDir: string, scope: SourceScope, fetchArgs: string[], ref: string): Promise<void> {
+		const installed = statSync(targetDir);
 		// Fetch only the ref we will reset to, avoiding unrelated branch/tag noise.
 		await this.runCommand("git", fetchArgs, { cwd: targetDir });
 
@@ -2192,18 +2198,130 @@ export class DefaultPackageManager implements PackageManager {
 			timeoutMs: NETWORK_TIMEOUT_MS,
 		});
 		const markerPath = this.getGitUpdateMarkerPath(targetDir);
-		if (localHead.trim() === targetHead.trim()) {
-			if (existsSync(markerPath)) {
-				await this.cleanAndInstallGitDependencies(targetDir, markerPath);
-			} else {
-				await this.repairMissingGitDependencies(targetDir);
+		const interruptedLegacyUpdate = statSync(markerPath, { throwIfNoEntry: false })?.isFile();
+		const state = this.getGitUpdateStatePath(targetDir, scope);
+		if (localHead.trim() === targetHead.trim() && !interruptedLegacyUpdate) {
+			if (this.hasMissingGitDependencies(targetDir)) {
+				const release = this.lockGitCheckout(state);
+				try {
+					this.assertSameGitCheckout(targetDir, installed);
+					if (this.hasMissingGitDependencies(targetDir)) {
+						await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
+					}
+				} finally {
+					release();
+				}
 			}
 			return;
 		}
 
-		writeFileSync(markerPath, "", "utf-8");
-		await this.runCommand("git", ["reset", "--hard", commitRef], { cwd: targetDir });
-		await this.cleanAndInstallGitDependencies(targetDir, markerPath);
+		const gitDir = join(targetDir, ".git");
+		if (!lstatSync(gitDir, { throwIfNoEntry: false })?.isDirectory() || existsSync(join(gitDir, "commondir"))) {
+			throw new Error(`Cannot stage Git package ${targetDir}: its metadata must be in a standalone .git directory.`);
+		}
+		const stateDir = dirname(state);
+		this.ensureGitIgnore(stateDir);
+		const stateDevice = statSync(stateDir).dev;
+		if (stateDevice !== statSync(dirname(targetDir)).dev || installed.dev !== stateDevice) {
+			throw new Error(
+				`Cannot update Git package ${targetDir}: keep its checkout and recovery directory ${stateDir} on the same filesystem.`,
+			);
+		}
+
+		// Relative file: dependencies must resolve from the same parent as the installed checkout.
+		const staged = mkdtempSync(join(dirname(targetDir), `.${basename(targetDir)}.pi-update-`));
+		try {
+			// Keep the checkout's refs and configuration, but never copy its installed dependencies.
+			cpSync(gitDir, join(staged, ".git"), { recursive: true });
+			const config = join(staged, ".git", "config");
+			const originalConfig = existsSync(config) ? readFileSync(config) : undefined;
+			const worktreeConfig = join(staged, ".git", "config.worktree");
+			const originalWorktreeConfig = existsSync(worktreeConfig) ? readFileSync(worktreeConfig) : undefined;
+			if (originalWorktreeConfig) {
+				await this.runCommand("git", ["config", "--file", worktreeConfig, "core.worktree", staged], {
+					cwd: staged,
+				});
+			}
+			if (originalConfig) {
+				await this.runCommand("git", ["--git-dir=.git", "config", "--local", "core.worktree", staged], {
+					cwd: staged,
+				});
+			}
+			await this.runCommand("git", ["--git-dir=.git", "--work-tree=.", "reset", "--hard", targetHead.trim()], {
+				cwd: staged,
+			});
+			if (existsSync(join(staged, "package.json"))) {
+				await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: staged });
+			}
+			if (originalConfig) writeFileSync(config, originalConfig);
+			if (originalWorktreeConfig) writeFileSync(worktreeConfig, originalWorktreeConfig);
+
+			const release = this.lockGitCheckout(state);
+			try {
+				this.assertSameGitCheckout(targetDir, installed);
+				const previous = `${state}.previous`;
+				this.removeGitUpdateFiles(previous);
+				try {
+					renameSync(targetDir, previous);
+					renameSync(staged, targetDir);
+				} catch (error) {
+					this.restoreGitBackup(targetDir, previous);
+					throw new Error(`Could not replace Git package ${targetDir}; close processes using it and retry.`, {
+						cause: error,
+					});
+				}
+				this.removeGitUpdateFiles(previous);
+				if (interruptedLegacyUpdate) rmSync(markerPath, { force: true });
+			} finally {
+				release();
+			}
+		} finally {
+			this.removeGitUpdateFiles(staged);
+		}
+	}
+
+	private async recoverGitCheckout(targetDir: string, scope: SourceScope): Promise<boolean> {
+		if (existsSync(targetDir)) return true;
+		const state = this.getGitUpdateStatePath(targetDir, scope);
+		const previous = `${state}.previous`;
+		const lockfilePath = `${state}.lock`;
+		if (!existsSync(previous) && !existsSync(lockfilePath)) return existsSync(targetDir);
+		const release = await lockfile.lock(state, {
+			realpath: false,
+			lockfilePath,
+			retries: { retries: 5, minTimeout: 20 },
+		});
+		try {
+			this.restoreGitBackup(targetDir, previous);
+			return existsSync(targetDir);
+		} finally {
+			await release();
+		}
+	}
+
+	private restoreGitBackup(targetDir: string, previous: string): void {
+		if (existsSync(targetDir) || !existsSync(previous)) return;
+		try {
+			renameSync(previous, targetDir);
+		} catch (error) {
+			throw new Error(`Could not restore Git package ${targetDir}; previous checkout is at ${previous}.`, {
+				cause: error,
+			});
+		}
+	}
+
+	private removeGitUpdateFiles(path: string): void {
+		try {
+			rmSync(path, { recursive: true, force: true });
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			this.emitProgress({
+				type: "progress",
+				action: "update",
+				source: path,
+				message: `Could not remove temporary Git package files at ${path} (${reason}).`,
+			});
+		}
 	}
 
 	private async refreshTemporaryGitSource(source: GitSource, sourceStr: string, installedPath: string): Promise<void> {
@@ -2232,9 +2350,17 @@ export class DefaultPackageManager implements PackageManager {
 
 	private async removeGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitInstallPath(source, scope);
-		rmSync(targetDir, { recursive: true, force: true });
-		rmSync(this.getGitUpdateMarkerPath(targetDir), { force: true });
-		this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
+		const state = this.getGitUpdateStatePath(targetDir, scope);
+		const release = this.lockGitCheckout(state);
+		try {
+			rmSync(targetDir, { recursive: true, force: true });
+			const markerPath = this.getGitUpdateMarkerPath(targetDir);
+			if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
+			rmSync(`${state}.previous`, { recursive: true, force: true });
+			this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
+		} finally {
+			release();
+		}
 	}
 
 	private pruneEmptyGitParents(targetDir: string, installRoot: string | undefined): void {
@@ -2360,7 +2486,11 @@ export class DefaultPackageManager implements PackageManager {
 		if (!installRoot) {
 			throw new Error("Missing git install root");
 		}
-		return this.resolveManagedPath(installRoot, source.host, source.path);
+		const checkout = this.resolveManagedPath(installRoot, source.host, source.path);
+		if (relative(installRoot, checkout).split(sep)[0]?.toLowerCase() === ".git-update-state") {
+			throw new Error("Git package path overlaps Pi's reserved update state directory");
+		}
+		return checkout;
 	}
 
 	private getGitInstallRoot(scope: SourceScope): string | undefined {

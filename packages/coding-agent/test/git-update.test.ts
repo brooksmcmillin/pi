@@ -9,7 +9,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -161,10 +161,8 @@ describe("DefaultPackageManager git update", () => {
 				"git fetch --prune --no-tags origin +refs/heads/main:refs/remotes/origin/main",
 			);
 			expect(executedCommands).not.toContain("git fetch --prune origin");
-			expect(executedCommands).not.toContain("git reset --hard @{upstream}");
-			expect(executedCommands).not.toContain("git reset --hard origin/HEAD");
-			expect(executedCommands).not.toContain("git clean -fdx");
-			expect(executedCommands).not.toContain("npm install");
+			expect(executedCommands.some((command) => /^git .*\b(reset|clean)\b/.test(command))).toBe(false);
+			expect(executedCommands.some((command) => command.startsWith("npm install"))).toBe(false);
 		});
 
 		it("should update to latest commit when remote has new commits", async () => {
@@ -189,9 +187,24 @@ describe("DefaultPackageManager git update", () => {
 		});
 	});
 
-	describe("git clean failures", () => {
+	it("refuses to stage a checkout with a separate Git directory", async () => {
+		mkdirSync(remoteDir, { recursive: true });
+		initGitRepo(remoteDir);
+		const original = createCommit(remoteDir, "extension.ts", "// v1", "Initial commit");
+		mkdirSync(dirname(installedDir), { recursive: true });
+		const metadataDir = join(tempDir, "separate-metadata");
+		git(["clone", "--separate-git-dir", metadataDir, remoteDir, installedDir], tempDir);
+		settingsManager.setPackages([gitSource]);
+		createCommit(remoteDir, "extension.ts", "// v2", "Update");
+
+		await expect(packageManager.update()).rejects.toThrow("standalone .git directory");
+		expect(getCurrentCommit(installedDir)).toBe(original);
+		expect(getFileContent(installedDir, "extension.ts")).toBe("// v1");
+	});
+
+	describe("legacy interrupted updates", () => {
 		// https://github.com/earendil-works/pi/issues/11597
-		it("should install dependencies and retry the clean later when git clean fails", async () => {
+		it("rebuilds a checkout marked incomplete by an older Pi version", async () => {
 			setupRemoteAndInstall();
 			const newCommit = createCommit(
 				remoteDir,
@@ -200,44 +213,29 @@ describe("DefaultPackageManager git update", () => {
 				"Add package.json",
 			);
 
-			const executedCommands: string[] = [];
-			let failClean = true;
+			git(["pull", "--ff-only"], installedDir);
+			const installs: Array<string | undefined> = [];
 			const managerWithInternals = packageManager as unknown as {
 				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
 			};
 			managerWithInternals.runCommand = async (command, args, options) => {
 				const commandLine = `${command} ${args.join(" ")}`;
-				executedCommands.push(commandLine);
-				if (command === "npm") return;
-				if (commandLine === "git clean -fdx" && failClean) {
-					throw new Error("git clean -fdx failed with code 1");
+				if (command === "npm") {
+					installs.push(options?.cwd);
+					return;
 				}
 				const result = spawnSync(command, args, { cwd: options?.cwd, encoding: "utf-8" });
 				if (result.status !== 0) {
 					throw new Error(`Command failed: ${commandLine}\n${result.stderr}`);
 				}
 			};
-			const progressMessages: string[] = [];
-			packageManager.setProgressCallback((event) => {
-				if (event.type === "progress" && event.message) progressMessages.push(event.message);
-			});
-			const markerPath = join(agentDir, "git", "github.com", "test", ".extension.pi-update-incomplete");
+			const markerPath = join(dirname(installedDir), ".extension.pi-update-incomplete");
+			writeFileSync(markerPath, "");
 
 			await packageManager.update();
 
 			expect(getCurrentCommit(installedDir)).toBe(newCommit);
-			expect(executedCommands).toContain("git clean -fdx");
-			expect(executedCommands.some((command) => command.startsWith("npm install"))).toBe(true);
-			expect(progressMessages.some((message) => message.includes("Could not remove all untracked files"))).toBe(
-				true,
-			);
-			expect(existsSync(markerPath)).toBe(true);
-
-			failClean = false;
-			executedCommands.length = 0;
-			await packageManager.update();
-
-			expect(executedCommands).toContain("git clean -fdx");
+			expect(installs).toEqual([expect.stringContaining(".extension.pi-update-")]);
 			expect(existsSync(markerPath)).toBe(false);
 		});
 	});
@@ -303,43 +301,23 @@ describe("DefaultPackageManager git update", () => {
 			const cachedDir = managerWithPaths.getGitInstallPath(managerWithPaths.parseSource(gitSource), "temporary");
 			const extensionFile = join(cachedDir, "pi-extensions", "session-breakdown.ts");
 
-			rmSync(cachedDir, { recursive: true, force: true });
-			mkdirSync(join(cachedDir, "pi-extensions"), { recursive: true });
+			mkdirSync(join(remoteDir, "pi-extensions"), { recursive: true });
+			initGitRepo(remoteDir);
 			writeFileSync(
-				join(cachedDir, "package.json"),
+				join(remoteDir, "package.json"),
 				JSON.stringify({ pi: { extensions: ["./pi-extensions"] } }, null, 2),
 			);
-			writeFileSync(extensionFile, "// stale");
+			git(["add", "package.json"], remoteDir);
+			createCommit(remoteDir, "pi-extensions/session-breakdown.ts", "// stale", "Initial package");
+			mkdirSync(dirname(cachedDir), { recursive: true });
+			git(["clone", remoteDir, cachedDir], tempDir);
+			const newCommit = createCommit(remoteDir, "pi-extensions/session-breakdown.ts", "// fresh", "Update package");
+			settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
 
-			const executedCommands: string[] = [];
-			const managerWithInternals = packageManager as unknown as {
-				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
-				runCommandCapture: (command: string, args: string[], options?: { cwd?: string }) => Promise<string>;
-			};
-			managerWithInternals.runCommand = async (command, args) => {
-				executedCommands.push(`${command} ${args.join(" ")}`);
-				if (command === "git" && args[0] === "reset") {
-					writeFileSync(extensionFile, "// fresh");
-				}
-			};
-			managerWithInternals.runCommandCapture = async (_command, args) => {
-				if (args[0] === "rev-parse" && args[1] === "HEAD") {
-					return "local-head";
-				}
-				if (args[0] === "rev-parse" && args[1] === "@{upstream}") {
-					return "remote-head";
-				}
-				if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") {
-					return "origin/main";
-				}
-				return "";
-			};
+			const resources = await packageManager.resolveExtensionSources([gitSource], { temporary: true });
 
-			await packageManager.resolveExtensionSources([gitSource], { temporary: true });
-
-			expect(executedCommands).toContain(
-				"git fetch --prune --no-tags origin +refs/heads/main:refs/remotes/origin/main",
-			);
+			expect(resources.extensions.some((entry) => entry.path === extensionFile)).toBe(true);
+			expect(getCurrentCommit(cachedDir)).toBe(newCommit);
 			expect(getFileContent(cachedDir, "pi-extensions/session-breakdown.ts")).toBe("// fresh");
 		});
 	});
