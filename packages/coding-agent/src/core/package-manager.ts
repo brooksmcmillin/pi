@@ -875,12 +875,24 @@ function matchesPackagePath(
 	logicalRoot: string,
 	matcher: typeof matchesAnyPattern,
 ): boolean {
-	return (
-		matcher(file, rules, baseDir) ||
-		(logicalRoot !== baseDir &&
-			isPathInside(baseDir, file) &&
-			matcher(join(logicalRoot, relative(baseDir, file)), rules, logicalRoot))
-	);
+	if (matcher(file, rules, baseDir)) return true;
+	if (logicalRoot === baseDir || !isPathInside(baseDir, file)) return false;
+	const suffix = relative(baseDir, file);
+	if (matcher(join(logicalRoot, suffix), rules, logicalRoot)) return true;
+
+	// A saved absolute filter can name an earlier revision of this same package.
+	const revisionPrefix = basename(baseDir).slice(0, -6);
+	const parent = `${toPosixPath(dirname(baseDir))}/`;
+	return rules.some((rule) => {
+		const normalized = toPosixPath(normalizePath(rule));
+		if (!normalized.startsWith(parent)) return false;
+		const revision = normalized.slice(parent.length).split("/", 1)[0];
+		if (!revision?.startsWith(revisionPrefix) || !/^[a-zA-Z0-9]{6}$/.test(revision.slice(revisionPrefix.length))) {
+			return false;
+		}
+		const historicalRoot = join(dirname(baseDir), revision);
+		return matcher(join(historicalRoot, suffix), [rule], historicalRoot);
+	});
 }
 
 function applyAutoloadDisabledPatterns(

@@ -258,7 +258,7 @@ describe("DefaultPackageManager git update", () => {
 
 			await packageManager.update();
 
-			const active = selected();
+			let active = selected();
 			expect(active).not.toBe(installedDir);
 			if (kind === "active exact" || kind === "active delta") {
 				const reported = packageManager.listConfiguredPackages()[0]?.installedPath;
@@ -273,6 +273,10 @@ describe("DefaultPackageManager git update", () => {
 						],
 					},
 				]);
+				createCommit(remoteDir, "extension.ts", "// v3", "Advance revision without changing extensions");
+				await packageManager.update();
+				active = selected();
+				expect(active).not.toBe(reported);
 			}
 			const { extensions } = await packageManager.resolve();
 			expect(extensions.find((entry) => entry.path === join(active, "extensions", "excluded.ts"))?.enabled).toBe(
