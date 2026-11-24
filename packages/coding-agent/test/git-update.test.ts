@@ -1473,57 +1473,74 @@ describe("DefaultPackageManager git update", () => {
 	});
 
 	describe("temporary git sources", () => {
-		it.each([false, true])("refreshes cached temporary Git aliases (local first: %s)", async (localFirst) => {
-			const managerWithPaths = packageManager as unknown as PackageManagerPathInternals;
-			const cachedDir = managerWithPaths.getGitInstallPath(managerWithPaths.parseSource(gitSource), "temporary");
+		it.each(["git first", "local first", "configured"])(
+			"pins refreshed temporary Git aliases across trust (%s)",
+			async (kind) => {
+				const managerWithPaths = packageManager as unknown as PackageManagerPathInternals;
+				const cachedDir = managerWithPaths.getGitInstallPath(managerWithPaths.parseSource(gitSource), "temporary");
 
-			mkdirSync(join(remoteDir, "pi-extensions"), { recursive: true });
-			initGitRepo(remoteDir);
-			writeFileSync(
-				join(remoteDir, "package.json"),
-				JSON.stringify({ pi: { extensions: ["./pi-extensions"] } }, null, 2),
-			);
-			git(["add", "package.json"], remoteDir);
-			const marker = join(tempDir, "temporary-initializations");
-			const extension = (value: string) =>
-				`import { appendFileSync } from "node:fs"; export default function() { appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
-			createCommit(remoteDir, "pi-extensions/session-breakdown.ts", extension("stale\n"), "Initial package");
-			mkdirSync(dirname(cachedDir), { recursive: true });
-			git(["clone", remoteDir, cachedDir], tempDir);
-			const newCommit = createCommit(
-				remoteDir,
-				"pi-extensions/session-breakdown.ts",
-				extension("fresh\n"),
-				"Update package",
-			);
-			settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
+				mkdirSync(join(remoteDir, "pi-extensions"), { recursive: true });
+				initGitRepo(remoteDir);
+				writeFileSync(
+					join(remoteDir, "package.json"),
+					JSON.stringify({ pi: { extensions: ["./pi-extensions"] } }, null, 2),
+				);
+				git(["add", "package.json"], remoteDir);
+				const marker = join(tempDir, "temporary-initializations");
+				const extension = (value: string) =>
+					`import { appendFileSync } from "node:fs"; export default function() { appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
+				createCommit(remoteDir, "pi-extensions/session-breakdown.ts", extension("stale\n"), "Initial package");
+				mkdirSync(dirname(cachedDir), { recursive: true });
+				git(["clone", remoteDir, cachedDir], tempDir);
+				const newCommit = createCommit(
+					remoteDir,
+					"pi-extensions/session-breakdown.ts",
+					extension("fresh\n"),
+					"Update package",
+				);
+				settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
 
-			const cachedFile = join(cachedDir, "pi-extensions", "session-breakdown.ts");
-			await settingsManager.flush();
-			const loader = new DefaultResourceLoader({
-				cwd: tempDir,
-				agentDir,
-				settingsManager,
-				additionalExtensionPaths: localFirst ? [cachedFile, gitSource] : [gitSource, cachedFile],
-			});
-			await loader.reload({
-				resolveProjectTrust: async ({ extensionsResult }) => {
-					const active = selected(gitSource, "temporary");
-					expect(extensionsResult.errors).toEqual([]);
-					expect(extensionsResult.extensions.map(({ path }) => path)).toEqual([
-						join(active, "pi-extensions", "session-breakdown.ts"),
-					]);
-					expect(readFileSync(marker, "utf8")).toBe("fresh\n");
-					return false;
-				},
-			});
-			const active = selected(gitSource, "temporary");
-			expect(getCurrentCommit(active)).toBe(newCommit);
-			expect(loader.getExtensions().errors).toEqual([]);
-			expect(loader.getExtensions().extensions.map(({ path }) => path)).toEqual([
-				join(active, "pi-extensions", "session-breakdown.ts"),
-			]);
-			expect(readFileSync(marker, "utf8")).toBe("fresh\n");
-		});
+				const relativeFile = "pi-extensions/session-breakdown.ts";
+				const cachedFile = join(cachedDir, relativeFile);
+				if (kind === "configured") settingsManager.setExtensionPaths([cachedFile]);
+				await settingsManager.flush();
+				const loader = new DefaultResourceLoader({
+					cwd: tempDir,
+					agentDir,
+					settingsManager,
+					additionalExtensionPaths:
+						kind === "configured"
+							? [gitSource]
+							: kind === "local first"
+								? [cachedFile, gitSource]
+								: [gitSource, cachedFile],
+				});
+				await loader.reload({
+					resolveProjectTrust: async ({ extensionsResult }) => {
+						const active = selected(gitSource, "temporary");
+						expect(extensionsResult.errors).toEqual([]);
+						expect(extensionsResult.extensions.map(({ path }) => path)).toEqual([
+							join(active, "pi-extensions", "session-breakdown.ts"),
+						]);
+						expect(readFileSync(marker, "utf8")).toBe("fresh\n");
+						createCommit(remoteDir, relativeFile, extension("newer\n"), "Advance during trust prompt");
+						return false;
+					},
+				});
+				const active = selected(gitSource, "temporary");
+				expect(getCurrentCommit(active)).toBe(newCommit);
+				expect(loader.getExtensions().errors).toEqual([]);
+				expect(loader.getExtensions().extensions.map(({ path }) => path)).toEqual([
+					join(active, "pi-extensions", "session-breakdown.ts"),
+				]);
+				expect(readFileSync(marker, "utf8")).toBe("fresh\n");
+				await loader.reload();
+				const next = selected(gitSource, "temporary");
+				expect(next).not.toBe(active);
+				expect(loader.getExtensions().errors).toEqual([]);
+				expect(loader.getExtensions().extensions.map(({ path }) => path)).toEqual([join(next, relativeFile)]);
+				expect(readFileSync(marker, "utf8")).toBe("fresh\nnewer\n");
+			},
+		);
 	});
 });

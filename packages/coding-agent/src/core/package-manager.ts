@@ -98,6 +98,12 @@ export interface ResolvedResource {
 	metadata: PathMetadata;
 }
 
+export interface TemporaryGitSelection {
+	checkouts: ReadonlyMap<string, string>;
+	gitRevisions: ReadonlyMap<string, string>;
+	installFailures: PackageInstallFailure[];
+}
+
 export interface ResolvedPaths {
 	/** Checkout selection shared with explicit extension sources in the same load. */
 	gitRevisions?: ReadonlyMap<string, string>;
@@ -1156,8 +1162,12 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	async resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
+	async resolve(
+		onMissing?: (source: string) => Promise<MissingSourceAction>,
+		temporaryGit?: TemporaryGitSelection,
+	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
+		accumulator.gitRevisions = new Map(temporaryGit?.gitRevisions);
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 
@@ -1252,9 +1262,29 @@ export class DefaultPackageManager implements PackageManager {
 		return { ...this.toResolvedPaths(accumulator), installFailures, gitRevisions: accumulator.gitRevisions };
 	}
 
+	async prepareTemporaryGitSources(sources: string[]): Promise<TemporaryGitSelection> {
+		const accumulator = this.createAccumulator();
+		const checkouts = new Map<string, string>();
+		const gitSources = sources.filter((source) => this.parseSource(source).type === "git");
+		const installFailures = await this.resolvePackageSources(
+			gitSources.map((pkg) => ({ pkg, scope: "temporary" })),
+			accumulator,
+			undefined,
+			undefined,
+			undefined,
+			{ checkouts, preparing: true },
+		);
+		return { checkouts, gitRevisions: accumulator.gitRevisions, installFailures };
+	}
+
 	async resolveExtensionSources(
 		sources: string[],
-		options?: { local?: boolean; temporary?: boolean; gitRevisions?: ReadonlyMap<string, string> },
+		options?: {
+			local?: boolean;
+			temporary?: boolean;
+			gitRevisions?: ReadonlyMap<string, string>;
+			temporaryGit?: TemporaryGitSelection;
+		},
 	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
 		accumulator.gitRevisions = new Map(options?.gitRevisions);
@@ -1273,8 +1303,13 @@ export class DefaultPackageManager implements PackageManager {
 			undefined,
 			undefined,
 			missingLocalPaths,
+			options?.temporaryGit ? { checkouts: new Map(options.temporaryGit.checkouts), preparing: false } : undefined,
 		);
-		return { ...this.toResolvedPaths(accumulator), installFailures, missingLocalPaths };
+		return {
+			...this.toResolvedPaths(accumulator),
+			installFailures: [...(options?.temporaryGit?.installFailures ?? []), ...installFailures],
+			missingLocalPaths,
+		};
 	}
 
 	listConfiguredPackages(): ConfiguredPackage[] {
@@ -1631,14 +1666,16 @@ export class DefaultPackageManager implements PackageManager {
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
 		checkoutSnapshot?: ReadonlyMap<string, string>,
 		missingLocalPaths?: string[],
+		temporarySelection?: { checkouts: Map<string, string>; preparing: boolean },
 	): Promise<PackageInstallFailure[]> {
 		const installFailures: PackageInstallFailure[] = [];
 		const temporaryCollections: Array<() => void> = [];
-		const temporaryCheckouts = new Map<string, string>();
+		const temporaryCheckouts = temporarySelection?.checkouts ?? new Map<string, string>();
 		// Finish temporary Git selection before collecting resources, but retain CLI precedence.
 		const collect = (scope: SourceScope, resources: () => void) => {
-			if (scope === "temporary") temporaryCollections.push(resources);
-			else resources();
+			if (scope === "temporary") {
+				if (!temporarySelection?.preparing) temporaryCollections.push(resources);
+			} else resources();
 		};
 		for (const { pkg, scope } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
@@ -1724,6 +1761,7 @@ export class DefaultPackageManager implements PackageManager {
 						);
 						continue;
 					}
+					if (resolvedScope === "temporary" && temporarySelection?.preparing === false) continue;
 					const recovered = await this.recoverGitCheckout(logical, resolvedScope);
 					present = recovered !== undefined;
 					installedPath = recovered ?? "";
