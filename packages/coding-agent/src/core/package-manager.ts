@@ -1130,9 +1130,10 @@ function applyAutoloadDisabledPatterns(
 	baseDir: string,
 	logicalRoot = baseDir,
 	aliases?: ReadonlyMap<string, Set<string>>,
+	filesBySpelling?: ReadonlyMap<string, string>,
 ): Map<string, { enabled: boolean; alias?: string }> {
-	const states = new Map<string, Map<string | undefined, boolean>>();
-	for (const pattern of patterns) {
+	const states = new Map<string, Map<string | undefined, { enabled: boolean; firstRule: number }>>();
+	for (const [ruleIndex, pattern] of patterns.entries()) {
 		const target = pattern.slice(
 			pattern.startsWith("+") || pattern.startsWith("-") || pattern.startsWith("!") ? 1 : 0,
 		);
@@ -1148,20 +1149,23 @@ function applyAutoloadDisabledPatterns(
 				matched = spellings.length ? spellings : [undefined];
 			}
 			if (!matched.length) continue;
-			const declarations = states.get(filePath) ?? new Map<string | undefined, boolean>();
-			for (const alias of matched) declarations.set(alias, enabled);
+			const declarations = states.get(filePath) ?? new Map();
+			for (const alias of matched)
+				declarations.set(alias, { enabled, firstRule: declarations.get(alias)?.firstRule ?? ruleIndex });
 			states.set(filePath, declarations);
 		}
 	}
-	const result = new Map<string, { enabled: boolean; alias?: string }>();
-	for (const [filePath, declarations] of states) {
+	const order = new Map([...(filesBySpelling?.keys() ?? [])].map((spelling, index) => [spelling, index]));
+	const rows = [...states].map(([filePath, declarations]) => {
 		const ordered = [...(aliases?.get(filePath) ?? [undefined])];
-		const winner = ordered.find((alias) => declarations.get(alias) === true);
-		if (winner !== undefined || declarations.get(undefined) === true)
-			result.set(filePath, { enabled: true, alias: winner });
-		else result.set(filePath, { enabled: false, alias: ordered.find((alias) => declarations.has(alias)) });
-	}
-	return result;
+		const alias =
+			ordered.find((spelling) => declarations.get(spelling)?.enabled) ??
+			ordered.find((spelling) => declarations.has(spelling));
+		const state = declarations.get(alias)!;
+		return { filePath, alias, ...state, rank: order.get(alias ?? filePath) ?? Number.MAX_SAFE_INTEGER };
+	});
+	rows.sort((a, b) => a.firstRule - b.firstRule || a.rank - b.rank);
+	return new Map(rows.map(({ filePath, alias, enabled }) => [filePath, { alias, enabled }]));
 }
 
 class GitRevisionPointerError extends Error {}
@@ -3225,8 +3229,20 @@ export class DefaultPackageManager implements PackageManager {
 			return;
 		}
 
-		const { allFiles, aliases } = this.collectManifestFiles(packageRoot, resourceType, manifest, selectPath);
-		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot, filterRoot, aliases);
+		const { allFiles, aliases, filesBySpelling } = this.collectManifestFiles(
+			packageRoot,
+			resourceType,
+			manifest,
+			selectPath,
+		);
+		const enabledByUser = applyAutoloadDisabledPatterns(
+			allFiles,
+			userPatterns,
+			packageRoot,
+			filterRoot,
+			aliases,
+			filesBySpelling,
+		);
 		for (const [filePath, { enabled, alias }] of enabledByUser) {
 			const spellings = aliases?.get(filePath);
 			const ordered = alias === undefined ? spellings : new Set([alias, ...(spellings ?? [])]);
@@ -3387,7 +3403,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Collect all files from plain entries (non-pattern entries)
 		const { plain, patterns } = splitPatterns(entries);
-		const { allFiles, aliases } = this.collectSelectedPackagePaths(
+		const { allFiles, aliases, filesBySpelling } = this.collectSelectedPackagePaths(
 			plain.map((entry) => this.resolvePathFromBase(entry, baseDir)),
 			resourceType,
 			(path) => this.redirectGitResource(path, gitRevisions),
@@ -3396,7 +3412,8 @@ export class DefaultPackageManager implements PackageManager {
 		// pi config saves exact paths relative to the settings directory. Resolve them through
 		// the same revision mapping as declarations, even if they name a different revision.
 		const rules = this.redirectGitExactRules(patterns, baseDir, gitRevisions, aliases);
-		for (const f of allFiles) {
+		const order = new Map([...filesBySpelling.keys()].map((spelling, index) => [spelling, index]));
+		const rows = allFiles.map((f) => {
 			const spellings = aliases.get(f);
 			const revision = this.withGitRevision(metadata, f, gitRevisions).gitRevision;
 			const matches = (alias?: Set<string>) => {
@@ -3424,13 +3441,15 @@ export class DefaultPackageManager implements PackageManager {
 				);
 				if (independent) declaration = { aliases: new Set([independent]), enabled: true };
 			}
-			this.addResource(
-				target,
+			return {
 				f,
-				this.withGitRevision(metadata, f, gitRevisions, declaration.aliases, spellings),
-				declaration.enabled,
-			);
-		}
+				metadata: this.withGitRevision(metadata, f, gitRevisions, declaration.aliases, spellings),
+				enabled: declaration.enabled,
+				rank: order.get(declaration.aliases?.values().next().value ?? f) ?? Number.MAX_SAFE_INTEGER,
+			};
+		});
+		rows.sort((a, b) => a.rank - b.rank);
+		for (const row of rows) this.addResource(target, row.f, row.metadata, row.enabled);
 	}
 
 	private getDeclarationRules(

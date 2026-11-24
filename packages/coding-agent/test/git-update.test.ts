@@ -2265,7 +2265,9 @@ describe("DefaultPackageManager git update", () => {
 		]);
 	});
 
-	it.skipIf(process.platform === "win32").each(["force-include", "manifest-exclusion", "settings-exclusion"])(
+	it
+		.skipIf(process.platform === "win32")
+		.each(["force-include", "manifest-exclusion", "settings-exclusion", "delta-exclusion", "top-level-exclusion"])(
 		"keeps the same prompt winner with interleaved Git aliases (%s)",
 		async (mode) => {
 			setupRemoteAndInstall();
@@ -2285,7 +2287,7 @@ describe("DefaultPackageManager git update", () => {
 							"a/first.md",
 							"b/review.md",
 							"c/review.md",
-							...(mode === "settings-exclusion" ? [] : ["!a/first.md"]),
+							...(mode === "manifest-exclusion" || mode === "force-include" ? ["!a/first.md"] : []),
 							...(mode === "force-include" ? ["+a/first.md"] : []),
 						],
 					},
@@ -2293,10 +2295,24 @@ describe("DefaultPackageManager git update", () => {
 				"Declare filtered prompts",
 			);
 			git(["pull", "--ff-only"], installedDir);
-			if (mode !== "manifest-exclusion")
-				settingsManager.setPackages([
-					{ source: gitSource, prompts: ["**/*.md", ...(mode === "settings-exclusion" ? ["-a/first.md"] : [])] },
+			if (mode === "top-level-exclusion") {
+				settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+				settingsManager.setPromptTemplatePaths([
+					...["a/first.md", "b/review.md", "c/review.md"].map((path) => join(installedDir, path)),
+					`-${join(installedDir, "a/first.md")}`,
 				]);
+			} else if (mode !== "manifest-exclusion") {
+				settingsManager.setPackages([
+					{
+						source: gitSource,
+						autoload: mode !== "delta-exclusion",
+						prompts: [
+							"**/*.md",
+							...(mode === "settings-exclusion" || mode === "delta-exclusion" ? ["-a/first.md"] : []),
+						],
+					},
+				]);
+			}
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			const verifyWinner = async (checkout: string) => {
 				await loader.reload();
