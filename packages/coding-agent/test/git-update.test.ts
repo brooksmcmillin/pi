@@ -1848,7 +1848,7 @@ describe("DefaultPackageManager git update", () => {
 		expect(readFileSync(join(installedDir, target), "utf8")).toBe("Retained review");
 	});
 
-	it.skipIf(process.platform === "win32").each(["manifest", "settings", "settings-exact"])(
+	it.skipIf(process.platform === "win32").each(["manifest", "settings", "settings-exact", "external-exact"])(
 		"does not discover a hidden prompt target independently of its excluded directory alias (%s)",
 		async (source) => {
 			setupRemoteAndInstall();
@@ -1866,13 +1866,14 @@ describe("DefaultPackageManager git update", () => {
 			git(["pull", "--ff-only"], installedDir);
 			const declaredRoot = join(installedDir, "prompts");
 			const hiddenTarget = join(declaredRoot, ".hidden", "note.md");
+			const external = source === "external-exact";
+			const exact = external || source === "settings-exact";
+			const declared = external ? join(tempDir, "shortcut.md") : declaredRoot;
+			if (external) symlinkSync(hiddenTarget, declared);
+			const glob = external ? `!${declared}` : `!${relative(agentDir, declaredRoot)}/**/note.md`;
 			if (source !== "manifest") {
 				settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-				settingsManager.setPromptTemplatePaths([
-					declaredRoot,
-					`!${relative(agentDir, declaredRoot)}/**/note.md`,
-					...(source === "settings-exact" ? [`+${hiddenTarget}`] : []),
-				]);
+				settingsManager.setPromptTemplatePaths([declared, glob, ...(exact ? [`+${hiddenTarget}`] : [])]);
 			}
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await loader.reload();
@@ -1882,14 +1883,42 @@ describe("DefaultPackageManager git update", () => {
 			await loader.reload();
 			expect(loader.getPrompts().prompts).toEqual([]);
 			if (source !== "manifest") {
-				settingsManager.setPromptTemplatePaths([
-					declaredRoot,
-					...(source === "settings-exact" ? [`-${hiddenTarget}`] : []),
-				]);
+				settingsManager.setPromptTemplatePaths([declared, ...(exact ? [`-${hiddenTarget}`] : [])]);
 				await loader.reload();
 				expect(loader.getPrompts().prompts.map(({ content }) => content)).toEqual(["Selected note"]);
 				const [prompt] = (await packageManager.resolve()).prompts;
-				expect(prompt?.metadata.gitRevision?.declarations).toEqual([join(declaredRoot, "shortcut", "note.md")]);
+				expect(prompt?.metadata.gitRevision?.declarations).toEqual([
+					external ? declared : join(declaredRoot, "shortcut", "note.md"),
+				]);
+				if (source === "settings") {
+					const toggle = async () => {
+						const resolved = await packageManager.resolve();
+						const row = { ...resolved.prompts[0]!, resourceType: "prompts" as const };
+						const noop = () => {};
+						const selector = new ConfigSelectorComponent(
+							{ global: resolved, project: resolved },
+							settingsManager,
+							tempDir,
+							agentDir,
+							noop,
+							noop,
+							noop,
+						);
+						return (
+							selector.getResourceList() as unknown as { toggleResource(item: typeof row): boolean }
+						).toggleResource(row);
+					};
+					expect(await toggle()).toBe(false);
+					await loader.reload();
+					expect(loader.getPrompts().prompts).toEqual([]);
+					createCommit(remoteDir, "prompts/.hidden/note.md", "Next note", "Advance selected note");
+					await packageManager.update();
+					await loader.reload();
+					expect(loader.getPrompts().prompts).toEqual([]);
+					expect(await toggle()).toBe(true);
+					await loader.reload();
+					expect(loader.getPrompts().prompts.map(({ content }) => content)).toEqual(["Next note"]);
+				}
 				return;
 			}
 			createCommit(

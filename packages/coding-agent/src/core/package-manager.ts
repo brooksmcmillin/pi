@@ -1021,6 +1021,27 @@ export function redirectGitRevisionPath(
 	return undefined;
 }
 
+export function selectGitDeclarationPath(
+	path: string,
+	{ logical, active }: NonNullable<PathMetadata["gitRevision"]>,
+): string {
+	const direct = redirectGitRevisionPath(path, logical, active, true);
+	if (direct !== undefined) return direct;
+	// Resolve checkout-root aliases without following links to individual resources.
+	const canonicalRoot = canonicalizePath(logical);
+	let selected = path;
+	for (let parent = dirname(path); ; parent = dirname(parent)) {
+		const canonical = canonicalizePath(parent);
+		const root = redirectGitRevisionPath(canonical, canonicalRoot, active, true);
+		if (root === active) selected = join(active, relative(parent, path));
+		else if (isPathInside(canonical, canonicalRoot)) {
+			selected =
+				redirectGitRevisionPath(join(canonical, relative(parent, path)), canonicalRoot, active, true) ?? selected;
+		}
+		if (dirname(parent) === parent) return selected;
+	}
+}
+
 export function matchesPackageAliasExactRule(aliases: readonly string[], rule: string, baseDir: string): boolean {
 	return aliases.some((alias) => matchesAnyExactPattern(alias, [rule], baseDir));
 }
@@ -3362,12 +3383,7 @@ export class DefaultPackageManager implements PackageManager {
 				if (!alias || !revision)
 					return applyPatterns([f], rules, baseDir, baseDir, alias ? new Map([[f, alias]]) : undefined).has(f);
 				const spelling = alias.values().next().value!;
-				const { logical, active } = revision;
-				// Match historical exact paths without following links below the checkout boundary.
-				const selectSpelling = (path: string) =>
-					redirectGitRevisionPath(path, logical, active, true) ??
-					redirectGitRevisionPath(path, logical, active) ??
-					path;
+				const selectSpelling = (path: string) => selectGitDeclarationPath(path, revision);
 				const candidateRules = patterns.flatMap((pattern) => {
 					if (!pattern.startsWith("+") && !pattern.startsWith("-")) {
 						return this.redirectGitExactRules([pattern], baseDir, gitRevisions, aliases);

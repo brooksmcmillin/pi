@@ -22,6 +22,7 @@ import {
 	type ResolvedPaths,
 	type ResolvedResource,
 	redirectGitRevisionPath,
+	selectGitDeclarationPath,
 } from "../../../core/package-manager.ts";
 import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
 import { BUILTIN_PATH_PREFIX, getResourcePathKey } from "../../../core/source-info.ts";
@@ -836,11 +837,20 @@ class ResourceList implements Component, Focusable {
 		const revision = item.metadata.gitRevision;
 		if (!revision) return false;
 		const path = resolvePath(target, this.getTopLevelBaseDir(scope), { trim: true });
+		if (matchSkillDirectory && revision.declarations?.length) {
+			const normalized = selectGitDeclarationPath(path, revision);
+			return revision.declarations.some((declaration) => {
+				const selected = selectGitDeclarationPath(declaration, revision);
+				return (
+					selected === normalized ||
+					(item.resourceType === "skills" && basename(selected) === "SKILL.md" && dirname(selected) === normalized)
+				);
+			});
+		}
 		const selected = redirectGitRevisionPath(path, revision.logical, revision.active);
 		return (
 			selected === item.path ||
 			revision.aliases?.includes(path) === true ||
-			(matchSkillDirectory && revision.declarations?.includes(path) === true) ||
 			(matchSkillDirectory &&
 				item.resourceType === "skills" &&
 				basename(item.path) === "SKILL.md" &&
@@ -870,7 +880,7 @@ class ResourceList implements Component, Focusable {
 		const sourceScope = this.getItemScope(item);
 		if (scope !== sourceScope || item.metadata.source === "builtin") return item.path;
 		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(sourceScope);
-		return relative(baseDir, item.path);
+		return relative(baseDir, this.getTopLevelRulePath(item));
 	}
 
 	private createPackageOverrideSource(item: ResourceItem): PackageSource {
@@ -928,7 +938,20 @@ class ResourceList implements Component, Focusable {
 		if (item.metadata.source === "builtin") return item.path;
 		const scope = item.metadata.scope as "user" | "project";
 		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(scope);
-		return relative(baseDir, item.path);
+		return relative(baseDir, this.getTopLevelRulePath(item));
+	}
+
+	private getTopLevelRulePath(item: ResourceItem): string {
+		const revision = item.metadata.gitRevision;
+		const declaration = revision?.aliases?.[0];
+		if (
+			revision?.declarations?.length === 1 &&
+			declaration &&
+			selectGitDeclarationPath(declaration, revision) !== item.path
+		) {
+			return declaration;
+		}
+		return item.path;
 	}
 
 	private getPackageResourcePatterns(item: ResourceItem, preferred: string): Set<string> {
