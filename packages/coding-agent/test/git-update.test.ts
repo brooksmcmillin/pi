@@ -1492,6 +1492,7 @@ describe("DefaultPackageManager git update", () => {
 		{ excluded: false, configured: false },
 		{ excluded: true, configured: false },
 		{ excluded: true, configured: true },
+		{ excluded: true, configured: "parent" },
 	])(
 		"keeps the prompt alias name while loading selected content ($excluded/$configured)",
 		async ({ excluded, configured }) => {
@@ -1499,16 +1500,22 @@ describe("DefaultPackageManager git update", () => {
 			mkdirSync(join(remoteDir, "prompts"));
 			createCommit(remoteDir, "prompts/review.md", "Old review", "Add review prompt");
 			git(["pull", "--ff-only"], installedDir);
-			const alias = join(configured ? tempDir : join(agentDir, "prompts"), "quick.md");
-			mkdirSync(dirname(alias), { recursive: true });
-			symlinkSync(join(installedDir, "prompts", "review.md"), alias);
+			const name = configured === "parent" ? "review" : "quick";
+			const alias =
+				configured === "parent"
+					? join(tempDir, "linked-prompts", "review.md")
+					: join(configured ? tempDir : join(agentDir, "prompts"), "quick.md");
+			if (configured === "parent") {
+				symlinkSync(join(installedDir, "prompts"), dirname(alias), "dir");
+			} else {
+				mkdirSync(dirname(alias), { recursive: true });
+				symlinkSync(join(installedDir, "prompts", "review.md"), alias);
+			}
 			if (configured) settingsManager.setPromptTemplatePaths([alias]);
 			if (excluded) settingsManager.setPackages([{ source: gitSource, prompts: [] }]);
 			const before = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await before.reload();
-			expect(before.getPrompts().prompts).toEqual([
-				expect.objectContaining({ name: "quick", content: "Old review" }),
-			]);
+			expect(before.getPrompts().prompts).toEqual([expect.objectContaining({ name, content: "Old review" })]);
 			createCommit(remoteDir, "prompts/review.md", "Selected review", "Update review prompt");
 			await packageManager.update();
 			await settingsManager.flush();
@@ -1516,7 +1523,7 @@ describe("DefaultPackageManager git update", () => {
 			await loader.reload();
 			expect(loader.getPrompts().prompts).toEqual([
 				expect.objectContaining({
-					name: "quick",
+					name,
 					content: "Selected review",
 					filePath: join(selected(), "prompts", "review.md"),
 				}),

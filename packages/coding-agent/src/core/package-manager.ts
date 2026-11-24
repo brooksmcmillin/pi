@@ -3674,6 +3674,22 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
+	private isIndependentGitAlias(path: string, revision: NonNullable<PathMetadata["gitRevision"]>): boolean {
+		for (let component = path; dirname(component) !== component; component = dirname(component)) {
+			try {
+				if (!lstatSync(component, { throwIfNoEntry: false })?.isSymbolicLink()) continue;
+				if (component === path) return true;
+				// A link to the checkout or a directory inside it adds another declaration.
+				// An alias of its storage parent just re-spells the same checkout path.
+				if (redirectGitRevisionPath(canonicalizePath(component), revision.logical, revision.active, true))
+					return true;
+			} catch {
+				// An inaccessible component does not prove a separate alias.
+			}
+		}
+		return false;
+	}
+
 	private addResource(
 		map: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		path: string,
@@ -3682,19 +3698,20 @@ export class DefaultPackageManager implements PackageManager {
 	): void {
 		if (!path) return;
 		const existing = map.get(path);
+		const revision = metadata.gitRevision;
 		// Selection can collapse distinct spellings before canonical precedence runs.
 		// An independent auto-discovered alias keeps its own enablement. A plain
 		// configured declaration still does not undo an explicit package exclusion.
 		if (
 			!existing ||
 			(metadata.origin === "top-level" &&
-				metadata.gitRevision?.aliases?.some(
+				revision?.aliases?.some(
 					(alias) =>
 						alias !== path &&
 						(!enabled ||
 							existing.enabled ||
 							metadata.source === "auto" ||
-							lstatSync(alias, { throwIfNoEntry: false })?.isSymbolicLink()),
+							this.isIndependentGitAlias(alias, revision)),
 				) &&
 				resourcePrecedenceRank(metadata) < resourcePrecedenceRank(existing.metadata))
 		) {
