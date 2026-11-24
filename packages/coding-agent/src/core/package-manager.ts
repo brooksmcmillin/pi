@@ -3083,11 +3083,12 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		// Apply user patterns
-		const enabledByUser = applyPatterns(allFiles, userPatterns, packageRoot, filterRoot, aliases);
-
 		for (const f of allFiles) {
-			const enabled = enabledByUser.has(f);
-			this.addResource(target, f, this.withPackageAliases(metadata, aliases?.get(f)), enabled);
+			// The first declaration wins physical-path deduplication, as for ordinary symlinks.
+			const firstAlias = aliases?.get(f)?.values().next().value;
+			const declaration = firstAlias === undefined ? undefined : new Map([[f, new Set([firstAlias])]]);
+			const enabled = applyPatterns([f], userPatterns, packageRoot, filterRoot, declaration).has(f);
+			this.addResource(target, f, this.withPackageAliases(metadata, declaration?.get(f)), enabled);
 		}
 	}
 
@@ -3286,12 +3287,14 @@ export class DefaultPackageManager implements PackageManager {
 		patterns: string[],
 		baseDir: string,
 		gitRevisions: ReadonlyMap<string, string>,
+		declarations?: ReadonlyMap<string, Set<string>>,
 	): string[] {
 		if (gitRevisions.size === 0) return patterns;
 		return patterns.flatMap((pattern) => {
 			if (pattern[0] !== "+" && pattern[0] !== "-" && pattern[0] !== "!") return [pattern];
 			const original = this.resolvePathFromBase(pattern.slice(1), baseDir);
 			const active = this.redirectGitResource(original, gitRevisions);
+			if (declarations?.get(active)?.has(original)) return [pattern];
 			// Keep relative globs relative so literal settings-directory characters do not become glob syntax.
 			const target = pattern[0] === "!" && !isAbsolute(pattern.slice(1)) ? relative(baseDir, active) : active;
 			return active === original ? [pattern] : [pattern, `${pattern[0]}${target}`];
@@ -3406,13 +3409,14 @@ export class DefaultPackageManager implements PackageManager {
 				for (const alias of aliases.get(path) ?? []) spellings.add(alias);
 				discovered.set(active, spellings);
 			}
-			const rules = this.redirectGitExactRules(overrides, baseDir, accumulator.gitRevisions);
+			const rules = this.redirectGitExactRules(overrides, baseDir, accumulator.gitRevisions, discovered);
 			for (const [active, spellings] of discovered) {
+				const declaration = new Set([...spellings].slice(0, 1));
 				this.addResource(
 					target,
 					active,
-					this.withGitRevision(metadata, active, accumulator.gitRevisions, spellings),
-					isEnabledByOverrides(active, rules, baseDir, spellings),
+					this.withGitRevision(metadata, active, accumulator.gitRevisions, declaration),
+					isEnabledByOverrides(active, rules, baseDir, declaration),
 				);
 			}
 			aliases.clear();

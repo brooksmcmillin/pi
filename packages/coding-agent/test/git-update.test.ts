@@ -1054,6 +1054,38 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
+	it.skipIf(process.platform === "win32").each([false, true])(
+		"keeps the first prompt when a second alias is excluded (package: %s)",
+		async (asPackage) => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "review.md", "Selected review", "Add prompt");
+			const dir = join(agentDir, asPackage ? "local-prompts" : "prompts");
+			mkdirSync(dir);
+			for (const name of ["keep.md", "z-hide.md"]) symlinkSync(join(installedDir, "review.md"), join(dir, name));
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			if (asPackage) {
+				writeFileSync(join(dir, "package.json"), JSON.stringify({ pi: { prompts: ["keep.md", "z-hide.md"] } }));
+				settingsManager.setPackages([
+					{ source: gitSource, autoload: false },
+					{ source: dir, prompts: ["-z-hide.md"] },
+				]);
+			} else {
+				settingsManager.setPromptTemplatePaths(["-prompts/z-hide.md"]);
+			}
+			await packageManager.update();
+			await settingsManager.flush();
+			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			await loader.reload();
+			expect(loader.getPrompts().prompts).toEqual([
+				expect.objectContaining({
+					name: "keep",
+					filePath: join(selected(), "review.md"),
+					content: "Selected review",
+				}),
+			]);
+		},
+	);
+
 	it.skipIf(process.platform === "win32")("loads discovered aliases to extensionless selected resources", async () => {
 		setupRemoteAndInstall();
 		const theme = JSON.parse(
@@ -1073,10 +1105,17 @@ describe("DefaultPackageManager git update", () => {
 		await packageManager.update();
 		await settingsManager.flush();
 		const active = selected();
-		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		const review = join(active, "review");
+		const loader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+			additionalSkillPaths: [review],
+			additionalPromptTemplatePaths: [review],
+		});
 		await loader.reload();
 		expect(loader.getPrompts().prompts).toEqual([
-			expect.objectContaining({ name: "quick", filePath: join(active, "review"), content: "Selected review" }),
+			expect.objectContaining({ name: "quick", filePath: review, content: "Selected review" }),
 		]);
 		expect(loader.getSkills().skills).toContainEqual(
 			expect.objectContaining({ name: "guide", filePath: join(active, "guide") }),

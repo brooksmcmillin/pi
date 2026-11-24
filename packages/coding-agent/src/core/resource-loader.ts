@@ -399,7 +399,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private extensionThemeSourceInfos: Map<string, SourceInfo>;
 	private resourceMetadataByPath: Map<string, PathMetadata>;
 	private lastPromptPaths: string[];
-	private selectPathForRoot?: (root: string) => ((path: string) => string) | undefined;
+	private resourceSelectors?: Record<
+		"skills" | "prompts" | "themes",
+		(root: string) => ((path: string) => string) | undefined
+	>;
 	private lastThemePaths: string[];
 	private loaded: boolean;
 
@@ -649,12 +652,19 @@ export class DefaultResourceLoader implements ResourceLoader {
 			}
 			return path;
 		};
-		const explicitRoots = new Set(
-			[...this.additionalSkillPaths, ...this.additionalPromptTemplatePaths, ...this.additionalThemePaths].map(
-				(path) => this.resolveResourcePath(path),
-			),
-		);
-		this.selectPathForRoot = (root) => (explicitRoots.has(root) ? selectExplicitPath : undefined);
+		const selector = (explicit: string[], discovered: string[]) => {
+			const explicitRoots = new Set(explicit.map((path) => this.resolveResourcePath(path)));
+			for (const path of discovered) explicitRoots.delete(this.resolveResourcePath(path));
+			return (root: string) => (explicitRoots.has(root) ? selectExplicitPath : undefined);
+		};
+		this.resourceSelectors = {
+			skills: selector(this.additionalSkillPaths, [...cliEnabledSkills, ...(this.noSkills ? [] : enabledSkills)]),
+			prompts: selector(this.additionalPromptTemplatePaths, [
+				...cliEnabledPrompts,
+				...(this.noPromptTemplates ? [] : enabledPrompts),
+			]),
+			themes: selector(this.additionalThemePaths, [...cliEnabledThemes, ...(this.noThemes ? [] : enabledThemes)]),
+		};
 		const explicitSkills = this.additionalSkillPaths;
 		const skillPaths = this.noSkills
 			? this.mergePaths(cliEnabledSkills, explicitSkills)
@@ -943,7 +953,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				cwd: this.cwd,
 				agentDir: this.agentDir,
 				skillPaths,
-				selectPathForRoot: this.selectPathForRoot,
+				selectPathForRoot: this.resourceSelectors?.skills,
 				getDiscoveredPath: (path) => this.getDiscoveredResourceAlias(metadataByPath?.get(path), ".md"),
 				includeDefaults: false,
 			});
@@ -968,7 +978,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				cwd: this.cwd,
 				agentDir: this.agentDir,
 				promptPaths,
-				selectPathForRoot: this.selectPathForRoot,
+				selectPathForRoot: this.resourceSelectors?.prompts,
 				getDiscoveredPath: (path) => this.getDiscoveredResourceAlias(metadataByPath?.get(path), ".md"),
 				includeDefaults: false,
 			});
@@ -1158,7 +1168,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		for (const p of paths) {
 			const original = this.resolveResourcePath(p);
-			const selectPath = this.selectPathForRoot?.(original);
+			const selectPath = this.resourceSelectors?.themes(original);
 			const resolved = selectPath?.(original) ?? original;
 			const declaredPath =
 				(selectPath ? undefined : this.getDiscoveredResourceAlias(metadataByPath?.get(resolved), ".json")) ??
