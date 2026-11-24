@@ -200,6 +200,33 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
+	it("pins a configured user Git extension across the trust prompt", async () => {
+		setupRemoteAndInstall();
+		const marker = join(tempDir, "initializations.txt");
+		const extension = (value: string) => `import { appendFileSync } from 'node:fs';
+			export default function() { appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", extension("old\n"), "Add worker");
+		git(["pull", "--ff-only"], installedDir);
+		const oldPath = join(installedDir, "extensions", "worker.ts");
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await loader.reload({
+			resolveProjectTrust: async ({ extensionsResult }) => {
+				expect(extensionsResult.extensions.map(({ path }) => path)).toContain(oldPath);
+				createCommit(remoteDir, "extensions/worker.ts", extension("new\n"), "Publish during trust");
+				await packageManager.update();
+				return true;
+			},
+		});
+		const newPath = join(selected(), "extensions", "worker.ts");
+		expect(newPath).not.toBe(oldPath);
+		expect(loader.getExtensions().extensions.map(({ path }) => path)).toContain(oldPath);
+		expect(readFileSync(marker, "utf8")).toBe("old\n");
+		await loader.reload();
+		expect(loader.getExtensions().extensions.map(({ path }) => path)).toContain(newPath);
+		expect(readFileSync(marker, "utf8")).toBe("old\nnew\n");
+	});
+
 	describe("normal updates (no force-push)", () => {
 		it("should skip reset, clean, and install when already up to date", async () => {
 			mkdirSync(remoteDir, { recursive: true });
@@ -1461,29 +1488,35 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
-	it.skipIf(process.platform === "win32")("keeps the prompt alias name while loading selected content", async () => {
-		setupRemoteAndInstall();
-		mkdirSync(join(remoteDir, "prompts"));
-		createCommit(remoteDir, "prompts/review.md", "Old review", "Add review prompt");
-		git(["pull", "--ff-only"], installedDir);
-		mkdirSync(join(agentDir, "prompts"));
-		symlinkSync(join(installedDir, "prompts", "review.md"), join(agentDir, "prompts", "quick.md"));
-		const before = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
-		await before.reload();
-		expect(before.getPrompts().prompts).toEqual([expect.objectContaining({ name: "quick", content: "Old review" })]);
-		createCommit(remoteDir, "prompts/review.md", "Selected review", "Update review prompt");
-		await packageManager.update();
-		await settingsManager.flush();
-		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
-		await loader.reload();
-		expect(loader.getPrompts().prompts).toEqual([
-			expect.objectContaining({
-				name: "quick",
-				content: "Selected review",
-				filePath: join(selected(), "prompts", "review.md"),
-			}),
-		]);
-	});
+	it.skipIf(process.platform === "win32").each([false, true])(
+		"keeps the prompt alias name while loading selected content (package excluded: %s)",
+		async (excluded) => {
+			setupRemoteAndInstall();
+			mkdirSync(join(remoteDir, "prompts"));
+			createCommit(remoteDir, "prompts/review.md", "Old review", "Add review prompt");
+			git(["pull", "--ff-only"], installedDir);
+			mkdirSync(join(agentDir, "prompts"));
+			symlinkSync(join(installedDir, "prompts", "review.md"), join(agentDir, "prompts", "quick.md"));
+			if (excluded) settingsManager.setPackages([{ source: gitSource, prompts: [] }]);
+			const before = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			await before.reload();
+			expect(before.getPrompts().prompts).toEqual([
+				expect.objectContaining({ name: "quick", content: "Old review" }),
+			]);
+			createCommit(remoteDir, "prompts/review.md", "Selected review", "Update review prompt");
+			await packageManager.update();
+			await settingsManager.flush();
+			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			await loader.reload();
+			expect(loader.getPrompts().prompts).toEqual([
+				expect.objectContaining({
+					name: "quick",
+					content: "Selected review",
+					filePath: join(selected(), "prompts", "review.md"),
+				}),
+			]);
+		},
+	);
 
 	it
 		.skipIf(process.platform === "win32")

@@ -107,6 +107,7 @@ export interface TemporaryGitSelection {
 export interface ResolvedPaths {
 	/** Checkout selection shared with explicit extension sources in the same load. */
 	gitRevisions?: ReadonlyMap<string, string>;
+	configuredGitCheckouts?: ReadonlyMap<string, string>;
 	missingLocalPaths?: string[];
 	extensions: ResolvedResource[];
 	skills: ResolvedResource[];
@@ -1215,6 +1216,7 @@ export class DefaultPackageManager implements PackageManager {
 	async resolve(
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
 		temporaryGit?: TemporaryGitSelection,
+		bootstrapCheckouts?: ReadonlyMap<string, string>,
 	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
 		accumulator.gitRevisions = new Map(temporaryGit?.gitRevisions);
@@ -1238,7 +1240,9 @@ export class DefaultPackageManager implements PackageManager {
 			if (parsed.type !== "git") continue;
 			try {
 				const logical = this.getGitStoragePath(parsed, entry.scope);
-				const selected = this.readSelectedGitRevision(logical, this.getGitUpdateStatePath(logical, entry.scope));
+				const pinned = entry.scope === "user" ? bootstrapCheckouts?.get(logical) : undefined;
+				const selected =
+					pinned ?? this.readSelectedGitRevision(logical, this.getGitUpdateStatePath(logical, entry.scope));
 				if (existsSync(selected)) {
 					checkoutSnapshot.set(logical, selected);
 					if (logical !== selected) accumulator.gitRevisions.set(logical, selected);
@@ -1309,7 +1313,12 @@ export class DefaultPackageManager implements PackageManager {
 			);
 		}
 
-		return { ...this.toResolvedPaths(accumulator), installFailures, gitRevisions: accumulator.gitRevisions };
+		return {
+			...this.toResolvedPaths(accumulator),
+			installFailures,
+			gitRevisions: accumulator.gitRevisions,
+			configuredGitCheckouts: checkoutSnapshot,
+		};
 	}
 
 	async prepareTemporaryGitSources(sources: string[]): Promise<TemporaryGitSelection> {
@@ -1714,7 +1723,7 @@ export class DefaultPackageManager implements PackageManager {
 		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
 		accumulator: ResourceAccumulator,
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
-		checkoutSnapshot?: ReadonlyMap<string, string>,
+		checkoutSnapshot?: Map<string, string>,
 		missingLocalPaths?: string[],
 		temporarySelection?: { checkouts: Map<string, string>; preparing: boolean },
 	): Promise<PackageInstallFailure[]> {
@@ -1836,6 +1845,7 @@ export class DefaultPackageManager implements PackageManager {
 				const logicalPath = this.getGitStoragePath(parsed, resolvedScope);
 				if (logicalPath !== installedPath) accumulator.gitRevisions.set(logicalPath, installedPath);
 				if (resolvedScope === "temporary") temporaryCheckouts.set(logicalPath, installedPath);
+				else checkoutSnapshot?.set(logicalPath, installedPath);
 				collect(resolvedScope, () =>
 					this.collectPackageResources(installedPath, accumulator, filter, metadata, logicalPath),
 				);
@@ -3671,10 +3681,11 @@ export class DefaultPackageManager implements PackageManager {
 		if (!path) return;
 		const existing = map.get(path);
 		// Selection can collapse distinct spellings before canonical precedence runs.
-		// Keep a package exclusion even when a top-level alias is enabled.
+		// An independent auto-discovered alias keeps its own enablement. A plain
+		// configured declaration still does not undo an explicit package exclusion.
 		if (
 			!existing ||
-			((!enabled || existing.enabled) &&
+			((!enabled || existing.enabled || metadata.source === "auto") &&
 				metadata.origin === "top-level" &&
 				metadata.gitRevision?.aliases?.some((alias) => alias !== path) &&
 				resourcePrecedenceRank(metadata) < resourcePrecedenceRank(existing.metadata))
