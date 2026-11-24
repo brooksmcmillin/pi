@@ -623,7 +623,7 @@ function collectAutoThemeEntries(dir: string, selectPath: (path: string) => stri
 }
 
 function resolveExtensionEntries(dir: string, selectPath: (path: string) => string): string[] | null {
-	const packageJsonPath = join(dir, "package.json");
+	const packageJsonPath = selectPath(join(dir, "package.json"));
 	if (existsSync(packageJsonPath)) {
 		const manifest = readPiManifest(packageJsonPath);
 		if (manifest?.extensions?.length) {
@@ -1163,7 +1163,8 @@ export class DefaultPackageManager implements PackageManager {
 			allPackages.push({ pkg, scope: "user" });
 		}
 
-		// Seed installed revision paths before resolving local aliases, regardless of declaration order.
+		// Pin installed checkout paths before resolving local aliases, regardless of declaration order.
+		const checkoutSnapshot = new Map<string, string>();
 		for (const entry of allPackages) {
 			if (entry.scope === "project" && !this.settingsManager.isProjectTrusted()) continue;
 			const parsed = this.parseSource(this.getPackageSourceString(entry.pkg));
@@ -1171,7 +1172,10 @@ export class DefaultPackageManager implements PackageManager {
 			try {
 				const logical = this.getGitStoragePath(parsed, entry.scope);
 				const selected = this.readSelectedGitRevision(logical, this.getGitUpdateStatePath(logical, entry.scope));
-				if (logical !== selected && existsSync(selected)) accumulator.gitRevisions.set(logical, selected);
+				if (existsSync(selected)) {
+					checkoutSnapshot.set(logical, selected);
+					if (logical !== selected) accumulator.gitRevisions.set(logical, selected);
+				}
 			} catch {
 				// Normal package resolution reports failures for packages that are actually loaded.
 			}
@@ -1179,7 +1183,12 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Dedupe: project scope wins over global for same package identity
 		const packageSources = this.dedupePackages(allPackages);
-		const installFailures = await this.resolvePackageSources(packageSources, accumulator, onMissing);
+		const installFailures = await this.resolvePackageSources(
+			packageSources,
+			accumulator,
+			onMissing,
+			checkoutSnapshot,
+		);
 
 		const globalBaseDir = this.agentDir;
 		const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
@@ -1605,6 +1614,7 @@ export class DefaultPackageManager implements PackageManager {
 		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
 		accumulator: ResourceAccumulator,
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
+		checkoutSnapshot?: ReadonlyMap<string, string>,
 	): Promise<PackageInstallFailure[]> {
 		const installFailures: PackageInstallFailure[] = [];
 		for (const { pkg, scope } of sources) {
@@ -1679,10 +1689,15 @@ export class DefaultPackageManager implements PackageManager {
 				let installedPath: string;
 				let present: boolean;
 				try {
-					const recovered = await this.recoverGitCheckout(
-						this.getGitStoragePath(parsed, resolvedScope),
-						resolvedScope,
-					);
+					const logical = this.getGitStoragePath(parsed, resolvedScope);
+					const pinned = checkoutSnapshot?.get(logical);
+					if (pinned !== undefined) {
+						metadata.baseDir = pinned;
+						metadata.packageRoot = pinned;
+						this.collectPackageResources(pinned, accumulator, filter, metadata, logical);
+						continue;
+					}
+					const recovered = await this.recoverGitCheckout(logical, resolvedScope);
 					present = recovered !== undefined;
 					installedPath = recovered ?? "";
 				} catch (error) {
@@ -1749,7 +1764,7 @@ export class DefaultPackageManager implements PackageManager {
 			if (stats.isDirectory()) {
 				metadata.baseDir = resolved;
 				metadata.packageRoot = resolved;
-				const resources = this.collectPackageResources(resolved, accumulator, filter, metadata);
+				const resources = this.collectPackageResources(resolved, accumulator, filter, metadata, original);
 				if (!resources) {
 					this.addResource(accumulator.extensions, resolved, metadata, true);
 				}

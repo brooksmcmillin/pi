@@ -352,6 +352,53 @@ describe("DefaultPackageManager git update", () => {
 		]);
 	});
 
+	it("pins a checkout selection when publication occurs between local and Git collection", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		await packageManager.update();
+		const previous = selected();
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() { return 2; }", "Update worker");
+		await packageManager.update();
+		const next = selected();
+		expect(next).not.toBe(previous);
+		const key = createHash("sha256")
+			.update(relative(join(agentDir, "git"), installedDir))
+			.digest("hex");
+		const pointer = join(agentDir, "git", ".git-update-state", `${key}.current`);
+		writeFileSync(pointer, basename(previous));
+		settingsManager.setPackages([join(installedDir, "extensions", "worker.ts"), gitSource]);
+		const manager = packageManager as unknown as { resolveLocalExtensionSource: (...args: unknown[]) => void };
+		const resolveLocal = manager.resolveLocalExtensionSource.bind(manager);
+		const publish = vi.spyOn(manager, "resolveLocalExtensionSource").mockImplementationOnce((...args) => {
+			resolveLocal(...args);
+			const pending = `${pointer}.fixture`;
+			writeFileSync(pending, basename(next));
+			renameSync(pending, pointer);
+		});
+		const workers = async () =>
+			(await packageManager.resolve()).extensions.filter(({ path }) => basename(path) === "worker.ts");
+		expect(await workers()).toEqual([expect.objectContaining({ path: join(previous, "extensions", "worker.ts") })]);
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(await workers()).toEqual([expect.objectContaining({ path: join(next, "extensions", "worker.ts") })]);
+	});
+
+	it("preserves an absolute filter on a local package alias of a managed checkout", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		git(["pull", "--ff-only"], installedDir);
+		settingsManager.setPackages([
+			{ source: installedDir, extensions: [`-${join(installedDir, "extensions", "worker.ts")}`] },
+			{ source: gitSource, autoload: false },
+		]);
+		createCommit(remoteDir, "extension.ts", "// v2", "Advance revision");
+		await packageManager.update();
+		expect((await packageManager.resolve()).extensions).toContainEqual(
+			expect.objectContaining({ path: join(selected(), "extensions", "worker.ts"), enabled: false }),
+		);
+	});
+
 	it("redirects explicit user paths when a trusted project shadows the package", async () => {
 		setupRemoteAndInstall();
 		mkdirSync(join(remoteDir, "extensions"));
@@ -740,6 +787,28 @@ describe("DefaultPackageManager git update", () => {
 			expect(recursive.themes).toContainEqual(
 				expect.objectContaining({ path: join(active, "themes-tool.json", "nested.json") }),
 			);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"reads an aliased extension manifest from the selected revision",
+		async () => {
+			setupRemoteAndInstall();
+			const manifest = (entry: string) => JSON.stringify({ pi: { extensions: [entry] } });
+			createCommit(remoteDir, "package.json", manifest("src/old.ts"), "Declare old extension");
+			git(["pull", "--ff-only"], installedDir);
+			const root = join(agentDir, "extensions");
+			mkdirSync(join(root, "src"), { recursive: true });
+			for (const name of ["old.ts", "new.ts"])
+				writeFileSync(join(root, "src", name), "export default function() {}");
+			symlinkSync(join(installedDir, "package.json"), join(root, "package.json"));
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
+			createCommit(remoteDir, "package.json", manifest("src/new.ts"), "Select new extension");
+			await packageManager.update();
+			const paths = (await packageManager.resolve()).extensions.map(({ path }) => path);
+			expect(paths).toContain(join(root, "src", "new.ts"));
+			expect(paths).not.toContain(join(root, "src", "old.ts"));
 		},
 	);
 
