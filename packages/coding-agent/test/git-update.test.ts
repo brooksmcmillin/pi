@@ -240,7 +240,7 @@ describe("DefaultPackageManager git update", () => {
 		expect(getFileContent(installedDir, "extension.ts")).toBe("// v1");
 	});
 
-	it.each(["absolute", "tilde", "anchored glob"])(
+	it.each(["absolute", "tilde", "anchored glob", "active exact", "active delta"])(
 		"preserves a %s exclusion after selecting a new revision",
 		async (kind) => {
 			setupRemoteAndInstall();
@@ -260,6 +260,20 @@ describe("DefaultPackageManager git update", () => {
 
 			const active = selected();
 			expect(active).not.toBe(installedDir);
+			if (kind === "active exact" || kind === "active delta") {
+				const reported = packageManager.listConfiguredPackages()[0]?.installedPath;
+				expect(reported).toBe(active);
+				settingsManager.setPackages([
+					{
+						source: gitSource,
+						autoload: kind !== "active delta",
+						extensions: [
+							`-${join(reported!, "extensions", "excluded.ts")}`,
+							`+${join(reported!, "extensions", "enabled.ts")}`,
+						],
+					},
+				]);
+			}
 			const { extensions } = await packageManager.resolve();
 			expect(extensions.find((entry) => entry.path === join(active, "extensions", "excluded.ts"))?.enabled).toBe(
 				false,
@@ -269,6 +283,25 @@ describe("DefaultPackageManager git update", () => {
 			);
 		},
 	);
+
+	it("loads and removes a repository with a nonreserved revision prefix", async () => {
+		const source = "git:github.com/test/.pi-revision-tools";
+		const worker = join(dirname(installedDir), ".pi-revision-tools", "extensions", "worker.ts");
+		mkdirSync(dirname(worker), { recursive: true });
+		writeFileSync(worker, "export default function() {}");
+		const reserved = `git:github.com/test/.pi-revision-${"a".repeat(64)}-Ab1234`;
+		settingsManager.setPackages([reserved, source]);
+		const resolved = await packageManager.resolve();
+		expect(resolved.installFailures).toEqual([
+			expect.objectContaining({ source: reserved, message: expect.stringContaining("reserved revision namespace") }),
+		]);
+		expect(resolved.extensions.some((entry) => entry.path === worker && entry.enabled)).toBe(true);
+		expect(packageManager.listConfiguredPackages().find((entry) => entry.source === source)?.installedPath).toBe(
+			dirname(dirname(worker)),
+		);
+		await expect(packageManager.removeAndPersist(source)).resolves.toBe(true);
+		expect(existsSync(worker)).toBe(false);
+	});
 
 	it.each([false, true])("isolates invalid revision state (directory: %s)", async (directory) => {
 		setupRemoteAndInstall();

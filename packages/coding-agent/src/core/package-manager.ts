@@ -818,7 +818,9 @@ function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: str
  * - `+path`: force-include exact path (overrides exclusions)
  * - `-path`: force-exclude exact path (overrides force-includes)
  */
-function applyPatterns(allPaths: string[], patterns: string[], baseDir: string): Set<string> {
+function applyPatterns(allPaths: string[], patterns: string[], baseDir: string, logicalRoot = baseDir): Set<string> {
+	const matches = (file: string, rules: string[], matcher: typeof matchesAnyPattern) =>
+		matchesPackagePath(file, rules, baseDir, logicalRoot, matcher);
 	const includes: string[] = [];
 	const excludes: string[] = [];
 	const forceIncludes: string[] = [];
@@ -841,18 +843,18 @@ function applyPatterns(allPaths: string[], patterns: string[], baseDir: string):
 	if (includes.length === 0) {
 		result = [...allPaths];
 	} else {
-		result = allPaths.filter((filePath) => matchesAnyPattern(filePath, includes, baseDir));
+		result = allPaths.filter((filePath) => matches(filePath, includes, matchesAnyPattern));
 	}
 
 	// Step 2: Apply excludes
 	if (excludes.length > 0) {
-		result = result.filter((filePath) => !matchesAnyPattern(filePath, excludes, baseDir));
+		result = result.filter((filePath) => !matches(filePath, excludes, matchesAnyPattern));
 	}
 
 	// Step 3: Force-include (add back from allPaths, overriding exclusions)
 	if (forceIncludes.length > 0) {
 		for (const filePath of allPaths) {
-			if (!result.includes(filePath) && matchesAnyExactPattern(filePath, forceIncludes, baseDir)) {
+			if (!result.includes(filePath) && matches(filePath, forceIncludes, matchesAnyExactPattern)) {
 				result.push(filePath);
 			}
 		}
@@ -860,13 +862,33 @@ function applyPatterns(allPaths: string[], patterns: string[], baseDir: string):
 
 	// Step 4: Force-exclude (remove even if included or force-included)
 	if (forceExcludes.length > 0) {
-		result = result.filter((filePath) => !matchesAnyExactPattern(filePath, forceExcludes, baseDir));
+		result = result.filter((filePath) => !matches(filePath, forceExcludes, matchesAnyExactPattern));
 	}
 
 	return new Set(result);
 }
 
-function applyAutoloadDisabledPatterns(allPaths: string[], patterns: string[], baseDir: string): Map<string, boolean> {
+function matchesPackagePath(
+	file: string,
+	rules: string[],
+	baseDir: string,
+	logicalRoot: string,
+	matcher: typeof matchesAnyPattern,
+): boolean {
+	return (
+		matcher(file, rules, baseDir) ||
+		(logicalRoot !== baseDir &&
+			isPathInside(baseDir, file) &&
+			matcher(join(logicalRoot, relative(baseDir, file)), rules, logicalRoot))
+	);
+}
+
+function applyAutoloadDisabledPatterns(
+	allPaths: string[],
+	patterns: string[],
+	baseDir: string,
+	logicalRoot = baseDir,
+): Map<string, boolean> {
 	const result = new Map<string, boolean>();
 	for (const pattern of patterns) {
 		const target = pattern.slice(
@@ -876,7 +898,13 @@ function applyAutoloadDisabledPatterns(allPaths: string[], patterns: string[], b
 		const exact = pattern.startsWith("+") || pattern.startsWith("-");
 		for (const filePath of allPaths) {
 			if (
-				exact ? matchesAnyExactPattern(filePath, [target], baseDir) : matchesAnyPattern(filePath, [target], baseDir)
+				matchesPackagePath(
+					filePath,
+					[target],
+					baseDir,
+					logicalRoot,
+					exact ? matchesAnyExactPattern : matchesAnyPattern,
+				)
 			) {
 				result.set(filePath, enabled);
 			}
@@ -2594,8 +2622,12 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private getGitStoragePath(source: GitSource, scope: SourceScope): string {
-		if ([source.host, ...source.path.split("/")].some((part) => part.toLowerCase().startsWith(".pi-revision-"))) {
-			throw new Error("Git package path overlaps Pi's reserved revision namespace");
+		if (
+			[source.host, ...source.path.split("/")].some((part) => /^\.pi-revision-[a-f0-9]{64}-[a-z0-9]{6}$/i.test(part))
+		) {
+			throw new GitRevisionPointerError(
+				"Git package path overlaps Pi's reserved revision namespace; use a local checkout instead",
+			);
 		}
 		if (scope === "temporary") {
 			// Include the ref in the hash so each pinned ref gets its own checkout.
@@ -2607,7 +2639,9 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		const checkout = this.resolveManagedPath(installRoot, source.host, source.path);
 		if (relative(installRoot, checkout).split(sep)[0]?.toLowerCase() === ".git-update-state") {
-			throw new Error("Git package path overlaps Pi's reserved update state directory");
+			throw new GitRevisionPointerError(
+				"Git package path overlaps Pi's reserved update state directory; use a local checkout instead",
+			);
 		}
 		return checkout;
 	}
@@ -2760,11 +2794,10 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		// Apply user patterns
-		const paths = allFiles.map((file) => this.packageFilterPath(file, packageRoot, filterRoot));
-		const enabledByUser = applyPatterns(paths, userPatterns, filterRoot);
+		const enabledByUser = applyPatterns(allFiles, userPatterns, packageRoot, filterRoot);
 
-		for (const [index, f] of allFiles.entries()) {
-			const enabled = enabledByUser.has(paths[index]!);
+		for (const f of allFiles) {
+			const enabled = enabledByUser.has(f);
 			this.addResource(target, f, metadata, enabled);
 		}
 	}
@@ -2782,18 +2815,8 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType);
-		const paths = allFiles.map((file) => this.packageFilterPath(file, packageRoot, filterRoot));
-		const enabledByUser = applyAutoloadDisabledPatterns(paths, userPatterns, filterRoot);
-		for (const [index, filePath] of allFiles.entries()) {
-			const enabled = enabledByUser.get(paths[index]!);
-			if (enabled !== undefined) this.addResource(target, filePath, metadata, enabled);
-		}
-	}
-
-	private packageFilterPath(file: string, physicalRoot: string, logicalRoot: string): string {
-		return physicalRoot !== logicalRoot && isPathInside(physicalRoot, file)
-			? join(logicalRoot, relative(physicalRoot, file))
-			: file;
+		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot, filterRoot);
+		for (const [filePath, enabled] of enabledByUser) this.addResource(target, filePath, metadata, enabled);
 	}
 
 	/**
