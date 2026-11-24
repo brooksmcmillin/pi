@@ -883,7 +883,7 @@ function matchesPackagePath(
 	// A saved absolute filter can name an earlier revision of this same package.
 	const revisionPrefix = basename(baseDir).slice(0, -6);
 	const parent = dirname(baseDir);
-	const revisionPath = /^(.+)\/(\.pi-revision-[a-f0-9]{64}-[a-zA-Z0-9]{6})\//;
+	const revisionPath = /^(.+)\/(\.pi-revision-[a-f0-9]{64}-[a-zA-Z0-9]{6})(?:\/|$)/;
 	return rules.some((rule) => {
 		const normalized = toPosixPath(normalizePath(rule));
 		if (!isAbsolute(normalized)) return false;
@@ -2283,21 +2283,25 @@ export class DefaultPackageManager implements PackageManager {
 		ref: string,
 	): Promise<void> {
 		const installed = statSync(targetDir);
-		// Fetch only the ref we will reset to, avoiding unrelated branch/tag noise.
-		await this.runCommand("git", fetchArgs, { cwd: targetDir });
-
-		const localHead = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
-			cwd: targetDir,
-			timeoutMs: NETWORK_TIMEOUT_MS,
-		});
-		const commitRef = `${ref}^{commit}`;
-		const targetHead = await this.runCommandCapture("git", ["rev-parse", commitRef], {
-			cwd: targetDir,
-			timeoutMs: NETWORK_TIMEOUT_MS,
-		});
+		const state = this.getGitUpdateStatePath(logicalDir, scope);
+		const releaseFetch = this.lockGitCheckout(state);
+		let localHead: string;
+		let targetHead: string;
+		try {
+			this.assertSameGitCheckout(targetDir, installed);
+			if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
+				throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
+			}
+			// Pin the fetched commit before another operation can overwrite FETCH_HEAD.
+			const options = { cwd: targetDir, timeoutMs: NETWORK_TIMEOUT_MS };
+			await this.runCommand("git", fetchArgs, { cwd: targetDir });
+			localHead = await this.runCommandCapture("git", ["rev-parse", "HEAD"], options);
+			targetHead = await this.runCommandCapture("git", ["rev-parse", `${ref}^{commit}`], options);
+		} finally {
+			releaseFetch();
+		}
 		const markerPath = this.getGitUpdateMarkerPath(targetDir);
 		const interruptedLegacyUpdate = statSync(markerPath, { throwIfNoEntry: false })?.isFile();
-		const state = this.getGitUpdateStatePath(logicalDir, scope);
 		const previous = `${state}.previous`;
 		if (localHead.trim() === targetHead.trim() && !interruptedLegacyUpdate) {
 			if (existsSync(previous) || this.hasMissingGitDependencies(targetDir)) {

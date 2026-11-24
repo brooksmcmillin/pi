@@ -295,6 +295,65 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
+	it("keeps a pinned fetch result isolated from a competing update", async () => {
+		setupRemoteAndInstall();
+		const pinnedCommit = createCommit(remoteDir, "extension.ts", "// pinned", "Pinned revision");
+		git(["tag", "pinned"], remoteDir);
+		createCommit(remoteDir, "extension.ts", "// latest", "Latest revision");
+		const pinnedSource = `${gitSource}@pinned`;
+		settingsManager.setPackages([pinnedSource]);
+		const competingSettings = SettingsManager.inMemory();
+		competingSettings.setPackages([gitSource]);
+		const competitor = new DefaultPackageManager({ cwd: tempDir, agentDir, settingsManager: competingSettings });
+		const manager = packageManager as unknown as {
+			runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
+		};
+		const run = manager.runCommand.bind(manager);
+		let competed = false;
+		vi.spyOn(manager, "runCommand").mockImplementation(async (command, args, options) => {
+			await run(command, args, options);
+			if (command === "git" && args[0] === "fetch" && args.at(-1) === "pinned") {
+				competed = true;
+				await expect(competitor.update()).rejects.toMatchObject({ code: "ELOCKED" });
+			}
+		});
+		await packageManager.update();
+		expect(competed).toBe(true);
+		expect(getCurrentCommit(selected(pinnedSource))).toBe(pinnedCommit);
+	});
+
+	it("preserves an exclusion of a root skill by its previous revision directory", async () => {
+		setupRemoteAndInstall();
+		createCommit(
+			remoteDir,
+			"SKILL.md",
+			"---\nname: root-skill\ndescription: Fixture skill\n---\nRead this skill.\n",
+			"Add root skill",
+		);
+		settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
+		createCommit(
+			remoteDir,
+			"package.json",
+			JSON.stringify({ name: "fixture", version: "1.0.0", pi: { skills: ["./SKILL.md"] } }),
+			"Declare skill",
+		);
+		await packageManager.update();
+		const prior = selected();
+		const unrelated = join(dirname(prior), `.pi-revision-${"0".repeat(64)}-Ab1234`);
+		settingsManager.setPackages([{ source: gitSource, skills: [`-${unrelated}`] }]);
+		expect(
+			(await packageManager.resolve()).skills.find((entry) => entry.path === join(prior, "SKILL.md"))?.enabled,
+		).toBe(true);
+		settingsManager.setPackages([{ source: gitSource, skills: [`-${prior}`] }]);
+		createCommit(remoteDir, "extension.ts", "// v3", "Advance revision");
+		await packageManager.update();
+		const current = selected();
+		expect(current).not.toBe(prior);
+		expect(
+			(await packageManager.resolve()).skills.find((entry) => entry.path === join(current, "SKILL.md"))?.enabled,
+		).toBe(false);
+	});
+
 	it("loads and removes a repository with a nonreserved revision prefix", async () => {
 		const source = "git:github.com/test/.pi-revision-tools";
 		const worker = join(dirname(installedDir), ".pi-revision-tools", "extensions", "worker.ts");
