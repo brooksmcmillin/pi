@@ -177,7 +177,11 @@ function loadTemplateFromFile(
 /**
  * Scan a directory for .md files (non-recursive) and load them as prompt templates.
  */
-function loadTemplatesFromDir(dir: string, getSourceInfo: (filePath: string) => SourceInfo): LoadPromptTemplatesResult {
+function loadTemplatesFromDir(
+	dir: string,
+	getSourceInfo: (filePath: string) => SourceInfo,
+	selectPath = (path: string) => path,
+): LoadPromptTemplatesResult {
 	const templates: PromptTemplate[] = [];
 	const diagnostics: ResourceDiagnostic[] = [];
 
@@ -189,7 +193,7 @@ function loadTemplatesFromDir(dir: string, getSourceInfo: (filePath: string) => 
 		const entries = readdirSync(dir, { withFileTypes: true });
 
 		for (const entry of entries) {
-			const fullPath = join(dir, entry.name);
+			const fullPath = selectPath(join(dir, entry.name));
 
 			// For symlinks, check if they point to a file
 			let isFile = entry.isFile();
@@ -206,7 +210,7 @@ function loadTemplatesFromDir(dir: string, getSourceInfo: (filePath: string) => 
 			if (isFile && entry.name.endsWith(".md")) {
 				const result = loadTemplateFromFile(fullPath, getSourceInfo(fullPath));
 				if (result.template) {
-					templates.push(result.template);
+					templates.push({ ...result.template, name: basename(entry.name, ".md") });
 				}
 				diagnostics.push(...result.diagnostics);
 			}
@@ -225,6 +229,7 @@ export interface LoadPromptTemplatesOptions {
 	agentDir: string;
 	/** Explicit prompt template paths (files or directories). */
 	promptPaths: string[];
+	selectPathForRoot?: (root: string) => ((path: string) => string) | undefined;
 	/** Include default prompt directories. */
 	includeDefaults: boolean;
 }
@@ -293,7 +298,9 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions): LoadPr
 
 	// 3. Load explicit prompt paths
 	for (const rawPath of promptPaths) {
-		const resolvedPath = resolvePath(rawPath, resolvedCwd, { trim: true });
+		const original = resolvePath(rawPath, resolvedCwd, { trim: true });
+		const selectPath = options.selectPathForRoot?.(original);
+		const resolvedPath = selectPath?.(original) ?? original;
 		if (!existsSync(resolvedPath)) {
 			continue;
 		}
@@ -301,11 +308,11 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions): LoadPr
 		try {
 			const stats = statSync(resolvedPath);
 			if (stats.isDirectory()) {
-				addResult(loadTemplatesFromDir(resolvedPath, getSourceInfo));
-			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
+				addResult(loadTemplatesFromDir(resolvedPath, getSourceInfo, selectPath));
+			} else if (stats.isFile() && original.endsWith(".md")) {
 				const result = loadTemplateFromFile(resolvedPath, getSourceInfo(resolvedPath));
 				if (result.template) {
-					templates.push(result.template);
+					templates.push({ ...result.template, name: basename(original, ".md") });
 				}
 				diagnostics.push(...result.diagnostics);
 			}

@@ -399,6 +399,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private extensionThemeSourceInfos: Map<string, SourceInfo>;
 	private resourceMetadataByPath: Map<string, PathMetadata>;
 	private lastPromptPaths: string[];
+	private selectPathForRoot?: (root: string) => ((path: string) => string) | undefined;
 	private lastThemePaths: string[];
 	private loaded: boolean;
 
@@ -648,30 +649,38 @@ export class DefaultResourceLoader implements ResourceLoader {
 			}
 			return path;
 		};
-		const explicitSkills = this.additionalSkillPaths.map(selectExplicitPath);
+		const explicitRoots = new Set(
+			[...this.additionalSkillPaths, ...this.additionalPromptTemplatePaths, ...this.additionalThemePaths].map(
+				(path) => this.resolveResourcePath(path),
+			),
+		);
+		this.selectPathForRoot = (root) => (explicitRoots.has(root) ? selectExplicitPath : undefined);
+		const explicitSkills = this.additionalSkillPaths;
 		const skillPaths = this.noSkills
 			? this.mergePaths(cliEnabledSkills, explicitSkills)
 			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], explicitSkills);
 
 		this.lastSkillPaths = skillPaths;
 		this.updateSkillsFromPaths(skillPaths, metadataByPath);
-		for (const [i, resolved] of explicitSkills.entries()) {
-			if (isLocalPath(this.additionalSkillPaths[i]!)) {
+		for (const path of explicitSkills) {
+			if (isLocalPath(path)) {
+				const resolved = selectExplicitPath(path);
 				if (!existsSync(resolved) && !this.skillDiagnostics.some((d) => d.path === resolved)) {
 					this.skillDiagnostics.push({ type: "error", message: "Skill path does not exist", path: resolved });
 				}
 			}
 		}
 
-		const explicitPrompts = this.additionalPromptTemplatePaths.map(selectExplicitPath);
+		const explicitPrompts = this.additionalPromptTemplatePaths;
 		const promptPaths = this.noPromptTemplates
 			? this.mergePaths(cliEnabledPrompts, explicitPrompts)
 			: this.mergePaths([...cliEnabledPrompts, ...enabledPrompts], explicitPrompts);
 
 		this.lastPromptPaths = promptPaths;
 		this.updatePromptsFromPaths(promptPaths, metadataByPath);
-		for (const [i, resolved] of explicitPrompts.entries()) {
-			if (isLocalPath(this.additionalPromptTemplatePaths[i]!)) {
+		for (const path of explicitPrompts) {
+			if (isLocalPath(path)) {
+				const resolved = selectExplicitPath(path);
 				if (!existsSync(resolved) && !this.promptDiagnostics.some((d) => d.path === resolved)) {
 					this.promptDiagnostics.push({
 						type: "error",
@@ -682,14 +691,15 @@ export class DefaultResourceLoader implements ResourceLoader {
 			}
 		}
 
-		const explicitThemes = this.additionalThemePaths.map(selectExplicitPath);
+		const explicitThemes = this.additionalThemePaths;
 		const themePaths = this.noThemes
 			? this.mergePaths(cliEnabledThemes, explicitThemes)
 			: this.mergePaths([...cliEnabledThemes, ...enabledThemes], explicitThemes);
 
 		this.lastThemePaths = themePaths;
 		this.updateThemesFromPaths(themePaths, metadataByPath);
-		for (const resolved of explicitThemes) {
+		for (const path of explicitThemes) {
+			const resolved = selectExplicitPath(path);
 			if (!existsSync(resolved) && !this.themeDiagnostics.some((d) => d.path === resolved)) {
 				this.themeDiagnostics.push({ type: "error", message: "Theme path does not exist", path: resolved });
 			}
@@ -933,6 +943,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				cwd: this.cwd,
 				agentDir: this.agentDir,
 				skillPaths,
+				selectPathForRoot: this.selectPathForRoot,
 				includeDefaults: false,
 			});
 		}
@@ -956,6 +967,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				cwd: this.cwd,
 				agentDir: this.agentDir,
 				promptPaths,
+				selectPathForRoot: this.selectPathForRoot,
 				includeDefaults: false,
 			});
 			const templates = loaded.templates.map((template) => {
@@ -963,7 +975,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 				const alias = (metadata?.gitRevision?.aliases ?? metadata?.packageAliases)?.find((path) =>
 					path.endsWith(".md"),
 				);
-				return alias ? { ...template, name: basename(alias, ".md") } : template;
+				return alias && template.name === basename(template.filePath, ".md")
+					? { ...template, name: basename(alias, ".md") }
+					: template;
 			});
 			const deduped = this.dedupePrompts(templates);
 			promptsResult = {
@@ -1145,7 +1159,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		for (const p of paths) {
-			const resolved = this.resolveResourcePath(p);
+			const original = this.resolveResourcePath(p);
+			const selectPath = this.selectPathForRoot?.(original);
+			const resolved = selectPath?.(original) ?? original;
 			if (!existsSync(resolved)) {
 				diagnostics.push({ type: "warning", message: "theme path does not exist", path: resolved });
 				continue;
@@ -1154,7 +1170,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			try {
 				const stats = statSync(resolved);
 				if (stats.isDirectory()) {
-					this.loadThemesFromDir(resolved, themes, diagnostics, colorMode);
+					this.loadThemesFromDir(resolved, themes, diagnostics, colorMode, selectPath);
 				} else if (stats.isFile() && resolved.endsWith(".json")) {
 					this.loadThemeFromFile(resolved, themes, diagnostics, colorMode);
 				} else {
@@ -1174,6 +1190,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		themes: Theme[],
 		diagnostics: ResourceDiagnostic[],
 		colorMode: TerminalColorMode,
+		selectPath = (path: string) => path,
 	): void {
 		if (!existsSync(dir)) {
 			return;
@@ -1182,10 +1199,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 		try {
 			const entries = readdirSync(dir, { withFileTypes: true });
 			for (const entry of entries) {
+				const selected = selectPath(join(dir, entry.name));
 				let isFile = entry.isFile();
 				if (entry.isSymbolicLink()) {
 					try {
-						isFile = statSync(join(dir, entry.name)).isFile();
+						isFile = statSync(selected).isFile();
 					} catch {
 						continue;
 					}
@@ -1196,7 +1214,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				if (!entry.name.endsWith(".json")) {
 					continue;
 				}
-				this.loadThemeFromFile(join(dir, entry.name), themes, diagnostics, colorMode);
+				this.loadThemeFromFile(selected, themes, diagnostics, colorMode);
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "failed to read theme directory";

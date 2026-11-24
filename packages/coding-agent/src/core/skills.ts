@@ -44,8 +44,8 @@ function prefixIgnorePattern(line: string, prefix: string): string | null {
 	return negated ? `!${prefixed}` : prefixed;
 }
 
-function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
-	const relativeDir = relative(rootDir, dir);
+function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string, logicalDir = dir): void {
+	const relativeDir = relative(rootDir, logicalDir);
 	const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
 
 	for (const filename of IGNORE_FILE_NAMES) {
@@ -176,6 +176,8 @@ function loadSkillsFromDirInternal(
 	includeRootFiles: boolean,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	selectPath = (path: string) => path,
+	logicalDir = dir,
 ): LoadSkillsResult {
 	const skills: Skill[] = [];
 	const diagnostics: ResourceDiagnostic[] = [];
@@ -184,9 +186,9 @@ function loadSkillsFromDirInternal(
 		return { skills, diagnostics };
 	}
 
-	const root = rootDir ?? dir;
+	const root = rootDir ?? logicalDir;
 	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	addIgnoreRules(ig, dir, root, logicalDir);
 
 	try {
 		const entries = readdirSync(dir, { withFileTypes: true });
@@ -196,7 +198,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const fullPath = join(dir, entry.name);
+			const fullPath = selectPath(join(dir, entry.name));
 
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
@@ -207,7 +209,7 @@ function loadSkillsFromDirInternal(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const relPath = toPosixPath(relative(root, join(logicalDir, entry.name)));
 			if (!isFile || ig.ignores(relPath)) {
 				continue;
 			}
@@ -230,7 +232,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const fullPath = join(dir, entry.name);
+			const fullPath = selectPath(join(dir, entry.name));
 
 			// For symlinks, check if they point to a directory and follow them
 			let isDirectory = entry.isDirectory();
@@ -246,14 +248,22 @@ function loadSkillsFromDirInternal(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const relPath = toPosixPath(relative(root, join(logicalDir, entry.name)));
 			const ignorePath = isDirectory ? `${relPath}/` : relPath;
 			if (ig.ignores(ignorePath)) {
 				continue;
 			}
 
 			if (isDirectory) {
-				const subResult = loadSkillsFromDirInternal(fullPath, source, false, ig, root);
+				const subResult = loadSkillsFromDirInternal(
+					fullPath,
+					source,
+					false,
+					ig,
+					root,
+					selectPath,
+					join(logicalDir, entry.name),
+				);
 				skills.push(...subResult.skills);
 				diagnostics.push(...subResult.diagnostics);
 				continue;
@@ -403,6 +413,7 @@ export interface LoadSkillsOptions {
 	agentDir: string;
 	/** Explicit skill paths (files or directories) */
 	skillPaths: string[];
+	selectPathForRoot?: (root: string) => ((path: string) => string) | undefined;
 	/** Include default skills directories. */
 	includeDefaults: boolean;
 }
@@ -471,7 +482,9 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	};
 
 	for (const rawPath of skillPaths) {
-		const resolvedPath = resolvePath(rawPath, resolvedCwd, { trim: true });
+		const original = resolvePath(rawPath, resolvedCwd, { trim: true });
+		const selectPath = options.selectPathForRoot?.(original);
+		const resolvedPath = selectPath?.(original) ?? original;
 		if (!existsSync(resolvedPath)) {
 			allDiagnostics.push({ type: "warning", message: "skill path does not exist", path: resolvedPath });
 			continue;
@@ -481,7 +494,7 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 			const stats = statSync(resolvedPath);
 			const source = getSource(resolvedPath);
 			if (stats.isDirectory()) {
-				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true));
+				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true, undefined, undefined, selectPath));
 			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
 				const result = loadSkillFromFile(resolvedPath, source);
 				if (result.skill) {

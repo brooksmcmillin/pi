@@ -104,6 +104,61 @@ describe("DefaultResourceLoader", () => {
 			}
 		});
 
+		it.skipIf(process.platform === "win32")(
+			"selects aliased children of explicit resource directories and preserves prompt names",
+			async () => {
+				const logical = join(cwd, "old");
+				const active = join(cwd, "selected");
+				const dir = join(cwd, "cli-resources");
+				for (const path of [logical, active, dir]) mkdirSync(path);
+				writeFileSync(join(logical, "review.md"), "Old review");
+				writeFileSync(join(logical, "removed.md"), "Removed review");
+				writeFileSync(join(active, "review.md"), "Selected review");
+				writeFileSync(join(active, "added.md"), "Added prompt");
+				writeFileSync(join(active, "SKILL.md"), "---\nname: selected\ndescription: Selected skill\n---\nBody");
+				const theme = JSON.parse(
+					readFileSync(join(process.cwd(), "src", "modes", "interactive", "theme", "dark.json"), "utf8"),
+				);
+				writeFileSync(join(active, "theme.json"), JSON.stringify({ ...theme, name: "selected-theme" }));
+				for (const name of ["added.md", "removed.md", "theme.json"])
+					symlinkSync(join(logical, name), join(dir, name));
+				const skillDir = join(dir, "skills");
+				mkdirSync(skillDir);
+				symlinkSync(join(logical, "SKILL.md"), join(skillDir, "SKILL.md"));
+				symlinkSync(join(logical, "review.md"), join(dir, "summary.md"));
+				const quick = join(cwd, "quick.md");
+				symlinkSync(join(logical, "review.md"), quick);
+				const snapshot = vi.spyOn(DefaultPackageManager.prototype, "resolve").mockResolvedValue({
+					extensions: [],
+					skills: [],
+					prompts: [],
+					themes: [],
+					gitRevisions: new Map([[logical, active]]),
+				});
+				try {
+					const loader = new DefaultResourceLoader({
+						cwd,
+						agentDir,
+						additionalSkillPaths: [skillDir],
+						additionalThemePaths: [dir],
+						additionalPromptTemplatePaths: [dir, quick],
+					});
+					await loader.reload();
+					expect(loader.getSkills().skills).toContainEqual(
+						expect.objectContaining({ filePath: join(active, "SKILL.md") }),
+					);
+					expect(loader.getThemes().themes).toContainEqual(expect.objectContaining({ name: "selected-theme" }));
+					expect(loader.getPrompts().prompts).toEqual([
+						expect.objectContaining({ name: "added", content: "Added prompt" }),
+						expect.objectContaining({ name: "summary", content: "Selected review" }),
+						expect.objectContaining({ name: "quick", content: "Selected review" }),
+					]);
+				} finally {
+					snapshot.mockRestore();
+				}
+			},
+		);
+
 		it("should initialize with empty results before reload", () => {
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 
