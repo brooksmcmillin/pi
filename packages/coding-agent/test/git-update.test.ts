@@ -1177,6 +1177,60 @@ describe("DefaultPackageManager git update", () => {
 		}
 	});
 
+	it.skipIf(process.platform === "win32")(
+		"keeps hidden manifest glob prefixes hidden after revision selection",
+		async () => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "added.md", "Selected prompt", "Add prompt");
+			const local = join(agentDir, "local-package");
+			mkdirSync(local);
+			symlinkSync(installedDir, join(local, ".resources"), "dir");
+			const manifest = (entry: string) =>
+				writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { prompts: [entry] } }));
+			settingsManager.setPackages([{ source: gitSource, autoload: false }, local]);
+			await packageManager.update();
+			manifest(".resources/*.md");
+			expect((await packageManager.resolve()).prompts).toEqual([]);
+			manifest(".resources/added.md");
+			expect((await packageManager.resolve()).prompts).toEqual([
+				expect.objectContaining({ path: join(selected(), "added.md") }),
+			]);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")("expands manifest globs through two selected checkouts", async () => {
+		setupRemoteAndInstall();
+		const secondSource = "git:github.com/test/other";
+		const secondRemote = join(tempDir, "second-remote");
+		const secondCheckout = join(dirname(installedDir), "other");
+		mkdirSync(secondRemote);
+		initGitRepo(secondRemote);
+		createCommit(secondRemote, "removed.md", "Old prompt", "Add old prompt");
+		git(["clone", secondRemote, secondCheckout], tempDir);
+		git(["rm", "removed.md"], secondRemote);
+		createCommit(secondRemote, "added.md", "Selected prompt", "Add new prompt");
+		mkdirSync(join(remoteDir, "assets"));
+		createCommit(remoteDir, "assets/old.md", "Old assets", "Add original assets");
+		git(["pull", "--ff-only"], installedDir);
+		git(["rm", "-r", "assets"], remoteDir);
+		symlinkSync(secondCheckout, join(remoteDir, "assets"), "dir");
+		git(["add", "assets"], remoteDir);
+		git(["commit", "-m", "Point assets to another checkout"], remoteDir);
+		const local = join(agentDir, "local-package");
+		mkdirSync(local);
+		const prefix = relative(local, join(installedDir, "assets"));
+		writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { prompts: [`${prefix}/*.md`] } }));
+		settingsManager.setPackages([
+			{ source: gitSource, autoload: false },
+			{ source: secondSource, autoload: false },
+			local,
+		]);
+		await packageManager.update();
+		expect((await packageManager.resolve()).prompts).toEqual([
+			expect.objectContaining({ path: join(selected(secondSource), "added.md") }),
+		]);
+	});
+
 	it("expands manifest globs from the selected checkout and retains original filter paths", async () => {
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "removed.md", "Old prompt", "Add old prompt");

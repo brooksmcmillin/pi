@@ -351,12 +351,14 @@ function hasGlobPattern(s: string): boolean {
 function expandPackageGlob(pattern: string, root: string): string[] {
 	return globSync(pattern, { cwd: root })
 		.map((match) => resolve(root, match))
-		.filter((path) =>
-			relative(root, path)
-				.split(sep)
-				.every((segment) => segment === ".." || !segment.startsWith(".")),
-		)
+		.filter((path) => isVisibleGlobPath(root, path))
 		.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function isVisibleGlobPath(root: string, path: string): boolean {
+	return relative(root, path)
+		.split(sep)
+		.every((segment) => segment === ".." || !segment.startsWith("."));
 }
 
 function splitPatterns(entries: string[]): { plain: string[]; patterns: string[] } {
@@ -2973,7 +2975,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (filterRoot !== packageRoot) {
 			metadata.gitRevision = { active: packageRoot, logical: filterRoot };
 		}
-		const selectPath = (path: string) => this.redirectGitResource(path, accumulator.gitRevisions);
+		const selectPath = (path: string) => this.redirectPackagePath(path, accumulator.gitRevisions);
 		const manifest = readPiManifest(selectPath(join(packageRoot, "package.json")));
 		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
 		if (changelogPath) {
@@ -3191,9 +3193,9 @@ export class DefaultPackageManager implements PackageManager {
 			const prefix = resolve(root, parts.slice(0, wildcard).join("/") || (isAbsolute(entry) ? sep : "."));
 			const selected = selectPath(prefix);
 			if (selected === prefix) return expandPackageGlob(entry, root);
-			return expandPackageGlob(parts.slice(wildcard).join("/"), selected).map((file) =>
-				join(prefix, relative(selected, file)),
-			);
+			return expandPackageGlob(parts.slice(wildcard).join("/"), selected)
+				.map((file) => join(prefix, relative(selected, file)))
+				.filter((file) => isVisibleGlobPath(root, file));
 		});
 		const patterns = entries.filter(isOverridePattern);
 		const allFiles = new Set<string>();
@@ -3344,6 +3346,26 @@ export class DefaultPackageManager implements PackageManager {
 			if (selected !== undefined) return selected;
 		}
 		return path;
+	}
+
+	private redirectPackagePath(path: string, revisions: ReadonlyMap<string, string>): string {
+		let selected = this.redirectGitResource(path, revisions);
+		const seen = new Set([path, selected]);
+		// A selected checkout can itself contain a link into another managed checkout.
+		for (let hops = 0; hops < 40; hops++) {
+			let next: string | undefined;
+			for (const [logical, active] of revisions) {
+				const candidate = redirectGitRevisionPath(selected, logical, active);
+				if (candidate !== undefined && candidate !== selected) {
+					next = candidate;
+					break;
+				}
+			}
+			if (next === undefined || seen.has(next)) break;
+			seen.add(next);
+			selected = next;
+		}
+		return selected;
 	}
 
 	private withGitRevision(
