@@ -89,7 +89,7 @@ export interface PathMetadata {
 	baseDir?: string;
 	changelogPath?: string;
 	packageRoot?: string;
-	gitRevision?: { logical: string; active: string; aliases?: readonly string[] };
+	gitRevision?: { logical: string; active: string; aliases?: readonly string[]; declarations?: readonly string[] };
 }
 
 export interface ResolvedResource {
@@ -1079,8 +1079,8 @@ function applyAutoloadDisabledPatterns(
 	baseDir: string,
 	logicalRoot = baseDir,
 	aliases?: ReadonlyMap<string, Set<string>>,
-): Map<string, boolean> {
-	const result = new Map<string, boolean>();
+): Map<string, { enabled: boolean; alias?: string }> {
+	const result = new Map<string, { enabled: boolean; alias?: string }>();
 	for (const pattern of patterns) {
 		const target = pattern.slice(
 			pattern.startsWith("+") || pattern.startsWith("-") || pattern.startsWith("!") ? 1 : 0,
@@ -1089,11 +1089,9 @@ function applyAutoloadDisabledPatterns(
 		const exact = pattern.startsWith("+") || pattern.startsWith("-");
 		const matcher = exact ? matchesAnyExactPattern : matchesAnyPattern;
 		for (const filePath of allPaths) {
-			if (
-				[...(aliases?.get(filePath) ?? [])].some((alias) => matcher(alias, [target], baseDir)) ||
-				matchesPackagePath(filePath, [target], baseDir, logicalRoot, matcher)
-			) {
-				result.set(filePath, enabled);
+			const alias = [...(aliases?.get(filePath) ?? [])].find((path) => matcher(path, [target], baseDir));
+			if (alias !== undefined || matchesPackagePath(filePath, [target], baseDir, logicalRoot, matcher)) {
+				result.set(filePath, { enabled, alias });
 			}
 		}
 	}
@@ -1306,7 +1304,7 @@ export class DefaultPackageManager implements PackageManager {
 				[path],
 				getOverridePatterns(projectSettings.extensions ?? []),
 				projectBaseDir,
-			).get(path);
+			).get(path)?.enabled;
 			this.addResource(
 				accumulator.extensions,
 				path,
@@ -3145,8 +3143,10 @@ export class DefaultPackageManager implements PackageManager {
 
 		const { allFiles, aliases } = this.collectManifestFiles(packageRoot, resourceType, manifest, selectPath);
 		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot, filterRoot, aliases);
-		for (const [filePath, enabled] of enabledByUser) {
-			this.addResource(target, filePath, this.withPackageAliases(metadata, aliases?.get(filePath)), enabled);
+		for (const [filePath, { enabled, alias }] of enabledByUser) {
+			const spellings = aliases?.get(filePath);
+			const ordered = alias === undefined ? spellings : new Set([alias, ...(spellings ?? [])]);
+			this.addResource(target, filePath, this.withPackageAliases(metadata, ordered), enabled);
 		}
 	}
 
@@ -3357,7 +3357,7 @@ export class DefaultPackageManager implements PackageManager {
 			this.addResource(
 				target,
 				f,
-				this.withGitRevision(metadata, f, gitRevisions, declaration.aliases),
+				this.withGitRevision(metadata, f, gitRevisions, declaration.aliases, spellings),
 				declaration.enabled,
 			);
 		}
@@ -3425,10 +3425,19 @@ export class DefaultPackageManager implements PackageManager {
 		path: string,
 		revisions: ReadonlyMap<string, string>,
 		aliases?: ReadonlySet<string>,
+		declarations?: ReadonlySet<string>,
 	): PathMetadata {
 		for (const [logical, active] of revisions) {
 			if (isPathInside(active, path))
-				return { ...metadata, gitRevision: { logical, active, aliases: aliases && [...aliases] } };
+				return {
+					...metadata,
+					gitRevision: {
+						logical,
+						active,
+						aliases: aliases && [...aliases],
+						declarations: declarations && [...declarations],
+					},
+				};
 		}
 		return metadata;
 	}

@@ -539,19 +539,27 @@ class ResourceList implements Component, Focusable {
 
 		// Generate pattern for this resource
 		const pattern = this.getResourcePattern(item);
-		const disablePattern = `-${pattern}`;
-		const enablePattern = `+${pattern}`;
-
+		const declarations = item.metadata.gitRevision?.declarations ?? [];
+		const baseDir = this.getTopLevelBaseDir(scope);
 		const updated = current.filter((p) => {
 			const stripped = this.getPatternEntryTarget(p);
 			if (item.metadata.gitRevision && stripped === p) return true;
-			return stripped !== pattern && !this.matchesGitRevisionOverride(item, stripped, scope);
+			return (
+				stripped !== pattern &&
+				!declarations.includes(resolvePath(stripped, baseDir, { trim: true })) &&
+				!this.matchesGitRevisionOverride(item, stripped, scope)
+			);
 		});
 
 		if (enabled) {
-			updated.push(enablePattern);
+			updated.push(`+${pattern}`);
 		} else {
-			updated.push(disablePattern);
+			for (const target of new Set([
+				pattern,
+				...(declarations.length > 1 ? declarations.map((path) => relative(baseDir, path)) : []),
+			])) {
+				updated.push(`-${target}`);
+			}
 		}
 
 		if (scope === "project") {

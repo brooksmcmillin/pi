@@ -1130,6 +1130,7 @@ describe("DefaultPackageManager git update", () => {
 			"configured-direct",
 			"configured-directory",
 			"package-include",
+			"package-delta-include",
 			"package-direct",
 			"manifest-directory",
 			"package-toggle",
@@ -1159,7 +1160,9 @@ describe("DefaultPackageManager git update", () => {
 			const declaration =
 				kind.startsWith("manifest") || kind.endsWith("toggle")
 					? dir
-					: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] };
+					: kind === "package-delta-include"
+						? { source: dir, autoload: false, prompts: ["+z-hide.md"] }
+						: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] };
 			if (kind === "package-project-toggle") settingsManager.setProjectPackages([declaration]);
 			else settingsManager.setPackages([{ source: gitSource, autoload: false }, declaration]);
 		} else {
@@ -1196,7 +1199,10 @@ describe("DefaultPackageManager git update", () => {
 				name:
 					kind === "configured-direct" || kind === "configured-directory" || kind === "package-direct"
 						? "review"
-						: firstExcluded || kind === "package-include" || kind === "manifest-directory"
+						: firstExcluded ||
+								kind === "package-include" ||
+								kind === "package-delta-include" ||
+								kind === "manifest-directory"
 							? "z-hide"
 							: "keep",
 				filePath: join(selected(), "review.md"),
@@ -1496,9 +1502,10 @@ describe("DefaultPackageManager git update", () => {
 		{ excluded: true, configured: "parent", linkedAgentDir: true },
 		{ excluded: true, configured: "parent", directFirst: true },
 		{ excluded: true, configured: "parent", directFirst: true, excludeAlias: true },
+		{ excluded: true, configured: "parent", directFirst: true, toggle: true },
 	])(
-		"keeps the prompt alias name while loading selected content ($excluded/$configured/$linkedAgentDir/$directFirst/$excludeAlias)",
-		async ({ excluded, configured, linkedAgentDir, directFirst, excludeAlias }) => {
+		"keeps the prompt alias name while loading selected content ($excluded/$configured/$linkedAgentDir/$directFirst/$excludeAlias/$toggle)",
+		async ({ excluded, configured, linkedAgentDir, directFirst, excludeAlias, toggle }) => {
 			if (linkedAgentDir) {
 				const realAgentDir = join(tempDir, "real-agent");
 				mkdirSync(realAgentDir);
@@ -1547,6 +1554,31 @@ describe("DefaultPackageManager git update", () => {
 							}),
 						],
 			);
+			if (toggle) {
+				settingsManager.setPromptTemplatePaths([join(selected(), "prompts", "review.md"), alias]);
+				const resolved = await packageManager.resolve();
+				const item = resolved.prompts[0]!;
+				const noop = () => {};
+				const selector = new ConfigSelectorComponent(
+					{ global: resolved, project: resolved },
+					settingsManager,
+					tempDir,
+					agentDir,
+					noop,
+					noop,
+					noop,
+				);
+				const list = selector.getResourceList() as unknown as {
+					toggleResource(resource: typeof item & { resourceType: "prompts" }): boolean;
+				};
+				expect(list.toggleResource({ ...item, resourceType: "prompts" })).toBe(false);
+				await loader.reload();
+				expect(loader.getPrompts().prompts).toEqual([]);
+				createCommit(remoteDir, "prompts/review.md", "Next review", "Advance selected revision");
+				await packageManager.update();
+				await loader.reload();
+				expect(loader.getPrompts().prompts).toEqual([]);
+			}
 		},
 	);
 
