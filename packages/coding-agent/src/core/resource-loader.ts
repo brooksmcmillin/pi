@@ -30,6 +30,7 @@ import {
 	type PackageInstallFailure,
 	type PathMetadata,
 	type ResolvedResource,
+	redirectGitRevisionPath,
 	type TemporaryGitSelection,
 } from "./package-manager.ts";
 import type { PromptTemplate } from "./prompt-templates.ts";
@@ -639,30 +640,38 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.extensionsResult = this.extensionsOverride ? this.extensionsOverride(extensionsResult) : extensionsResult;
 		this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
+		const selectExplicitPath = (source: string) => {
+			const path = this.resolveResourcePath(source);
+			for (const [logical, active] of resolvedPaths.gitRevisions ?? []) {
+				const selected = redirectGitRevisionPath(path, logical, active);
+				if (selected !== undefined) return selected;
+			}
+			return path;
+		};
+		const explicitSkills = this.additionalSkillPaths.map(selectExplicitPath);
 		const skillPaths = this.noSkills
-			? this.mergePaths(cliEnabledSkills, this.additionalSkillPaths)
-			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], this.additionalSkillPaths);
+			? this.mergePaths(cliEnabledSkills, explicitSkills)
+			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], explicitSkills);
 
 		this.lastSkillPaths = skillPaths;
 		this.updateSkillsFromPaths(skillPaths, metadataByPath);
-		for (const p of this.additionalSkillPaths) {
-			if (isLocalPath(p)) {
-				const resolved = this.resolveResourcePath(p);
+		for (const [i, resolved] of explicitSkills.entries()) {
+			if (isLocalPath(this.additionalSkillPaths[i]!)) {
 				if (!existsSync(resolved) && !this.skillDiagnostics.some((d) => d.path === resolved)) {
 					this.skillDiagnostics.push({ type: "error", message: "Skill path does not exist", path: resolved });
 				}
 			}
 		}
 
+		const explicitPrompts = this.additionalPromptTemplatePaths.map(selectExplicitPath);
 		const promptPaths = this.noPromptTemplates
-			? this.mergePaths(cliEnabledPrompts, this.additionalPromptTemplatePaths)
-			: this.mergePaths([...cliEnabledPrompts, ...enabledPrompts], this.additionalPromptTemplatePaths);
+			? this.mergePaths(cliEnabledPrompts, explicitPrompts)
+			: this.mergePaths([...cliEnabledPrompts, ...enabledPrompts], explicitPrompts);
 
 		this.lastPromptPaths = promptPaths;
 		this.updatePromptsFromPaths(promptPaths, metadataByPath);
-		for (const p of this.additionalPromptTemplatePaths) {
-			if (isLocalPath(p)) {
-				const resolved = this.resolveResourcePath(p);
+		for (const [i, resolved] of explicitPrompts.entries()) {
+			if (isLocalPath(this.additionalPromptTemplatePaths[i]!)) {
 				if (!existsSync(resolved) && !this.promptDiagnostics.some((d) => d.path === resolved)) {
 					this.promptDiagnostics.push({
 						type: "error",
@@ -673,14 +682,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 			}
 		}
 
+		const explicitThemes = this.additionalThemePaths.map(selectExplicitPath);
 		const themePaths = this.noThemes
-			? this.mergePaths(cliEnabledThemes, this.additionalThemePaths)
-			: this.mergePaths([...cliEnabledThemes, ...enabledThemes], this.additionalThemePaths);
+			? this.mergePaths(cliEnabledThemes, explicitThemes)
+			: this.mergePaths([...cliEnabledThemes, ...enabledThemes], explicitThemes);
 
 		this.lastThemePaths = themePaths;
 		this.updateThemesFromPaths(themePaths, metadataByPath);
-		for (const p of this.additionalThemePaths) {
-			const resolved = this.resolveResourcePath(p);
+		for (const resolved of explicitThemes) {
 			if (!existsSync(resolved) && !this.themeDiagnostics.some((d) => d.path === resolved)) {
 				this.themeDiagnostics.push({ type: "error", message: "Theme path does not exist", path: resolved });
 			}
@@ -949,7 +958,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 				promptPaths,
 				includeDefaults: false,
 			});
-			const deduped = this.dedupePrompts(loaded.templates);
+			const templates = loaded.templates.map((template) => {
+				const metadata = metadataByPath?.get(template.filePath);
+				const alias = (metadata?.gitRevision?.aliases ?? metadata?.packageAliases)?.find((path) =>
+					path.endsWith(".md"),
+				);
+				return alias ? { ...template, name: basename(alias, ".md") } : template;
+			});
+			const deduped = this.dedupePrompts(templates);
 			promptsResult = {
 				prompts: deduped.prompts,
 				diagnostics: [...loaded.diagnostics, ...deduped.diagnostics],

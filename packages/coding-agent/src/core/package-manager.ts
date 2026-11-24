@@ -969,7 +969,18 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 		let next: string | undefined;
 		for (let component = candidate; dirname(component) !== component; component = dirname(component)) {
 			try {
-				const target = resolve(realpathSync(dirname(component)), readlinkSync(component));
+				const link = readlinkSync(component);
+				let parent = realpathSync(dirname(component));
+				let suffix = link;
+				if (process.platform !== "win32" && link.split("/").includes("..")) {
+					// Let the filesystem interpret parent segments after resolving any directory links.
+					const parts = link.split("/");
+					const lastParent = parts.lastIndexOf("..");
+					const prefix = parts.slice(0, lastParent + 1).join("/");
+					parent = realpathSync.native(isAbsolute(link) ? prefix : `${parent}/${prefix}`);
+					suffix = parts.slice(lastParent + 1).join("/");
+				}
+				const target = resolve(parent, suffix);
 				next = join(target, candidate.slice(component.length));
 				break;
 			} catch {

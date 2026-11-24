@@ -59,6 +59,51 @@ describe("DefaultResourceLoader", () => {
 			},
 		);
 
+		it("loads explicit resources and diagnoses missing paths in the selected checkout", async () => {
+			const logical = join(cwd, "old");
+			const active = join(cwd, "selected");
+			mkdirSync(logical);
+			mkdirSync(active);
+			writeFileSync(join(logical, "prompt.md"), "Old content");
+			writeFileSync(join(logical, "removed.md"), "Removed content");
+			writeFileSync(join(active, "prompt.md"), "Selected content");
+			writeFileSync(
+				join(active, "skill.md"),
+				"---\nname: skill\ndescription: Selected skill\n---\nSelected content",
+			);
+			const theme = JSON.parse(
+				readFileSync(join(process.cwd(), "src", "modes", "interactive", "theme", "dark.json"), "utf8"),
+			);
+			writeFileSync(join(active, "theme.json"), JSON.stringify({ ...theme, name: "selected-theme" }));
+			const snapshot = vi.spyOn(DefaultPackageManager.prototype, "resolve").mockResolvedValue({
+				extensions: [],
+				skills: [],
+				prompts: [],
+				themes: [],
+				gitRevisions: new Map([[logical, active]]),
+			});
+			try {
+				const loader = new DefaultResourceLoader({
+					cwd,
+					agentDir,
+					additionalSkillPaths: [join(logical, "skill.md")],
+					additionalThemePaths: [join(logical, "theme.json")],
+					additionalPromptTemplatePaths: [join(logical, "prompt.md"), join(logical, "removed.md")],
+				});
+				await loader.reload();
+				expect(loader.getSkills().skills).toContainEqual(
+					expect.objectContaining({ filePath: join(active, "skill.md") }),
+				);
+				expect(loader.getThemes().themes).toContainEqual(expect.objectContaining({ name: "selected-theme" }));
+				expect(loader.getPrompts().prompts).toEqual([expect.objectContaining({ content: "Selected content" })]);
+				expect(loader.getPrompts().diagnostics).toContainEqual(
+					expect.objectContaining({ path: join(active, "removed.md") }),
+				);
+			} finally {
+				snapshot.mockRestore();
+			}
+		});
+
 		it("should initialize with empty results before reload", () => {
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 

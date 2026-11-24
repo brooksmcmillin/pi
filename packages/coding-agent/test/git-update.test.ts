@@ -1054,7 +1054,30 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
-	it.skipIf(process.platform === "win32").each(["direct", "symlinked parent", "chained", "dangling directory"])(
+	it.skipIf(process.platform === "win32")("keeps the prompt alias name while loading selected content", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "review.md", "Old review", "Add review prompt");
+		git(["pull", "--ff-only"], installedDir);
+		mkdirSync(join(agentDir, "prompts"));
+		symlinkSync(join(installedDir, "review.md"), join(agentDir, "prompts", "quick.md"));
+		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+		createCommit(remoteDir, "review.md", "Selected review", "Update review prompt");
+		await packageManager.update();
+		await settingsManager.flush();
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await loader.reload();
+		expect(loader.getPrompts().prompts).toEqual([
+			expect.objectContaining({
+				name: "quick",
+				content: "Selected review",
+				filePath: join(selected(), "review.md"),
+			}),
+		]);
+	});
+
+	it
+		.skipIf(process.platform === "win32")
+		.each(["direct", "symlinked parent", "chained", "dangling directory", "parent after link"])(
 		"discovers a dangling prompt alias when its target appears (%s)",
 		async (kind) => {
 			const linkedParent = kind === "symlinked parent";
@@ -1070,6 +1093,11 @@ describe("DefaultPackageManager git update", () => {
 				symlinkSync(dirname(target), bridge, "dir");
 				symlinkSync(relative(containingDir, join(bridge, "tool.md")), alias);
 				mkdirSync(join(remoteDir, "new-dir"));
+			} else if (kind === "parent after link") {
+				const directory = join(installedDir, "bridge-target");
+				mkdirSync(directory);
+				symlinkSync(directory, join(containingDir, "bridge"), "dir");
+				symlinkSync("bridge/../tool.md", alias);
 			} else if (kind === "chained") {
 				const intermediate = join(tempDir, "intermediate.md");
 				symlinkSync(relative(tempDir, target), intermediate);
