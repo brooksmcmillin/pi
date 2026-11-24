@@ -309,6 +309,31 @@ describe("DefaultPackageManager git update", () => {
 			expect(extensions.find((entry) => entry.path === join(active, "extensions", "enabled.ts"))?.enabled).toBe(
 				true,
 			);
+			if (kind === "active exact" || kind === "active delta") {
+				const item = extensions.find((entry) => entry.path === join(active, "extensions", "excluded.ts"));
+				if (!item) throw new Error("Expected excluded extension");
+				const noop = () => {};
+				const resolved = await packageManager.resolve();
+				const selector = new ConfigSelectorComponent(
+					{ global: resolved, project: resolved },
+					settingsManager,
+					tempDir,
+					agentDir,
+					noop,
+					noop,
+					noop,
+				);
+				const list = selector.getResourceList() as unknown as {
+					toggleResource(resource: typeof item & { resourceType: "extensions" }): boolean;
+				};
+				expect(list.toggleResource({ ...item, resourceType: "extensions" })).toBe(true);
+				const pkg = settingsManager.getGlobalSettings().packages?.[0];
+				if (typeof pkg !== "object" || !pkg.extensions) throw new Error("Expected package filters");
+				expect(pkg.extensions).not.toContainEqual(expect.stringMatching(/^-.*excluded\.ts$/));
+				expect((await packageManager.resolve()).extensions).toContainEqual(
+					expect.objectContaining({ path: item.path, enabled: true }),
+				);
+			}
 		},
 	);
 
@@ -402,87 +427,98 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.each(["root", "child", "explicit child", "explicit file", "explicit nested file", "retained alias exclusion"])(
-		"uses the selected manifest through a %s alias",
-		async (kind) => {
-			setupRemoteAndInstall();
-			settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
-			createCommit(remoteDir, "old.ts", "export default function() {}", "Add old entry");
-			const manifest = (entry: string) =>
-				JSON.stringify({ name: "fixture", version: "1.0.0", pi: { extensions: [entry] } });
-			createCommit(remoteDir, "package.json", manifest("./old.ts"), "Declare old entry");
-			const nested = kind === "explicit nested file";
-			const replacement = nested ? "assets/new.ts" : "new.ts";
-			if (nested) createCommit(remoteDir, "assets", "old file", "Add old assets file");
-			git(["pull", "--ff-only"], installedDir);
-			const root = join(agentDir, kind.startsWith("explicit") ? "custom-extensions" : "extensions");
-			const alias = kind === "root" ? root : join(root, "alias");
-			mkdirSync(dirname(alias), { recursive: true });
-			symlinkSync(installedDir, alias, process.platform === "win32" ? "junction" : "dir");
-			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-			const declarations =
-				kind === "explicit child" ? [root] : kind.startsWith("explicit") ? [join(alias, replacement)] : [];
-			settingsManager.setExtensionPaths([...declarations, `-${relative(agentDir, join(alias, replacement))}`]);
-			if (nested) {
-				git(["rm", "assets"], remoteDir);
-				mkdirSync(join(remoteDir, "assets"));
-			}
-			createCommit(remoteDir, replacement, "export default function() {}", "Add replacement");
-			createCommit(remoteDir, "package.json", manifest(`./${replacement}`), "Select replacement");
-			await packageManager.update();
-			const entries = (await packageManager.resolve()).extensions.filter((entry) =>
-				["old.ts", "new.ts"].includes(basename(entry.path)),
-			);
-			const first = join(selected(), replacement);
-			expect(existsSync(join(alias, replacement))).toBe(false);
-			expect(entries).toEqual([expect.objectContaining({ path: first, enabled: false })]);
-			if (kind !== "retained alias exclusion") {
-				settingsManager.setExtensionPaths([...declarations, `-${relative(agentDir, first)}`]);
-			}
-			createCommit(remoteDir, "extension.ts", "// v3", "Advance revision again");
-			await packageManager.update();
-			const next = join(selected(), replacement);
-			expect(next).not.toBe(first);
-			const resolved = await packageManager.resolve();
-			const entriesAfterUpdate = resolved.extensions.filter((entry) =>
-				["old.ts", "new.ts"].includes(basename(entry.path)),
-			);
-			expect(entriesAfterUpdate).toEqual([expect.objectContaining({ path: next, enabled: false })]);
-			const item = entriesAfterUpdate[0];
-			if (!item) throw new Error("Expected discovered extension");
-			const noop = () => {};
-			const selector = new ConfigSelectorComponent(
-				{ global: resolved, project: resolved },
-				settingsManager,
-				tempDir,
-				agentDir,
-				noop,
-				noop,
-				noop,
-			);
-			const list = selector.getResourceList() as unknown as {
-				toggleResource(resource: typeof item & { resourceType: "extensions" }): boolean;
-				setProjectTopLevelOverride(
-					resource: typeof item & { resourceType: "extensions" },
-					state: "inherit",
-				): boolean;
-			};
-			settingsManager.setProjectExtensionPaths([first, `-${first}`]);
-			expect(list.setProjectTopLevelOverride({ ...item, resourceType: "extensions" }, "inherit")).toBe(true);
-			expect(settingsManager.getProjectSettings().extensions).toEqual([]);
-			expect((await packageManager.resolve()).extensions).toContainEqual(
-				expect.objectContaining({ path: next, enabled: false }),
-			);
-			expect(list.toggleResource({ ...item, resourceType: "extensions" })).toBe(true);
-			expect(settingsManager.getGlobalSettings().extensions).toEqual([
-				...declarations,
-				`+${relative(agentDir, next)}`,
-			]);
-			expect((await packageManager.resolve()).extensions).toContainEqual(
-				expect.objectContaining({ path: next, enabled: true }),
-			);
-		},
-	);
+	it.each([
+		"root",
+		"child",
+		"explicit child",
+		"explicit file",
+		"explicit nested file",
+		"retained alias exclusion",
+		"historical glob",
+	])("uses the selected manifest through a %s alias", async (kind) => {
+		setupRemoteAndInstall();
+		settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
+		createCommit(remoteDir, "old.ts", "export default function() {}", "Add old entry");
+		const manifest = (entry: string) =>
+			JSON.stringify({ name: "fixture", version: "1.0.0", pi: { extensions: [entry] } });
+		createCommit(remoteDir, "package.json", manifest("./old.ts"), "Declare old entry");
+		const nested = kind === "explicit nested file";
+		if (kind === "explicit file" && process.platform !== "win32") {
+			writeFileSync(join(tempDir, "external.ts"), "export default function() {}");
+			symlinkSync(join(tempDir, "external.ts"), join(installedDir, "new.ts"));
+		}
+		const replacement = nested ? "assets/new.ts" : "new.ts";
+		if (nested) createCommit(remoteDir, "assets", "old file", "Add old assets file");
+		git(["pull", "--ff-only"], installedDir);
+		const root = join(agentDir, kind.startsWith("explicit") ? "custom-extensions" : "extensions");
+		const alias = kind === "root" ? root : join(root, "alias");
+		mkdirSync(dirname(alias), { recursive: true });
+		symlinkSync(installedDir, alias, process.platform === "win32" ? "junction" : "dir");
+		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+		const declarations =
+			kind === "explicit child" ? [root] : kind.startsWith("explicit") ? [join(alias, replacement)] : [];
+		settingsManager.setExtensionPaths([...declarations, `-${relative(agentDir, join(alias, replacement))}`]);
+		if (nested) {
+			git(["rm", "assets"], remoteDir);
+			mkdirSync(join(remoteDir, "assets"));
+		}
+		createCommit(remoteDir, replacement, "export default function() {}", "Add replacement");
+		createCommit(remoteDir, "package.json", manifest(`./${replacement}`), "Select replacement");
+		await packageManager.update();
+		const entries = (await packageManager.resolve()).extensions.filter((entry) =>
+			["old.ts", "new.ts"].includes(basename(entry.path)),
+		);
+		const first = join(selected(), replacement);
+		expect(existsSync(join(alias, replacement))).toBe(kind === "explicit file" && process.platform !== "win32");
+		expect(entries).toEqual([expect.objectContaining({ path: first, enabled: false })]);
+		if (kind !== "retained alias exclusion") {
+			const rule =
+				kind === "historical glob"
+					? `!${relative(agentDir, dirname(first))}/*.ts`
+					: `-${relative(agentDir, first)}`;
+			settingsManager.setExtensionPaths([...declarations, rule]);
+		}
+		createCommit(remoteDir, "extension.ts", "// v3", "Advance revision again");
+		await packageManager.update();
+		const next = join(selected(), replacement);
+		expect(next).not.toBe(first);
+		const resolved = await packageManager.resolve();
+		const entriesAfterUpdate = resolved.extensions.filter((entry) =>
+			["old.ts", "new.ts"].includes(basename(entry.path)),
+		);
+		expect(entriesAfterUpdate).toEqual([expect.objectContaining({ path: next, enabled: false })]);
+		const item = entriesAfterUpdate[0];
+		if (!item) throw new Error("Expected discovered extension");
+		const noop = () => {};
+		const selector = new ConfigSelectorComponent(
+			{ global: resolved, project: resolved },
+			settingsManager,
+			tempDir,
+			agentDir,
+			noop,
+			noop,
+			noop,
+		);
+		const list = selector.getResourceList() as unknown as {
+			toggleResource(resource: typeof item & { resourceType: "extensions" }): boolean;
+			setProjectTopLevelOverride(resource: typeof item & { resourceType: "extensions" }, state: "inherit"): boolean;
+		};
+		settingsManager.setProjectExtensionPaths([first, `-${first}`]);
+		expect(list.setProjectTopLevelOverride({ ...item, resourceType: "extensions" }, "inherit")).toBe(true);
+		expect(settingsManager.getProjectSettings().extensions).toEqual([]);
+		expect((await packageManager.resolve()).extensions).toContainEqual(
+			expect.objectContaining({ path: next, enabled: false }),
+		);
+		expect(list.toggleResource({ ...item, resourceType: "extensions" })).toBe(true);
+		expect(settingsManager.getGlobalSettings().extensions).toEqual([
+			...declarations,
+			...(kind === "historical glob" ? [`!${relative(agentDir, dirname(first))}/*.ts`] : []),
+			`+${relative(agentDir, next)}`,
+		]);
+		expect((await packageManager.resolve()).extensions).toContainEqual(
+			expect.objectContaining({ path: next, enabled: true }),
+		);
+	});
 
 	it("keeps a directory skill exclusion when toggling an adjacent standalone skill", async () => {
 		setupRemoteAndInstall();

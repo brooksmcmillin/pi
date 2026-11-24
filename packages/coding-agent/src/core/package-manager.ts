@@ -918,33 +918,43 @@ function applyPatterns(
 	return new Set(result);
 }
 
-function canonicalizeGitResourcePath(path: string): string {
-	let ancestor = path;
-	while (true) {
-		try {
-			return join(realpathSync(ancestor), relative(ancestor, path));
-		} catch (error) {
-			const parent = dirname(ancestor);
-			const code = (error as NodeJS.ErrnoException).code;
-			if ((code !== "ENOENT" && code !== "ENOTDIR") || parent === ancestor) return path;
-			ancestor = parent;
-		}
+export function redirectGitRevisionPath(path: string, logical: string, active: string): string | undefined {
+	function select(candidate: string, root: string): string | undefined {
+		// Windows path.relative folds case even on case-sensitive directories. Only
+		// canonical filesystem spellings should make different path spellings match.
+		if (candidate === root) return active;
+		if (candidate.startsWith(`${root}${sep}`)) return join(active, candidate.slice(root.length + 1));
+		const parent = dirname(root);
+		const boundary = parent.endsWith(sep) ? parent : `${parent}${sep}`;
+		if (!candidate.startsWith(boundary)) return undefined;
+		const [name, ...parts] = candidate.slice(boundary.length).split(sep);
+		const prefix = basename(active).slice(0, -6);
+		if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) return join(active, ...parts);
+		return undefined;
+	}
+
+	const direct = select(path, logical);
+	if (direct) return direct;
+	const root = canonicalizePath(logical);
+	// Check directory aliases too: a missing or redirected leaf in the old
+	// checkout should not hide its path in the selected revision.
+	for (let ancestor = path; ; ancestor = dirname(ancestor)) {
+		const canonical = canonicalizePath(ancestor);
+		const selected = select(join(canonical, path.slice(ancestor.length)), root);
+		if (selected) return selected;
+		if (dirname(ancestor) === ancestor) return undefined;
 	}
 }
 
-export function redirectGitRevisionPath(path: string, logical: string, active: string): string | undefined {
-	for (const [candidate, root] of [
-		[path, logical],
-		[canonicalizeGitResourcePath(path), canonicalizePath(logical)],
-	] as const) {
-		if (candidate === root || isPathInside(root, candidate)) return join(active, relative(root, candidate));
-		const parent = dirname(root);
-		if (!isPathInside(parent, candidate)) continue;
-		const [name, ...parts] = relative(parent, candidate).split(sep);
-		const prefix = basename(active).slice(0, -6);
-		if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) return join(active, ...parts);
-	}
-	return undefined;
+export function matchesGitPackageExactRule(
+	file: string,
+	rule: string,
+	revision: { active: string; logical: string },
+): boolean {
+	return (
+		isAbsolute(normalizePath(rule)) &&
+		matchesPackagePath(file, [rule], revision.active, revision.logical, matchesAnyExactPattern)
+	);
 }
 
 function matchesPackagePath(
@@ -2813,6 +2823,9 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 		filterRoot = packageRoot,
 	): boolean {
+		if (filterRoot !== packageRoot) {
+			metadata.gitRevision = { active: packageRoot, logical: filterRoot };
+		}
 		const manifest = readPiManifest(join(packageRoot, "package.json"));
 		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
 		if (changelogPath) {
@@ -3054,7 +3067,7 @@ export class DefaultPackageManager implements PackageManager {
 	): string[] {
 		if (gitRevisions.size === 0) return patterns;
 		return patterns.flatMap((pattern) => {
-			if (pattern[0] !== "+" && pattern[0] !== "-") return [pattern];
+			if (pattern[0] !== "+" && pattern[0] !== "-" && pattern[0] !== "!") return [pattern];
 			const original = this.resolvePathFromBase(pattern.slice(1), baseDir);
 			const active = this.redirectGitResource(original, gitRevisions);
 			return active === original ? [pattern] : [pattern, `${pattern[0]}${active}`];

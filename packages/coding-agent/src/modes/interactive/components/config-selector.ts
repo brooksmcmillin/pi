@@ -16,6 +16,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { CONFIG_DIR_NAME } from "../../../config.ts";
 import {
+	matchesGitPackageExactRule,
 	type PathMetadata,
 	type ResolvedPaths,
 	type ResolvedResource,
@@ -608,7 +609,7 @@ class ResourceList implements Component, Focusable {
 		// Filter out existing patterns for this resource
 		const updated = current.filter((p) => {
 			const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
-			return stripped !== pattern;
+			return stripped !== pattern && !this.matchesAbsoluteGitPackageOverride(item, p);
 		});
 
 		if (enabled) {
@@ -724,7 +725,8 @@ class ResourceList implements Component, Focusable {
 		}
 		const pattern = this.getPackageResourcePattern(item);
 		const updated = ((pkg[item.resourceType] ?? []) as string[]).filter(
-			(entry) => this.getPatternEntryTarget(entry) !== pattern,
+			(entry) =>
+				this.getPatternEntryTarget(entry) !== pattern && !this.matchesAbsoluteGitPackageOverride(item, entry),
 		);
 		if (state !== "inherit") updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
 		(pkg as Record<string, unknown>)[item.resourceType] = updated.length > 0 ? updated : undefined;
@@ -759,10 +761,19 @@ class ResourceList implements Component, Focusable {
 		if (typeof pkg !== "object") return "inherit";
 		const entries = pkg[item.resourceType];
 		if (entries === undefined) return "inherit";
-		return this.getOverrideStateFromEntries(
-			entries,
-			new Set([this.getPackageResourcePattern(item)]),
-			pkg.autoload !== false,
+		const patterns = new Set([this.getPackageResourcePattern(item)]);
+		for (const entry of entries) {
+			if (this.matchesAbsoluteGitPackageOverride(item, entry)) patterns.add(this.getPatternEntryTarget(entry));
+		}
+		return this.getOverrideStateFromEntries(entries, patterns, pkg.autoload !== false);
+	}
+
+	private matchesAbsoluteGitPackageOverride(item: ResourceItem, entry: string): boolean {
+		const revision = item.metadata.gitRevision;
+		return (
+			revision !== undefined &&
+			(entry.startsWith("+") || entry.startsWith("-")) &&
+			matchesGitPackageExactRule(item.path, entry.slice(1), revision)
 		);
 	}
 
