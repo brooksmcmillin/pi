@@ -1054,6 +1054,38 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
+	it.skipIf(process.platform === "win32")("loads discovered aliases to extensionless selected resources", async () => {
+		setupRemoteAndInstall();
+		const theme = JSON.parse(
+			readFileSync(join(process.cwd(), "src", "modes", "interactive", "theme", "dark.json"), "utf8"),
+		);
+		const fixtures = [
+			["prompts", "quick.md", "review", "Selected review"],
+			["skills", "guide.md", "guide", "---\nname: guide\ndescription: Selected guide\n---\nBody"],
+			["themes", "style.json", "style", JSON.stringify({ ...theme, name: "selected-style" })],
+		] as const;
+		for (const [kind, alias, target, content] of fixtures) {
+			createCommit(remoteDir, target, content, `Add ${kind} resource`);
+			mkdirSync(join(agentDir, kind));
+			symlinkSync(join(installedDir, target), join(agentDir, kind, alias));
+		}
+		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+		await packageManager.update();
+		await settingsManager.flush();
+		const active = selected();
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await loader.reload();
+		expect(loader.getPrompts().prompts).toEqual([
+			expect.objectContaining({ name: "quick", filePath: join(active, "review"), content: "Selected review" }),
+		]);
+		expect(loader.getSkills().skills).toContainEqual(
+			expect.objectContaining({ name: "guide", filePath: join(active, "guide") }),
+		);
+		expect(loader.getThemes().themes).toContainEqual(
+			expect.objectContaining({ name: "selected-style", sourcePath: join(active, "style") }),
+		);
+	});
+
 	it.skipIf(process.platform === "win32")("keeps the prompt alias name while loading selected content", async () => {
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "review.md", "Old review", "Add review prompt");

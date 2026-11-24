@@ -230,8 +230,8 @@ export interface LoadPromptTemplatesOptions {
 	/** Explicit prompt template paths (files or directories). */
 	promptPaths: string[];
 	selectPathForRoot?: (root: string) => ((path: string) => string) | undefined;
-	/** Logical name for a discovered file, not an explicitly supplied path. */
-	getDiscoveredPromptName?: (filePath: string) => string | undefined;
+	/** Declaration path for a discovered file, separate from its read path. */
+	getDiscoveredPath?: (filePath: string) => string | undefined;
 	/** Include default prompt directories. */
 	includeDefaults: boolean;
 }
@@ -303,6 +303,7 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions): LoadPr
 		const original = resolvePath(rawPath, resolvedCwd, { trim: true });
 		const selectPath = options.selectPathForRoot?.(original);
 		const resolvedPath = selectPath?.(original) ?? original;
+		const declaredPath = (selectPath ? undefined : options.getDiscoveredPath?.(resolvedPath)) ?? original;
 		if (!existsSync(resolvedPath)) {
 			continue;
 		}
@@ -311,11 +312,10 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions): LoadPr
 			const stats = statSync(resolvedPath);
 			if (stats.isDirectory()) {
 				addResult(loadTemplatesFromDir(resolvedPath, getSourceInfo, selectPath));
-			} else if (stats.isFile() && original.endsWith(".md")) {
+			} else if (stats.isFile() && declaredPath.endsWith(".md")) {
 				const result = loadTemplateFromFile(resolvedPath, getSourceInfo(resolvedPath));
 				if (result.template) {
-					const name = selectPath ? undefined : options.getDiscoveredPromptName?.(resolvedPath);
-					templates.push({ ...result.template, name: name ?? basename(original, ".md") });
+					templates.push({ ...result.template, name: basename(declaredPath, ".md") });
 				}
 				diagnostics.push(...result.diagnostics);
 			}

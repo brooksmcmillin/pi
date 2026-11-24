@@ -944,6 +944,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				agentDir: this.agentDir,
 				skillPaths,
 				selectPathForRoot: this.selectPathForRoot,
+				getDiscoveredPath: (path) => this.getDiscoveredResourceAlias(metadataByPath?.get(path), ".md"),
 				includeDefaults: false,
 			});
 		}
@@ -968,13 +969,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				agentDir: this.agentDir,
 				promptPaths,
 				selectPathForRoot: this.selectPathForRoot,
-				getDiscoveredPromptName: (filePath) => {
-					const metadata = metadataByPath?.get(filePath);
-					const alias = (metadata?.gitRevision?.aliases ?? metadata?.packageAliases)?.find((path) =>
-						path.endsWith(".md"),
-					);
-					return alias ? basename(alias, ".md") : undefined;
-				},
+				getDiscoveredPath: (path) => this.getDiscoveredResourceAlias(metadataByPath?.get(path), ".md"),
 				includeDefaults: false,
 			});
 			const deduped = this.dedupePrompts(loaded.templates);
@@ -1004,7 +999,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				...detectCapabilities(() => false),
 				...this.settingsManager.getTerminalCapabilityOverrides(),
 			});
-			const loaded = this.loadThemes(themePaths, false, colorMode);
+			const loaded = this.loadThemes(themePaths, false, colorMode, metadataByPath);
 			const deduped = this.dedupeThemes(loaded.themes);
 			themesResult = { themes: deduped.themes, diagnostics: [...loaded.diagnostics, ...deduped.diagnostics] };
 		}
@@ -1138,10 +1133,15 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return isSyntheticPath(p) ? p : resolvePath(p, this.cwd, { trim: true });
 	}
 
+	private getDiscoveredResourceAlias(metadata: PathMetadata | undefined, suffix: string): string | undefined {
+		return (metadata?.gitRevision?.aliases ?? metadata?.packageAliases)?.find((path) => path.endsWith(suffix));
+	}
+
 	private loadThemes(
 		paths: string[],
 		includeDefaults: boolean,
 		colorMode: TerminalColorMode,
+		metadataByPath?: Map<string, PathMetadata>,
 	): {
 		themes: Theme[];
 		diagnostics: ResourceDiagnostic[];
@@ -1160,6 +1160,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 			const original = this.resolveResourcePath(p);
 			const selectPath = this.selectPathForRoot?.(original);
 			const resolved = selectPath?.(original) ?? original;
+			const declaredPath =
+				(selectPath ? undefined : this.getDiscoveredResourceAlias(metadataByPath?.get(resolved), ".json")) ??
+				original;
 			if (!existsSync(resolved)) {
 				diagnostics.push({ type: "warning", message: "theme path does not exist", path: resolved });
 				continue;
@@ -1169,7 +1172,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				const stats = statSync(resolved);
 				if (stats.isDirectory()) {
 					this.loadThemesFromDir(resolved, themes, diagnostics, colorMode, selectPath);
-				} else if (stats.isFile() && original.endsWith(".json")) {
+				} else if (stats.isFile() && declaredPath.endsWith(".json")) {
 					this.loadThemeFromFile(resolved, themes, diagnostics, colorMode);
 				} else {
 					diagnostics.push({ type: "warning", message: "theme path is not a json file", path: resolved });

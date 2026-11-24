@@ -414,6 +414,7 @@ export interface LoadSkillsOptions {
 	/** Explicit skill paths (files or directories) */
 	skillPaths: string[];
 	selectPathForRoot?: (root: string) => ((path: string) => string) | undefined;
+	getDiscoveredPath?: (filePath: string) => string | undefined;
 	/** Include default skills directories. */
 	includeDefaults: boolean;
 }
@@ -495,7 +496,10 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 			const source = getSource(resolvedPath);
 			if (stats.isDirectory()) {
 				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true, undefined, undefined, selectPath));
-			} else if (stats.isFile() && original.endsWith(".md")) {
+			} else if (
+				stats.isFile() &&
+				((selectPath ? undefined : options.getDiscoveredPath?.(resolvedPath)) ?? original).endsWith(".md")
+			) {
 				const result = loadSkillFromFile(resolvedPath, source);
 				if (result.skill) {
 					addSkills({ skills: [result.skill], diagnostics: result.diagnostics });
