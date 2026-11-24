@@ -1744,6 +1744,29 @@ describe("DefaultPackageManager git update", () => {
 		]);
 	});
 
+	it("keeps Git package ownership when top-level settings exclude an exact duplicate", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		git(["pull", "--ff-only"], installedDir);
+		const original = join(installedDir, "extensions/worker.ts");
+		settingsManager.setExtensionPaths([original, `-${original}`]);
+		const assertWorker = async (checkout: string) => {
+			const { extensions } = await packageManager.resolve();
+			expect(extensions.filter(({ path }) => basename(path) === "worker.ts")).toEqual([
+				expect.objectContaining({
+					path: join(checkout, "extensions/worker.ts"),
+					enabled: true,
+					metadata: expect.objectContaining({ origin: "package" }),
+				}),
+			]);
+		};
+		await assertWorker(installedDir);
+		createCommit(remoteDir, "update.txt", "advance", "Advance revision");
+		await packageManager.update();
+		await assertWorker(selected());
+	});
+
 	it.skipIf(process.platform === "win32").each([false, true])(
 		"deduplicates an auto-discovered symlink to an old checkout (excluded: %s)",
 		async (excluded) => {
@@ -2275,6 +2298,7 @@ describe("DefaultPackageManager git update", () => {
 			"top-level-exclusion",
 			"delta-rule-order",
 			"top-level-replacement",
+			"top-level-exclusion-only-aliases",
 		])("keeps the same prompt winner with interleaved Git aliases (%s)", async (mode) => {
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "shared.md", "Aliased prompt", "Add shared prompt");
@@ -2311,10 +2335,12 @@ describe("DefaultPackageManager git update", () => {
 		} else if (mode === "top-level-replacement") {
 			settingsManager.setPackages([{ source: gitSource, prompts: [] }]);
 			settingsManager.setPromptTemplatePaths([join(installedDir, "b/review.md"), join(installedDir, "c/review.md")]);
-		} else if (mode === "top-level-exclusion") {
+		} else if (mode === "top-level-exclusion" || mode === "top-level-exclusion-only-aliases") {
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 			settingsManager.setPromptTemplatePaths([
-				...["a/first.md", "b/review.md", "c/review.md"].map((path) => join(installedDir, path)),
+				...["a/first.md", ...(mode === "top-level-exclusion" ? ["b/review.md"] : []), "c/review.md"].map((path) =>
+					join(installedDir, path),
+				),
 				`-${join(installedDir, "a/first.md")}`,
 			]);
 		} else if (mode !== "manifest-exclusion") {
@@ -2332,6 +2358,10 @@ describe("DefaultPackageManager git update", () => {
 		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 		const verifyWinner = async (checkout: string) => {
 			await loader.reload();
+			if (mode === "top-level-exclusion-only-aliases") {
+				expect(loader.getPrompts().prompts).toEqual([]);
+				return;
+			}
 			expect(loader.getPrompts().prompts.find(({ name }) => name === "review")).toMatchObject({
 				content: mode === "delta-rule-order" ? "Aliased prompt" : "Independent prompt",
 				filePath: join(

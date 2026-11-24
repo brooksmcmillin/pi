@@ -3433,16 +3433,26 @@ export class DefaultPackageManager implements PackageManager {
 				);
 				return applyPatterns([spelling], candidateRules, baseDir).has(spelling);
 			};
-			let declaration = chooseResourceAlias(spellings, matches);
+			// Before redirection, canonical deduplication keeps the first declaration,
+			// even when disabled. Skip direct duplicates already owned by the package.
 			const existing = target.get(f);
-			// A direct spelling cannot override a disabled package row, but a later
-			// independent spelling can, provided its own settings rules enable it.
-			if (revision && existing?.metadata.origin === "package" && !existing.enabled && declaration.enabled) {
-				const independent = [...(spellings ?? [])].find(
-					(alias) => alias !== f && this.isIndependentGitAlias(alias, revision) && matches(new Set([alias])),
-				);
-				if (independent) declaration = { aliases: new Set([independent]), enabled: true };
+			const candidates = new Set<string>();
+			const seen = new Set<string>();
+			for (const alias of spellings ?? []) {
+				if (
+					revision &&
+					existing?.metadata.origin === "package" &&
+					(alias === f || !this.isIndependentGitAlias(alias, revision))
+				)
+					continue;
+				if (existsSync(alias)) {
+					const key = getResourcePathKey(alias);
+					if (seen.has(key)) continue;
+					seen.add(key);
+				}
+				candidates.add(alias);
 			}
+			const declaration = chooseResourceAlias(candidates.size ? candidates : undefined, matches);
 			return {
 				f,
 				metadata: this.withGitRevision(metadata, f, gitRevisions, declaration.aliases, spellings),
@@ -3868,14 +3878,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (
 			!existing ||
 			(metadata.origin === "top-level" &&
-				revision?.aliases?.some(
-					(alias) =>
-						alias !== path &&
-						(!enabled ||
-							existing.enabled ||
-							metadata.source === "auto" ||
-							this.isIndependentGitAlias(alias, revision)),
-				) &&
+				revision?.aliases?.some((alias) => alias !== path && this.isIndependentGitAlias(alias, revision)) &&
 				resourcePrecedenceRank(metadata) < resourcePrecedenceRank(existing.metadata))
 		) {
 			// A replacement takes its position from the winning declaration, not the displaced row.
