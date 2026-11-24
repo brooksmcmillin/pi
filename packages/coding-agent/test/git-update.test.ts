@@ -1258,6 +1258,29 @@ describe("DefaultPackageManager git update", () => {
 			expect.objectContaining({ path: join(selected(secondSource), "added.md") }),
 		]);
 
+		const checkConfigured = async (sources: string[], expectedPaths: string[]) => {
+			settingsManager.setPackages(sources.map((source) => ({ source, autoload: false })));
+			settingsManager.setPromptTemplatePaths([join(local, "resources", "assets")]);
+			const { prompts } = await packageManager.resolve();
+			expect(
+				prompts
+					.filter((prompt) => prompt.enabled)
+					.map((prompt) => prompt.path)
+					.sort(),
+			).toEqual(expectedPaths.sort());
+			settingsManager.setPromptTemplatePaths([]);
+		};
+		const sourceOrders = [
+			[gitSource, secondSource],
+			[secondSource, gitSource],
+		];
+		for (const sources of sourceOrders) {
+			await checkConfigured(sources, [
+				join(selected(secondSource), "added.md"),
+				join(selected(secondSource), "excluded.md"),
+			]);
+		}
+
 		// The next revision replaces A's link with a real directory. A retained
 		// checkout must not redirect this declaration into B in either order.
 		git(["pull", "--ff-only"], installedDir);
@@ -1266,14 +1289,11 @@ describe("DefaultPackageManager git update", () => {
 		mkdirSync(join(remoteDir, "assets"));
 		createCommit(remoteDir, "assets/replacement.md", "New assets", "Replace assets link");
 		await packageManager.update();
-		for (const sources of [
-			[gitSource, secondSource],
-			[secondSource, gitSource],
-		]) {
+		for (const sources of sourceOrders) {
+			const replacement = join(selected(), "assets", "replacement.md");
+			await checkConfigured(sources, [replacement]);
 			settingsManager.setPackages([...sources.map((source) => ({ source, autoload: false })), local]);
-			expect((await packageManager.resolve()).prompts).toEqual([
-				expect.objectContaining({ path: join(selected(), "assets", "replacement.md") }),
-			]);
+			expect((await packageManager.resolve()).prompts).toEqual([expect.objectContaining({ path: replacement })]);
 		}
 	});
 

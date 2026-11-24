@@ -3359,11 +3359,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private redirectGitResource(path: string, revisions: ReadonlyMap<string, string>): string {
-		for (const [logical, active] of revisions) {
-			const selected = redirectGitRevisionPath(path, logical, active);
-			if (selected !== undefined) return selected;
-		}
-		return path;
+		return DefaultPackageManager.selectGitResourcePath(path, revisions);
 	}
 
 	static selectGitResourcePath(path: string, revisions?: ReadonlyMap<string, string>): string {
