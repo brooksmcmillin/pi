@@ -1132,17 +1132,19 @@ describe("DefaultPackageManager git update", () => {
 			"package-include",
 			"package-delta-include",
 			"package-delta-mixed",
+			"package-project-delta-mixed",
 			"package-direct",
 			"manifest-directory",
 			"package-toggle",
 			"package-project-toggle",
 		])("loads the surviving prompt alias (%s)", async (kind) => {
 		const asPackage = kind.startsWith("package") || kind.startsWith("manifest");
+		const mixedDelta = kind.endsWith("delta-mixed");
 		const firstExcluded = kind.endsWith("-first");
 		const excluded = firstExcluded ? "keep.md" : "z-hide.md";
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "review.md", "Selected review", "Add prompt");
-		if (kind === "package-delta-mixed") git(["pull", "--ff-only"], installedDir);
+		if (mixedDelta) git(["pull", "--ff-only"], installedDir);
 		const dir = join(agentDir, kind.startsWith("auto") ? "prompts" : "local-prompts");
 		mkdirSync(dir);
 		for (const name of ["keep.md", "z-hide.md"]) symlinkSync(join(installedDir, "review.md"), join(dir, name));
@@ -1164,10 +1166,13 @@ describe("DefaultPackageManager git update", () => {
 					? dir
 					: kind === "package-delta-include"
 						? { source: dir, autoload: false, prompts: ["+z-hide.md"] }
-						: kind === "package-delta-mixed"
+						: mixedDelta
 							? { source: dir, autoload: false, prompts: ["+keep.md", "-z-hide.md"] }
 							: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] };
-			if (kind === "package-project-toggle") settingsManager.setProjectPackages([declaration]);
+			if (kind === "package-project-delta-mixed") {
+				settingsManager.setPackages([{ source: gitSource, autoload: false }, dir]);
+				settingsManager.setProjectPackages([declaration]);
+			} else if (kind === "package-project-toggle") settingsManager.setProjectPackages([declaration]);
 			else settingsManager.setPackages([{ source: gitSource, autoload: false }, declaration]);
 		} else {
 			settingsManager.setPromptTemplatePaths(
@@ -1176,7 +1181,7 @@ describe("DefaultPackageManager git update", () => {
 					: [`-prompts/${excluded}`],
 			);
 		}
-		if (kind === "package-delta-mixed") {
+		if (mixedDelta) {
 			const before = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await before.reload();
 			expect(before.getPrompts().prompts.map(({ name }) => name)).toEqual(["keep"]);
@@ -1219,6 +1224,34 @@ describe("DefaultPackageManager git update", () => {
 				content: "Selected review",
 			}),
 		]);
+		if (kind === "package-project-delta-mixed") {
+			const globalManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager: SettingsManager.inMemory(settingsManager.getGlobalSettings()),
+			});
+			const project = await packageManager.resolve();
+			const item = { ...project.prompts[0]!, resourceType: "prompts" as const };
+			const noop = () => {};
+			const selector = new ConfigSelectorComponent(
+				{ global: await globalManager.resolve(), project },
+				settingsManager,
+				tempDir,
+				agentDir,
+				noop,
+				noop,
+				noop,
+				undefined,
+				"project",
+			);
+			const list = selector.getResourceList() as unknown as {
+				getProjectOverrideState(resource: typeof item): string;
+				toggleResource(resource: typeof item): boolean;
+			};
+			expect(list.getProjectOverrideState(item)).toBe("load");
+			expect(list.toggleResource(item)).toBe(true);
+			expect(settingsManager.getProjectSettings().packages).toEqual([]);
+		}
 		if (kind.endsWith("toggle")) {
 			const project = kind === "package-project-toggle";
 			const toggle = async () => {
@@ -1743,13 +1776,18 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32")(
-		"loads a selected checkout's prompt symlink from its selected target",
-		async () => {
+	it.skipIf(process.platform === "win32").each([false, true])(
+		"loads a selected checkout's prompt symlink from its selected target (mixed delta: %s)",
+		async (delta) => {
 			setupRemoteAndInstall();
-			createCommit(remoteDir, "review.md", "Retained review", "Add review target");
 			mkdirSync(join(remoteDir, "prompts"));
-			symlinkSync(join(installedDir, "review.md"), join(remoteDir, "prompts", "quick.md"));
+			const target = delta ? "prompts/review.md" : "review.md";
+			createCommit(remoteDir, target, "Retained review", "Add review target");
+			symlinkSync(join(installedDir, target), join(remoteDir, "prompts", "quick.md"));
+			if (delta)
+				settingsManager.setPackages([
+					{ source: gitSource, autoload: false, prompts: ["+prompts/quick.md", "-prompts/review.md"] },
+				]);
 			git(["add", "prompts/quick.md"], remoteDir);
 			git(["commit", "-m", "Declare prompt alias"], remoteDir);
 			git(["pull", "--ff-only"], installedDir);
@@ -1758,17 +1796,17 @@ describe("DefaultPackageManager git update", () => {
 			expect(loader.getPrompts().prompts).toEqual([
 				expect.objectContaining({ name: "quick", content: "Retained review" }),
 			]);
-			createCommit(remoteDir, "review.md", "Selected review", "Update review target");
+			createCommit(remoteDir, target, "Selected review", "Update review target");
 			await packageManager.update();
 			await loader.reload();
 			expect(loader.getPrompts().prompts).toEqual([
 				expect.objectContaining({
 					name: "quick",
 					content: "Selected review",
-					filePath: join(selected(), "review.md"),
+					filePath: join(selected(), target),
 				}),
 			]);
-			expect(readFileSync(join(installedDir, "review.md"), "utf8")).toBe("Retained review");
+			expect(readFileSync(join(installedDir, target), "utf8")).toBe("Retained review");
 		},
 	);
 

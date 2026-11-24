@@ -82,6 +82,7 @@ function getNpmVersionRange(version: string | undefined): string | undefined {
 }
 
 export interface PathMetadata {
+	packageDelta?: boolean;
 	packageAliases?: readonly string[];
 	source: string;
 	scope: SourceScope;
@@ -3159,7 +3160,12 @@ export class DefaultPackageManager implements PackageManager {
 		for (const [filePath, { enabled, alias }] of enabledByUser) {
 			const spellings = aliases?.get(filePath);
 			const ordered = alias === undefined ? spellings : new Set([alias, ...(spellings ?? [])]);
-			this.addResource(target, filePath, this.withPackageAliases(metadata, ordered), enabled);
+			this.addResource(
+				target,
+				filePath,
+				this.withPackageAliases({ ...metadata, packageDelta: true }, ordered),
+				enabled,
+			);
 		}
 	}
 
@@ -3266,6 +3272,7 @@ export class DefaultPackageManager implements PackageManager {
 		selectPath: (path: string) => string,
 		directoriesOnly = false,
 	) {
+		const direct = new Set<string>();
 		const aliases = new Map<string, Set<string>>();
 		const allFiles = new Set<string>();
 		const rememberAlias = (file: string, alias: string) => {
@@ -3293,9 +3300,11 @@ export class DefaultPackageManager implements PackageManager {
 				if (!existsSync(active)) continue;
 				const logical = logicalPath(path);
 				if (logical !== active) rememberAlias(active, logical);
+				else if (path === selected || isPathInside(selected, path)) direct.add(active);
 				allFiles.add(active);
 			}
 		}
+		for (const path of direct) if (aliases.has(path)) rememberAlias(path, path);
 		return { allFiles: [...allFiles], aliases };
 	}
 

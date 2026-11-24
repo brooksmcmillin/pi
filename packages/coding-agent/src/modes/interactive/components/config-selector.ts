@@ -777,7 +777,16 @@ class ResourceList implements Component, Focusable {
 		for (const entry of entries) {
 			if (this.matchesAbsoluteGitPackageOverride(item, entry)) patterns.add(this.getPatternEntryTarget(entry));
 		}
-		return this.getOverrideStateFromEntries(entries, patterns, pkg.autoload !== false);
+		const state = this.getOverrideStateFromEntries(entries, patterns, pkg.autoload !== false);
+		if (
+			state !== "inherit" &&
+			pkg.autoload === false &&
+			item.metadata.scope === "project" &&
+			item.metadata.packageDelta
+		) {
+			return item.enabled ? "load" : "unload";
+		}
+		return state;
 	}
 
 	private matchesAbsoluteGitPackageOverride(item: ResourceItem, entry: string): boolean {
