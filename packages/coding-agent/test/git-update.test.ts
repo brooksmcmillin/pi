@@ -1488,15 +1488,21 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
-	it.skipIf(process.platform === "win32").each([false, true])(
-		"keeps the prompt alias name while loading selected content (package excluded: %s)",
-		async (excluded) => {
+	it.skipIf(process.platform === "win32").each([
+		{ excluded: false, configured: false },
+		{ excluded: true, configured: false },
+		{ excluded: true, configured: true },
+	])(
+		"keeps the prompt alias name while loading selected content ($excluded/$configured)",
+		async ({ excluded, configured }) => {
 			setupRemoteAndInstall();
 			mkdirSync(join(remoteDir, "prompts"));
 			createCommit(remoteDir, "prompts/review.md", "Old review", "Add review prompt");
 			git(["pull", "--ff-only"], installedDir);
-			mkdirSync(join(agentDir, "prompts"));
-			symlinkSync(join(installedDir, "prompts", "review.md"), join(agentDir, "prompts", "quick.md"));
+			const alias = join(configured ? tempDir : join(agentDir, "prompts"), "quick.md");
+			mkdirSync(dirname(alias), { recursive: true });
+			symlinkSync(join(installedDir, "prompts", "review.md"), alias);
+			if (configured) settingsManager.setPromptTemplatePaths([alias]);
 			if (excluded) settingsManager.setPackages([{ source: gitSource, prompts: [] }]);
 			const before = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await before.reload();
@@ -1630,6 +1636,35 @@ describe("DefaultPackageManager git update", () => {
 			createCommit(remoteDir, "extension.ts", "// v2", "Advance revision");
 			await packageManager.update();
 			expect((await assertWorker())?.path).toBe(join(selected(), "extensions", "worker.ts"));
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"loads a selected checkout's prompt symlink from its selected target",
+		async () => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "review.md", "Retained review", "Add review target");
+			mkdirSync(join(remoteDir, "prompts"));
+			symlinkSync(join(installedDir, "review.md"), join(remoteDir, "prompts", "quick.md"));
+			git(["add", "prompts/quick.md"], remoteDir);
+			git(["commit", "-m", "Declare prompt alias"], remoteDir);
+			git(["pull", "--ff-only"], installedDir);
+			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			await loader.reload();
+			expect(loader.getPrompts().prompts).toEqual([
+				expect.objectContaining({ name: "quick", content: "Retained review" }),
+			]);
+			createCommit(remoteDir, "review.md", "Selected review", "Update review target");
+			await packageManager.update();
+			await loader.reload();
+			expect(loader.getPrompts().prompts).toEqual([
+				expect.objectContaining({
+					name: "quick",
+					content: "Selected review",
+					filePath: join(selected(), "review.md"),
+				}),
+			]);
+			expect(readFileSync(join(installedDir, "review.md"), "utf8")).toBe("Retained review");
 		},
 	);
 

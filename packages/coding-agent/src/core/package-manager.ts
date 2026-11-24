@@ -957,7 +957,8 @@ export function redirectGitRevisionPath(
 
 	function selectPath(candidate: string): string | undefined {
 		const direct = select(candidate, logical);
-		if (direct) return direct;
+		if (direct && (direct !== candidate || logical === active)) return direct;
+		// A path already in the selected checkout can still be a link into a retained copy.
 		const root = canonicalizePath(logical);
 		let selected = select(canonicalizePath(candidate), root);
 		let boundary = candidate.length;
@@ -965,12 +966,13 @@ export function redirectGitRevisionPath(
 			const canonical = canonicalizePath(ancestor);
 			// An outer checkout alias takes precedence over symlinks inside the old checkout.
 			const match = select(join(canonical, candidate.slice(ancestor.length)), root);
-			if (match !== undefined) {
+			if (match !== undefined && match !== candidate) {
 				selected = match;
 				boundary = ancestor.length;
 			}
 			if (dirname(ancestor) === ancestor) break;
 		}
+		if (selected === candidate) return undefined;
 		if (selected && candidate === path) onBoundary?.(boundary);
 		return selected;
 	}
@@ -3685,9 +3687,15 @@ export class DefaultPackageManager implements PackageManager {
 		// configured declaration still does not undo an explicit package exclusion.
 		if (
 			!existing ||
-			((!enabled || existing.enabled || metadata.source === "auto") &&
-				metadata.origin === "top-level" &&
-				metadata.gitRevision?.aliases?.some((alias) => alias !== path) &&
+			(metadata.origin === "top-level" &&
+				metadata.gitRevision?.aliases?.some(
+					(alias) =>
+						alias !== path &&
+						(!enabled ||
+							existing.enabled ||
+							metadata.source === "auto" ||
+							lstatSync(alias, { throwIfNoEntry: false })?.isSymbolicLink()),
+				) &&
 				resourcePrecedenceRank(metadata) < resourcePrecedenceRank(existing.metadata))
 		) {
 			map.set(path, { metadata, enabled });
