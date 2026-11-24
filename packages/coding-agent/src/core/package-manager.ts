@@ -878,8 +878,10 @@ function applyPatterns(
 	baseDir: string,
 	logicalRoot = baseDir,
 	aliases?: ReadonlyMap<string, Set<string>>,
+	matchRule?: (rule: string, matcher: typeof matchesAnyPattern) => boolean,
 ): Set<string> {
 	const matches = (file: string, rules: string[], matcher: typeof matchesAnyPattern) => {
+		if (matchRule) return rules.some((rule) => matchRule(rule, matcher));
 		if (matchesPackagePath(file, rules, baseDir, logicalRoot, matcher)) return true;
 		for (const alias of aliases?.get(file) ?? []) {
 			if (matcher(alias, rules, baseDir)) return true;
@@ -1091,7 +1093,9 @@ function applyAutoloadDisabledPatterns(
 		const matcher = exact ? matchesAnyExactPattern : matchesAnyPattern;
 		for (const filePath of allPaths) {
 			const spellings = [...(aliases?.get(filePath) ?? [])];
-			let matched: (string | undefined)[] = spellings.filter((path) => matcher(path, [target], baseDir));
+			let matched: (string | undefined)[] = spellings.filter((path) =>
+				matchesPackagePath(path, [target], baseDir, logicalRoot, matcher),
+			);
 			if (!matched.length && matchesPackagePath(filePath, [target], baseDir, logicalRoot, matcher)) {
 				matched = spellings.length ? spellings : [undefined];
 			}
@@ -3133,9 +3137,14 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Apply user patterns
 		for (const f of allFiles) {
-			const declaration = chooseResourceAlias(aliases?.get(f), (alias) =>
-				applyPatterns([f], userPatterns, packageRoot, filterRoot, alias ? new Map([[f, alias]]) : undefined).has(f),
-			);
+			const spellings = aliases?.get(f);
+			const declaration = chooseResourceAlias(spellings, (alias) => {
+				return applyPatterns([f], userPatterns, packageRoot, filterRoot, undefined, (rule, matcher) => {
+					const matches = (path: string) => matchesPackagePath(path, [rule], packageRoot, filterRoot, matcher);
+					if (alias && [...(spellings ?? [])].some(matches)) return [...alias].some(matches);
+					return matches(f);
+				}).has(f);
+			});
 			const allAliases = new Set([...(declaration.aliases ?? []), ...(aliases?.get(f) ?? [])]);
 			this.addResource(target, f, this.withPackageAliases(metadata, allAliases), declaration.enabled);
 		}

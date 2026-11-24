@@ -1776,18 +1776,28 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32").each([false, true])(
-		"loads a selected checkout's prompt symlink from its selected target (mixed delta: %s)",
-		async (delta) => {
+	it.skipIf(process.platform === "win32").each(["default", "delta", "absolute-delta", "manifest"])(
+		"loads a selected checkout's prompt symlink from its selected target (%s)",
+		async (mode) => {
 			setupRemoteAndInstall();
 			mkdirSync(join(remoteDir, "prompts"));
-			const target = delta ? "prompts/review.md" : "review.md";
+			const target = mode === "default" ? "review.md" : "prompts/review.md";
 			createCommit(remoteDir, target, "Retained review", "Add review target");
 			symlinkSync(join(installedDir, target), join(remoteDir, "prompts", "quick.md"));
-			if (delta)
+			if (mode !== "default") {
+				const exclusion = mode === "absolute-delta" ? join(installedDir, target) : target;
 				settingsManager.setPackages([
-					{ source: gitSource, autoload: false, prompts: ["+prompts/quick.md", "-prompts/review.md"] },
+					{ source: gitSource, autoload: mode === "manifest", prompts: ["+prompts/quick.md", `-${exclusion}`] },
 				]);
+			}
+			if (mode === "manifest") {
+				createCommit(
+					remoteDir,
+					"package.json",
+					JSON.stringify({ pi: { prompts: ["prompts/quick.md", target] } }),
+					"Declare prompts",
+				);
+			}
 			git(["add", "prompts/quick.md"], remoteDir);
 			git(["commit", "-m", "Declare prompt alias"], remoteDir);
 			git(["pull", "--ff-only"], installedDir);
