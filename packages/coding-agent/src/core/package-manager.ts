@@ -846,6 +846,7 @@ function isEnabledByOverrides(
 	patterns: string[],
 	baseDir: string,
 	aliases: Iterable<string> = [],
+	globReadPath?: string,
 ): boolean {
 	const matches = (rules: string[], matcher: typeof matchesAnyPattern) => {
 		if (matcher(filePath, rules, baseDir)) return true;
@@ -858,7 +859,10 @@ function isEnabledByOverrides(
 	const forceExcludes = overrides.filter((pattern) => pattern.startsWith("-")).map((pattern) => pattern.slice(1));
 
 	let enabled = true;
-	if (excludes.length > 0 && matches(excludes, matchesAnyPattern)) {
+	if (
+		excludes.length > 0 &&
+		(matches(excludes, matchesAnyPattern) || (globReadPath && matchesAnyPattern(globReadPath, excludes, baseDir)))
+	) {
 		enabled = false;
 	}
 	if (forceIncludes.length > 0 && matches(forceIncludes, matchesAnyExactPattern)) {
@@ -3383,20 +3387,15 @@ export class DefaultPackageManager implements PackageManager {
 				if (!alias || !revision)
 					return applyPatterns([f], rules, baseDir, baseDir, alias ? new Map([[f, alias]]) : undefined).has(f);
 				const spelling = alias.values().next().value!;
-				const selectSpelling = (path: string) => selectGitDeclarationPath(path, revision);
-				const candidateRules = patterns.flatMap((pattern) => {
-					if (!pattern.startsWith("+") && !pattern.startsWith("-")) {
-						return this.redirectGitExactRules([pattern], baseDir, gitRevisions, aliases);
-					}
-					const rule = pattern.slice(1);
-					if ([...(spellings ?? [])].some((path) => matchesAnyExactPattern(path, [rule], baseDir)))
-						return [pattern];
-					const original = this.resolvePathFromBase(rule, baseDir);
-					const historical = selectSpelling(original);
-					return matchesAnyExactPattern(selectSpelling(spelling), [historical], baseDir)
-						? [pattern, `${pattern[0]}${spelling}`]
-						: [pattern];
-				});
+				const candidateRules = this.getDeclarationRules(
+					spelling,
+					revision,
+					patterns,
+					baseDir,
+					gitRevisions,
+					aliases,
+					spellings,
+				);
 				return applyPatterns([spelling], candidateRules, baseDir).has(spelling);
 			};
 			let declaration = chooseResourceAlias(spellings, matches);
@@ -3416,6 +3415,29 @@ export class DefaultPackageManager implements PackageManager {
 				declaration.enabled,
 			);
 		}
+	}
+
+	private getDeclarationRules(
+		spelling: string,
+		revision: NonNullable<PathMetadata["gitRevision"]>,
+		patterns: string[],
+		baseDir: string,
+		gitRevisions: ReadonlyMap<string, string>,
+		aliases: ReadonlyMap<string, Set<string>>,
+		spellings?: ReadonlySet<string>,
+	): string[] {
+		const normalized = selectGitDeclarationPath(spelling, revision);
+		return patterns.flatMap((pattern) => {
+			if (!pattern.startsWith("+") && !pattern.startsWith("-")) {
+				return this.redirectGitExactRules([pattern], baseDir, gitRevisions, aliases);
+			}
+			const rule = pattern.slice(1);
+			if ([...(spellings ?? [])].some((path) => matchesAnyExactPattern(path, [rule], baseDir))) return [pattern];
+			const historical = selectGitDeclarationPath(this.resolvePathFromBase(rule, baseDir), revision);
+			return matchesAnyExactPattern(normalized, [historical], baseDir)
+				? [pattern, `${pattern[0]}${spelling}`]
+				: [pattern];
+		});
 	}
 
 	private redirectGitExactRules(
@@ -3586,13 +3608,30 @@ export class DefaultPackageManager implements PackageManager {
 			}
 			const rules = this.redirectGitExactRules(overrides, baseDir, accumulator.gitRevisions, discovered);
 			for (const [active, spellings] of discovered) {
-				const declaration = chooseResourceAlias(spellings, (alias) =>
-					isEnabledByOverrides(active, rules, baseDir, alias),
-				);
+				const revision = this.withGitRevision(metadata, active, accumulator.gitRevisions).gitRevision;
+				const declaration = chooseResourceAlias(spellings, (alias) => {
+					if (!alias || !revision) return isEnabledByOverrides(active, rules, baseDir, alias);
+					const spelling = alias.values().next().value!;
+					return isEnabledByOverrides(
+						spelling,
+						this.getDeclarationRules(
+							spelling,
+							revision,
+							overrides,
+							baseDir,
+							accumulator.gitRevisions,
+							discovered,
+							spellings,
+						),
+						baseDir,
+						[],
+						active,
+					);
+				});
 				this.addResource(
 					target,
 					active,
-					this.withGitRevision(metadata, active, accumulator.gitRevisions, declaration.aliases),
+					this.withGitRevision(metadata, active, accumulator.gitRevisions, declaration.aliases, spellings),
 					declaration.enabled,
 				);
 			}

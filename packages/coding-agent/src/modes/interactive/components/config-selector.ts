@@ -676,7 +676,9 @@ class ResourceList implements Component, Focusable {
 
 	private setProjectTopLevelOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
 		const current = (this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[];
-		const pattern = this.isInheritedGlobalItem(item) ? item.path : this.getResourcePatternForScope(item, "project");
+		const pattern = this.isInheritedGlobalItem(item)
+			? (item.metadata.gitRevision?.aliases?.[0] ?? item.path)
+			: this.getResourcePatternForScope(item, "project");
 		const patterns = this.getTopLevelOverridePatterns(item, "project");
 		const updated = current.filter((entry) => {
 			const target = this.getPatternEntryTarget(entry);

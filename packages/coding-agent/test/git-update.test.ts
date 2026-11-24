@@ -1848,7 +1848,9 @@ describe("DefaultPackageManager git update", () => {
 		expect(readFileSync(join(installedDir, target), "utf8")).toBe("Retained review");
 	});
 
-	it.skipIf(process.platform === "win32").each(["manifest", "settings", "settings-exact", "external-exact"])(
+	it
+		.skipIf(process.platform === "win32")
+		.each(["manifest", "settings", "settings-exact", "external-exact", "external-directory", "auto-exact"])(
 		"does not discover a hidden prompt target independently of its excluded directory alias (%s)",
 		async (source) => {
 			setupRemoteAndInstall();
@@ -1866,29 +1868,46 @@ describe("DefaultPackageManager git update", () => {
 			git(["pull", "--ff-only"], installedDir);
 			const declaredRoot = join(installedDir, "prompts");
 			const hiddenTarget = join(declaredRoot, ".hidden", "note.md");
-			const external = source === "external-exact";
-			const exact = external || source === "settings-exact";
-			const declared = external ? join(tempDir, "shortcut.md") : declaredRoot;
-			if (external) symlinkSync(hiddenTarget, declared);
-			const glob = external ? `!${declared}` : `!${relative(agentDir, declaredRoot)}/**/note.md`;
+			const auto = source === "auto-exact";
+			const external = source === "external-exact" || auto;
+			const directory = source === "external-directory";
+			const exact = external || directory || source === "settings-exact";
+			const declared = directory
+				? join(tempDir, "shortcut")
+				: external
+					? join(auto ? join(agentDir, "prompts") : tempDir, "shortcut.md")
+					: declaredRoot;
+			if (external) {
+				mkdirSync(dirname(declared), { recursive: true });
+				symlinkSync(hiddenTarget, declared);
+			}
+			if (directory) symlinkSync(dirname(hiddenTarget), declared, "dir");
+			const glob = directory
+				? `!${declared}/*.md`
+				: external
+					? `!${declared}`
+					: `!${relative(agentDir, declaredRoot)}/**/note.md`;
 			if (source !== "manifest") {
 				settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-				settingsManager.setPromptTemplatePaths([declared, glob, ...(exact ? [`+${hiddenTarget}`] : [])]);
+				settingsManager.setPromptTemplatePaths(
+					auto ? [`-${hiddenTarget}`] : [declared, glob, ...(exact ? [`+${hiddenTarget}`] : [])],
+				);
 			}
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await loader.reload();
-			expect(loader.getPrompts().prompts).toEqual([]);
+			expect(loader.getPrompts().prompts.map(({ content }) => content)).toEqual(auto ? ["Original note"] : []);
 			createCommit(remoteDir, "prompts/.hidden/note.md", "Selected note", "Update note");
 			await packageManager.update();
 			await loader.reload();
-			expect(loader.getPrompts().prompts).toEqual([]);
+			expect(loader.getPrompts().prompts.map(({ content }) => content)).toEqual(auto ? ["Selected note"] : []);
+			if (auto) return;
 			if (source !== "manifest") {
 				settingsManager.setPromptTemplatePaths([declared, ...(exact ? [`-${hiddenTarget}`] : [])]);
 				await loader.reload();
 				expect(loader.getPrompts().prompts.map(({ content }) => content)).toEqual(["Selected note"]);
 				const [prompt] = (await packageManager.resolve()).prompts;
 				expect(prompt?.metadata.gitRevision?.declarations).toEqual([
-					external ? declared : join(declaredRoot, "shortcut", "note.md"),
+					directory ? join(declared, "note.md") : external ? declared : join(declaredRoot, "shortcut", "note.md"),
 				]);
 				if (source === "settings") {
 					const toggle = async () => {
@@ -1935,6 +1954,61 @@ describe("DefaultPackageManager git update", () => {
 					metadata: expect.objectContaining({ packageAliases: [join(active, "prompts", "shortcut", "note.md")] }),
 				}),
 			]);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"preserves an inherited prompt alias through project overrides and publication",
+		async () => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "review", "Old review", "Add review");
+			git(["pull", "--ff-only"], installedDir);
+			const alias = join(agentDir, "prompts", "quick.md");
+			mkdirSync(dirname(alias));
+			symlinkSync(join(installedDir, "review"), alias);
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			createCommit(remoteDir, "review", "Selected review", "Update review");
+			await packageManager.update();
+			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			const globalManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager: SettingsManager.inMemory(settingsManager.getGlobalSettings()),
+			});
+			const toggle = async () => {
+				const project = await packageManager.resolve();
+				const row = { ...project.prompts[0]!, resourceType: "prompts" as const };
+				const noop = () => {};
+				const selector = new ConfigSelectorComponent(
+					{ global: await globalManager.resolve(), project },
+					settingsManager,
+					tempDir,
+					agentDir,
+					noop,
+					noop,
+					noop,
+					undefined,
+					"project",
+				);
+				return (
+					selector.getResourceList() as unknown as { toggleResource(item: typeof row): boolean }
+				).toggleResource(row);
+			};
+			const prompts = async () => {
+				await loader.reload();
+				return loader.getPrompts().prompts.map(({ name, content }) => [name, content]);
+			};
+			expect(await prompts()).toEqual([["quick", "Selected review"]]);
+			expect(await toggle()).toBe(false);
+			expect(await prompts()).toEqual([]);
+			expect(await toggle()).toBe(true);
+			expect(await prompts()).toEqual([["quick", "Selected review"]]);
+			createCommit(remoteDir, "review", "Next review", "Advance review");
+			await packageManager.update();
+			expect(await prompts()).toEqual([["quick", "Next review"]]);
+			expect(await toggle()).toBe(true);
+			expect(settingsManager.getProjectSettings().prompts).toEqual([]);
+			expect(await prompts()).toEqual([["quick", "Next review"]]);
 		},
 	);
 
