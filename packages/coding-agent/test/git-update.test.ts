@@ -163,6 +163,43 @@ describe("DefaultPackageManager git update", () => {
 		return manager.getGitInstallPath(manager.parseSource(source), scope);
 	};
 
+	it.skipIf(process.platform === "win32")(
+		"preserves a project extension exclusion when checkout selection collapses the alias",
+		async () => {
+			setupRemoteAndInstall();
+			createCommit(
+				remoteDir,
+				"extension.ts",
+				"export default function(pi) { pi.registerCommand('git-alias-fixture', { handler: async () => {} }); }",
+				"Add extension",
+			);
+			createCommit(
+				remoteDir,
+				"package.json",
+				JSON.stringify({ pi: { extensions: ["extension.ts"] } }),
+				"Declare extension",
+			);
+			await packageManager.update();
+			const active = join(selected(), "extension.ts");
+			expect((await packageManager.resolve()).extensions).toContainEqual(
+				expect.objectContaining({ path: active, enabled: true }),
+			);
+			const alias = join(tempDir, "extension-alias.ts");
+			symlinkSync(join(installedDir, "extension.ts"), alias);
+			settingsManager.setProjectExtensionPaths([alias, `-${alias}`]);
+			const { extensions } = await packageManager.resolve();
+			expect(extensions.filter((entry) => entry.path === active)).toEqual([
+				expect.objectContaining({
+					enabled: false,
+					metadata: expect.objectContaining({ scope: "project", origin: "top-level" }),
+				}),
+			]);
+			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			await loader.reload();
+			expect(loader.getExtensions().extensions.some((extension) => extension.path === active)).toBe(false);
+		},
+	);
+
 	describe("normal updates (no force-push)", () => {
 		it("should skip reset, clean, and install when already up to date", async () => {
 			mkdirSync(remoteDir, { recursive: true });
@@ -1294,6 +1331,25 @@ describe("DefaultPackageManager git update", () => {
 			await checkConfigured(sources, [replacement]);
 			settingsManager.setPackages([...sources.map((source) => ({ source, autoload: false })), local]);
 			expect((await packageManager.resolve()).prompts).toEqual([expect.objectContaining({ path: replacement })]);
+		}
+		for (const roots of [
+			[join(installedDir, "assets"), secondCheckout],
+			[secondCheckout, join(installedDir, "assets")],
+		]) {
+			const loader = new DefaultResourceLoader({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+				noPromptTemplates: true,
+				additionalPromptTemplatePaths: roots,
+			});
+			await loader.reload();
+			expect(
+				loader
+					.getPrompts()
+					.prompts.map((prompt) => prompt.name)
+					.sort(),
+			).toEqual(["added", "excluded", "replacement"]);
 		}
 	});
 

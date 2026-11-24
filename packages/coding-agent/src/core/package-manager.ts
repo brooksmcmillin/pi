@@ -3669,7 +3669,16 @@ export class DefaultPackageManager implements PackageManager {
 		enabled: boolean,
 	): void {
 		if (!path) return;
-		if (!map.has(path)) {
+		const existing = map.get(path);
+		// An explicit top-level exclusion must survive selection collapsing an alias
+		// onto a package entry. A plain declaration does not undo a package exclusion.
+		if (
+			!existing ||
+			(!enabled &&
+				metadata.origin === "top-level" &&
+				metadata.source === "local" &&
+				existing.metadata.origin === "package")
+		) {
 			map.set(path, { metadata, enabled });
 		}
 	}

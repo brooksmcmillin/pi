@@ -670,8 +670,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 		};
 		const explicitSkills = this.additionalSkillPaths;
 		const skillPaths = this.noSkills
-			? this.mergePaths(cliEnabledSkills, explicitSkills)
-			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], explicitSkills);
+			? this.mergePaths(cliEnabledSkills, explicitSkills, selectExplicitPath)
+			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], explicitSkills, selectExplicitPath);
 
 		this.lastSkillPaths = skillPaths;
 		this.updateSkillsFromPaths(skillPaths, metadataByPath);
@@ -686,8 +686,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		const explicitPrompts = this.additionalPromptTemplatePaths;
 		const promptPaths = this.noPromptTemplates
-			? this.mergePaths(cliEnabledPrompts, explicitPrompts)
-			: this.mergePaths([...cliEnabledPrompts, ...enabledPrompts], explicitPrompts);
+			? this.mergePaths(cliEnabledPrompts, explicitPrompts, selectExplicitPath)
+			: this.mergePaths([...cliEnabledPrompts, ...enabledPrompts], explicitPrompts, selectExplicitPath);
 
 		this.lastPromptPaths = promptPaths;
 		this.updatePromptsFromPaths(promptPaths, metadataByPath);
@@ -706,8 +706,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		const explicitThemes = this.additionalThemePaths;
 		const themePaths = this.noThemes
-			? this.mergePaths(cliEnabledThemes, explicitThemes)
-			: this.mergePaths([...cliEnabledThemes, ...enabledThemes], explicitThemes);
+			? this.mergePaths(cliEnabledThemes, explicitThemes, selectExplicitPath)
+			: this.mergePaths([...cliEnabledThemes, ...enabledThemes], explicitThemes, selectExplicitPath);
 
 		this.lastThemePaths = themePaths;
 		this.updateThemesFromPaths(themePaths, metadataByPath);
@@ -1148,17 +1148,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 		};
 	}
 
-	private mergePaths(primary: string[], additional: string[]): string[] {
+	private mergePaths(primary: string[], additional: string[], selectAdditional?: (path: string) => string): string[] {
 		const merged: string[] = [];
 		const seen = new Set<string>();
-
-		for (const p of [...primary, ...additional]) {
-			const resolved = this.resolveResourcePath(p);
-			const pathKey = getResourcePathKey(resolved);
-			if (seen.has(pathKey)) continue;
-			seen.add(pathKey);
-			merged.push(resolved);
-		}
+		const append = (paths: string[], select?: (path: string) => string) => {
+			for (const p of paths) {
+				const resolved = this.resolveResourcePath(p);
+				const pathKey = getResourcePathKey(select?.(resolved) ?? resolved);
+				if (seen.has(pathKey)) continue;
+				seen.add(pathKey);
+				merged.push(resolved);
+			}
+		};
+		append(primary);
+		append(additional, selectAdditional);
 
 		return merged;
 	}
