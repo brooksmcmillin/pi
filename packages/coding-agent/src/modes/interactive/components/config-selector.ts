@@ -604,9 +604,7 @@ class ResourceList implements Component, Focusable {
 
 		// Write exclusions for each declaration so another alias cannot re-enable the row.
 		const pattern = this.getPackageResourcePattern(item);
-		const { baseDir, packageAliases } = item.metadata;
-		const patterns = new Set([pattern]);
-		if (baseDir) for (const alias of packageAliases ?? []) patterns.add(relative(baseDir, alias));
+		const patterns = this.getPackageResourcePatterns(item, pattern);
 		const enablePattern = `+${pattern}`;
 
 		// Filter out existing patterns for this resource
@@ -731,7 +729,10 @@ class ResourceList implements Component, Focusable {
 			(entry) =>
 				this.getPatternEntryTarget(entry) !== pattern && !this.matchesAbsoluteGitPackageOverride(item, entry),
 		);
-		if (state !== "inherit") updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+		if (state === "load") updated.push(`+${pattern}`);
+		if (state === "unload") {
+			for (const path of this.getPackageResourcePatterns(item, pattern)) updated.push(`-${path}`);
+		}
 		(pkg as Record<string, unknown>)[item.resourceType] = updated.length > 0 ? updated : undefined;
 		if (!RESOURCE_TYPES.some((key) => (pkg as Record<string, unknown>)[key] !== undefined)) {
 			if (pkg.autoload === false) packages.splice(pkgIndex, 1);
@@ -903,6 +904,13 @@ class ResourceList implements Component, Focusable {
 		const scope = item.metadata.scope as "user" | "project";
 		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(scope);
 		return relative(baseDir, item.path);
+	}
+
+	private getPackageResourcePatterns(item: ResourceItem, preferred: string): Set<string> {
+		const { baseDir, packageAliases } = item.metadata;
+		const patterns = new Set([preferred]);
+		if (baseDir) for (const alias of packageAliases ?? []) patterns.add(relative(baseDir, alias));
+		return patterns;
 	}
 
 	private getPackageResourcePattern(item: ResourceItem): string {

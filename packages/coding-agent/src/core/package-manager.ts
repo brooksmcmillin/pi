@@ -3277,6 +3277,7 @@ export class DefaultPackageManager implements PackageManager {
 				const active = this.redirectGitResource(file, gitRevisions);
 				if (active !== file && !existsSync(active)) continue;
 				allFiles.add(active);
+				if (active === file && original === selected && file === original) rememberAlias(active, file);
 				if (active !== file || original !== selected) {
 					const spellings = aliases.get(active) ?? new Set<string>();
 					if (active !== file) spellings.add(file);

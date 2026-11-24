@@ -1063,9 +1063,11 @@ describe("DefaultPackageManager git update", () => {
 			"configured",
 			"auto-first",
 			"configured-first",
+			"configured-direct",
 			"package-include",
 			"manifest-directory",
 			"package-toggle",
+			"package-project-toggle",
 		])("loads the surviving prompt alias (%s)", async (kind) => {
 		const asPackage = kind.startsWith("package") || kind.startsWith("manifest");
 		const firstExcluded = kind.endsWith("-first");
@@ -1088,12 +1090,12 @@ describe("DefaultPackageManager git update", () => {
 					},
 				}),
 			);
-			settingsManager.setPackages([
-				{ source: gitSource, autoload: false },
-				kind.startsWith("manifest") || kind === "package-toggle"
+			const declaration =
+				kind.startsWith("manifest") || kind.endsWith("toggle")
 					? dir
-					: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] },
-			]);
+					: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] };
+			if (kind === "package-project-toggle") settingsManager.setProjectPackages([declaration]);
+			else settingsManager.setPackages([{ source: gitSource, autoload: false }, declaration]);
 		} else {
 			settingsManager.setPromptTemplatePaths(
 				kind.startsWith("configured")
@@ -1102,30 +1104,45 @@ describe("DefaultPackageManager git update", () => {
 			);
 		}
 		await packageManager.update();
+		if (kind === "configured-direct") {
+			const alias = join(dir, "keep.md");
+			settingsManager.setPromptTemplatePaths([alias, join(selected(), "review.md"), `-${alias}`]);
+		}
 		await settingsManager.flush();
 		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 		await loader.reload();
 		expect(loader.getPrompts().prompts).toEqual([
 			expect.objectContaining({
-				name: firstExcluded || kind === "package-include" || kind === "manifest-directory" ? "z-hide" : "keep",
+				name:
+					kind === "configured-direct"
+						? "review"
+						: firstExcluded || kind === "package-include" || kind === "manifest-directory"
+							? "z-hide"
+							: "keep",
 				filePath: join(selected(), "review.md"),
 				content: "Selected review",
 			}),
 		]);
-		if (kind === "package-toggle") {
+		if (kind.endsWith("toggle")) {
+			const project = kind === "package-project-toggle";
 			const toggle = async () => {
 				const resolved = await packageManager.resolve();
 				const [item] = resolved.prompts;
 				if (!item) throw new Error("Missing prompt row");
 				const noop = () => {};
 				const selector = new ConfigSelectorComponent(
-					{ global: resolved, project: resolved },
+					{
+						global: project ? { extensions: [], skills: [], prompts: [], themes: [] } : resolved,
+						project: resolved,
+					},
 					settingsManager,
 					tempDir,
 					agentDir,
 					noop,
 					noop,
 					noop,
+					undefined,
+					project ? "project" : "global",
 				);
 				const list = selector.getResourceList() as unknown as {
 					toggleResource(resource: typeof item & { resourceType: "prompts" }): boolean;
