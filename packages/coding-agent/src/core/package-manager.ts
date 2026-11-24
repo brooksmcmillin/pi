@@ -87,7 +87,7 @@ export interface PathMetadata {
 	baseDir?: string;
 	changelogPath?: string;
 	packageRoot?: string;
-	gitRevision?: { logical: string; active: string };
+	gitRevision?: { logical: string; active: string; aliases?: readonly string[] };
 }
 
 export interface ResolvedResource {
@@ -3029,7 +3029,12 @@ export class DefaultPackageManager implements PackageManager {
 		const enabledPaths = applyPatterns([...allFiles], rules, baseDir, baseDir, aliases);
 
 		for (const f of allFiles) {
-			this.addResource(target, f, this.withGitRevision(metadata, f, gitRevisions), enabledPaths.has(f));
+			this.addResource(
+				target,
+				f,
+				this.withGitRevision(metadata, f, gitRevisions, aliases.get(f)),
+				enabledPaths.has(f),
+			);
 		}
 	}
 
@@ -3055,9 +3060,15 @@ export class DefaultPackageManager implements PackageManager {
 		return path;
 	}
 
-	private withGitRevision(metadata: PathMetadata, path: string, revisions: ReadonlyMap<string, string>): PathMetadata {
+	private withGitRevision(
+		metadata: PathMetadata,
+		path: string,
+		revisions: ReadonlyMap<string, string>,
+		aliases?: ReadonlySet<string>,
+	): PathMetadata {
 		for (const [logical, active] of revisions) {
-			if (isPathInside(active, path)) return { ...metadata, gitRevision: { logical, active } };
+			if (isPathInside(active, path))
+				return { ...metadata, gitRevision: { logical, active, aliases: aliases && [...aliases] } };
 		}
 		return metadata;
 	}
@@ -3154,7 +3165,7 @@ export class DefaultPackageManager implements PackageManager {
 				this.addResource(
 					target,
 					active,
-					this.withGitRevision(metadata, active, accumulator.gitRevisions),
+					this.withGitRevision(metadata, active, accumulator.gitRevisions, spellings),
 					isEnabledByOverrides(active, rules, baseDir, spellings),
 				);
 			}

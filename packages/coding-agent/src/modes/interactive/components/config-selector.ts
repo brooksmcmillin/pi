@@ -677,7 +677,12 @@ class ResourceList implements Component, Focusable {
 				(patterns.has(target) || this.matchesGitRevisionOverride(item, target, "project"))
 			)
 				return false;
-			return !(state === "inherit" && this.isInheritedGlobalItem(item) && target === pattern);
+			return !(
+				state === "inherit" &&
+				this.isInheritedGlobalItem(item) &&
+				(target === pattern ||
+					(entry === target && this.matchesGitRevisionOverride(item, target, "project", false)))
+			);
 		});
 		if (state !== "inherit") {
 			// Project entries name inherited files to override them. Built-in paths need no entry.
@@ -787,12 +792,23 @@ class ResourceList implements Component, Focusable {
 		return this.getItemScope(item) === "user" || this.inheritedEnabledByKey.has(this.getResourceItemKey(item));
 	}
 
-	private matchesGitRevisionOverride(item: ResourceItem, target: string, scope: SettingsScope): boolean {
+	private matchesGitRevisionOverride(
+		item: ResourceItem,
+		target: string,
+		scope: SettingsScope,
+		matchSkillDirectory = true,
+	): boolean {
 		const revision = item.metadata.gitRevision;
 		if (!revision) return false;
 		const path = resolvePath(target, this.getTopLevelBaseDir(scope), { trim: true });
 		const selected = redirectGitRevisionPath(path, revision.logical, revision.active);
-		return selected === item.path || (item.resourceType === "skills" && selected === dirname(item.path));
+		return (
+			selected === item.path ||
+			revision.aliases?.includes(path) === true ||
+			(matchSkillDirectory &&
+				item.resourceType === "skills" &&
+				(selected === dirname(item.path) || revision.aliases?.some((alias) => dirname(alias) === path) === true))
+		);
 	}
 
 	private getTopLevelOverridePatterns(item: ResourceItem, scope: SettingsScope): Set<string> {
