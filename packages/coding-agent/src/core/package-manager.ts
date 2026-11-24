@@ -2179,7 +2179,31 @@ export class DefaultPackageManager implements PackageManager {
 	private getGitUpdateStatePath(targetDir: string, scope: SourceScope): string {
 		const packageRoot = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
 		const stateRoot = join(packageRoot, ".git-update-state");
-		const identity = relative(packageRoot, targetDir);
+		let identity = relative(packageRoot, targetDir);
+		if (process.platform === "darwin") {
+			// Use the stored spelling only when the volume actually resolves the alias.
+			let parent = packageRoot;
+			identity = identity
+				.split(sep)
+				.map((part) => {
+					let name = part;
+					if (existsSync(join(parent, part))) {
+						const entries = readdirSync(parent);
+						if (!entries.includes(part)) {
+							const requested = statSync(join(parent, part));
+							name =
+								entries.find((entry) => {
+									if (entry.toLowerCase() !== part.toLowerCase()) return false;
+									const existing = statSync(join(parent, entry), { throwIfNoEntry: false });
+									return existing?.dev === requested.dev && existing.ino === requested.ino;
+								}) ?? part;
+						}
+					}
+					parent = join(parent, name);
+					return name;
+				})
+				.join(sep);
+		}
 		return join(
 			stateRoot,
 			createHash("sha256")
@@ -2384,6 +2408,11 @@ export class DefaultPackageManager implements PackageManager {
 		const state = this.getGitUpdateStatePath(targetDir, scope);
 		const release = this.lockGitCheckout(state);
 		try {
+			const pointer = `${state}.current`;
+			const pointerInfo = lstatSync(pointer, { throwIfNoEntry: false });
+			if (pointerInfo && !pointerInfo.isFile()) {
+				throw new GitRevisionPointerError(`Cannot remove Git package: expected a regular file at ${pointer}`);
+			}
 			let selected = targetDir;
 			try {
 				selected = this.readSelectedGitRevision(targetDir, state);
@@ -2410,7 +2439,7 @@ export class DefaultPackageManager implements PackageManager {
 			if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
 			await rm(`${state}.previous`, { recursive: true, force: true });
 			await rm(selected, { recursive: true, force: true });
-			rmSync(`${state}.current`, { force: true });
+			rmSync(pointer, { force: true });
 			this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
 		} finally {
 			release();

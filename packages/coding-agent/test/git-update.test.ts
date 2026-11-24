@@ -16,6 +16,21 @@ import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { allowNetwork } from "./test-network-env.ts";
 
+const fsFixture = vi.hoisted(() => ({ aliasFrom: "", aliasTo: "", blockedRename: "" }));
+vi.mock("node:fs", async (importOriginal) => {
+	const fs = await importOriginal<typeof import("node:fs")>();
+	const map = (path: Parameters<typeof fs.existsSync>[0]) => (path === fsFixture.aliasFrom ? fsFixture.aliasTo : path);
+	return {
+		...fs,
+		existsSync: (path: Parameters<typeof fs.existsSync>[0]) => fs.existsSync(map(path)),
+		statSync: ((path, options) => fs.statSync(map(path)!, options)) as typeof fs.statSync,
+		renameSync: ((from, to) => {
+			if (to === fsFixture.blockedRename) throw new Error("injected pointer rename failure");
+			fs.renameSync(from, to);
+		}) as typeof fs.renameSync,
+	};
+});
+
 // Helper to run git commands in a directory
 function git(args: string[], cwd: string): string {
 	const result = spawnSync("git", args, {
@@ -101,6 +116,7 @@ describe("DefaultPackageManager git update", () => {
 
 	afterEach(() => {
 		vi.unstubAllEnvs();
+		fsFixture.blockedRename = "";
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -289,17 +305,52 @@ describe("DefaultPackageManager git update", () => {
 		const active = selected();
 		const key = basename(active).match(/^\.pi-revision-([a-f0-9]{64})-/)?.[1];
 		if (!key) throw new Error("Expected a selected revision");
-		mkdirSync(join(agentDir, "git", ".git-update-state", `${key}.pending`));
+		const pointer = join(agentDir, "git", ".git-update-state", `${key}.current`);
+		fsFixture.blockedRename = pointer;
 		createCommit(remoteDir, "extension.ts", "// v3", "New update");
 
-		await expect(packageManager.update()).rejects.toThrow();
+		await expect(packageManager.update()).rejects.toThrow("injected pointer rename failure");
 		expect(selected()).toBe(active);
 		expect(getCurrentCommit(active)).toBe(expected);
 		expect(getFileContent(active, "extension.ts")).toBe("// v2");
 
-		await expect(packageManager.remove(gitSource)).rejects.toThrow();
-		expect(selected()).toBe(active);
+		rmSync(pointer);
+		mkdirSync(pointer);
+		await expect(packageManager.removeAndPersist(gitSource)).rejects.toThrow("expected a regular file");
+		expect(packageManager.listConfiguredPackages().some((entry) => entry.source === gitSource)).toBe(true);
+		expect(existsSync(installedDir)).toBe(true);
 		expect(getCurrentCommit(active)).toBe(expected);
+	});
+
+	it("distinguishes case-sensitive checkout names and shares selection for filesystem case aliases", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "extension.ts", "// v2", "Update");
+		await packageManager.update();
+		const active = selected();
+		const aliasSource = "git:github.com/test/EXTENSION";
+		const aliasPath = join(dirname(installedDir), "EXTENSION");
+		if (existsSync(aliasPath)) {
+			expect(basename(selected(aliasSource))).toBe(basename(active));
+			await packageManager.remove(aliasSource);
+			expect(existsSync(active)).toBe(false);
+			expect(existsSync(installedDir)).toBe(false);
+		} else {
+			const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+			fsFixture.aliasFrom = aliasPath;
+			fsFixture.aliasTo = installedDir;
+			try {
+				Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+				expect(selected(aliasSource)).toBe(active);
+			} finally {
+				Object.defineProperty(process, "platform", platform);
+				fsFixture.aliasFrom = "";
+				fsFixture.aliasTo = "";
+			}
+			mkdirSync(aliasPath);
+			expect(selected(aliasSource)).toBe(aliasPath);
+			await packageManager.remove(aliasSource);
+			expect(getFileContent(active, "extension.ts")).toBe("// v2");
+		}
 	});
 
 	it("keeps the selected revision after moving its managed root", async () => {
