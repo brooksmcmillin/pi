@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { detectCapabilities, getTerminalColorMode, type TerminalColorMode } from "@earendil-works/pi-tui";
 import chalk from "chalk";
@@ -705,9 +705,29 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.loaded = true;
 	}
 
+	private isProjectManagedExtensionSource(source: string): boolean {
+		if (!isLocalPath(source)) return false;
+		const path = this.resolveResourcePath(source);
+		const root = join(this.cwd, CONFIG_DIR_NAME, "git");
+		const canonicalRoot = canonicalizePath(root);
+		const inside = (candidate: string) => isPathWithin(canonicalRoot, canonicalizePath(candidate));
+		if (isPathWithin(root, path)) return true;
+		for (let candidate = path; ; candidate = dirname(candidate)) {
+			if (inside(candidate)) return true;
+			try {
+				if (inside(resolve(canonicalizePath(dirname(candidate)), readlinkSync(candidate)))) return true;
+			} catch {
+				// Ordinary path components are not links.
+			}
+			if (dirname(candidate) === candidate) return false;
+		}
+	}
+
 	private async loadCurrentExtensionSet(options: { includeInlineFactories: boolean }): Promise<LoadExtensionsResult> {
 		const resolvedPaths = await this.packageManager.resolve();
-		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
+		// Project-managed CLI aliases wait until checkout selection can use trusted settings.
+		const sources = this.additionalExtensionPaths.filter((source) => !this.isProjectManagedExtensionSource(source));
+		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(sources, {
 			temporary: true,
 			gitRevisions: resolvedPaths.gitRevisions,
 		});
