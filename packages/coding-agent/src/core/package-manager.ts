@@ -2232,7 +2232,15 @@ export class DefaultPackageManager implements PackageManager {
 		const staged = mkdtempSync(join(dirname(targetDir), `.${basename(targetDir)}.pi-update-`));
 		try {
 			// Keep the checkout's refs and configuration, but never copy its installed dependencies.
-			cpSync(gitDir, join(staged, ".git"), { recursive: true });
+			cpSync(gitDir, join(staged, ".git"), {
+				recursive: true,
+				filter: (path) => {
+					if (lstatSync(path).isSymbolicLink()) {
+						throw new Error(`Cannot stage Git package ${targetDir}: symbolic link in Git metadata at ${path}.`);
+					}
+					return true;
+				},
+			});
 			const config = join(staged, ".git", "config");
 			const originalConfig = existsSync(config) ? readFileSync(config) : undefined;
 			const worktreeConfig = join(staged, ".git", "config.worktree");

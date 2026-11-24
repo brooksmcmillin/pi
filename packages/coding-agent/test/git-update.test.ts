@@ -7,7 +7,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -198,6 +198,20 @@ describe("DefaultPackageManager git update", () => {
 		createCommit(remoteDir, "extension.ts", "// v2", "Update");
 
 		await expect(packageManager.update()).rejects.toThrow("standalone .git directory");
+		expect(getCurrentCommit(installedDir)).toBe(original);
+		expect(getFileContent(installedDir, "extension.ts")).toBe("// v1");
+	});
+
+	it.skipIf(process.platform === "win32")("refuses to stage a checkout with linked refs", async () => {
+		setupRemoteAndInstall();
+		const original = getCurrentCommit(installedDir);
+		const refs = join(installedDir, ".git", "refs");
+		const externalRefs = join(tempDir, "shared-refs");
+		renameSync(refs, externalRefs);
+		symlinkSync(externalRefs, refs, "dir");
+		createCommit(remoteDir, "extension.ts", "// v2", "Update");
+
+		await expect(packageManager.update()).rejects.toThrow("symbolic link in Git metadata");
 		expect(getCurrentCommit(installedDir)).toBe(original);
 		expect(getFileContent(installedDir, "extension.ts")).toBe("// v1");
 	});
