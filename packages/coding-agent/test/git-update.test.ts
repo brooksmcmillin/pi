@@ -2240,6 +2240,31 @@ describe("DefaultPackageManager git update", () => {
 		expect(getCurrentCommit(selected(pinnedSource))).toBe(pinnedCommit);
 	});
 
+	it("keeps the surviving prompt ahead of a force-included prompt in a filtered manifest", async () => {
+		const local = join(tempDir, "local-package");
+		for (const [dir, text] of [
+			["a", "Restored prompt"],
+			["b", "Surviving prompt"],
+		] as const) {
+			mkdirSync(join(local, dir), { recursive: true });
+			writeFileSync(join(local, dir, "review.md"), text);
+		}
+		writeFileSync(
+			join(local, "package.json"),
+			JSON.stringify({ pi: { prompts: ["a/review.md", "b/review.md", "!a/review.md", "+a/review.md"] } }),
+		);
+		settingsManager.setPackages([{ source: local, prompts: ["**/*.md"] }]);
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await loader.reload();
+		expect(loader.getPrompts().prompts).toEqual([
+			expect.objectContaining({
+				name: "review",
+				content: "Surviving prompt",
+				filePath: join(local, "b", "review.md"),
+			}),
+		]);
+	});
+
 	it("preserves the fallback name of a manifest-declared root skill across publication", async () => {
 		setupRemoteAndInstall();
 		vi.stubEnv(process.platform === "win32" ? "USERPROFILE" : "HOME", tempDir);

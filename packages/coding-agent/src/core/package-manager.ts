@@ -3246,6 +3246,7 @@ export class DefaultPackageManager implements PackageManager {
 				packageRoot,
 				resourceType,
 				selectPath,
+				true,
 			);
 			return { allFiles, enabledByManifest: new Set(allFiles), aliases };
 		}
@@ -3284,6 +3285,7 @@ export class DefaultPackageManager implements PackageManager {
 		root: string,
 		resourceType: ResourceType,
 		selectPath: (path: string) => string,
+		preserveFilterOrder = false,
 	) {
 		const sourceEntries = entries.filter((entry) => !isOverridePattern(entry));
 		const resolved = sourceEntries.flatMap((entry) => {
@@ -3305,6 +3307,24 @@ export class DefaultPackageManager implements PackageManager {
 		const discovered = this.collectSelectedPackagePaths(resolved, resourceType, selectPath);
 		const allFiles: string[] = [];
 		const aliases = new Map<string, Set<string>>();
+		if (preserveFilterOrder) {
+			// Filters used to consume applyPatterns' order, including restored matches at the end.
+			const filesBySpelling = new Map<string, string>();
+			for (const file of discovered.allFiles) {
+				for (const spelling of discovered.aliases.get(file) ?? [file]) filesBySpelling.set(spelling, file);
+			}
+			for (const spelling of applyPatterns([...filesBySpelling.keys()], patterns, root)) {
+				const file = filesBySpelling.get(spelling)!;
+				let spellings = aliases.get(file);
+				if (!spellings) {
+					allFiles.push(file);
+					spellings = new Set<string>();
+					aliases.set(file, spellings);
+				}
+				spellings.add(spelling);
+			}
+			return { allFiles, aliases };
+		}
 		for (const file of discovered.allFiles) {
 			const spellings = discovered.aliases.get(file) ?? new Set([file]);
 			const surviving = [...spellings].filter((alias) => applyPatterns([alias], patterns, root).has(alias));
