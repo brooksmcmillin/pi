@@ -3309,10 +3309,7 @@ export class DefaultPackageManager implements PackageManager {
 		const aliases = new Map<string, Set<string>>();
 		if (preserveFilterOrder) {
 			// Filters used to consume applyPatterns' order, including restored matches at the end.
-			const filesBySpelling = new Map<string, string>();
-			for (const file of discovered.allFiles) {
-				for (const spelling of discovered.aliases.get(file) ?? [file]) filesBySpelling.set(spelling, file);
-			}
+			const filesBySpelling = discovered.filesBySpelling;
 			for (const spelling of applyPatterns([...filesBySpelling.keys()], patterns, root)) {
 				const file = filesBySpelling.get(spelling)!;
 				let spellings = aliases.get(file);
@@ -3343,7 +3340,9 @@ export class DefaultPackageManager implements PackageManager {
 	) {
 		const aliases = new Map<string, Set<string>>();
 		const allFiles = new Set<string>();
+		const filesBySpelling = new Map<string, string>();
 		const rememberAlias = (file: string, alias: string) => {
+			if (!filesBySpelling.has(alias)) filesBySpelling.set(alias, file);
 			const spellings = aliases.get(file) ?? new Set<string>();
 			spellings.add(alias);
 			aliases.set(file, spellings);
@@ -3377,7 +3376,10 @@ export class DefaultPackageManager implements PackageManager {
 		for (const [file, spellings] of aliases) {
 			if (spellings.size === 1 && spellings.has(file)) aliases.delete(file);
 		}
-		return { allFiles: [...allFiles], aliases };
+		for (const [spelling, file] of filesBySpelling) {
+			if (!allFiles.has(file)) filesBySpelling.delete(spelling);
+		}
+		return { allFiles: [...allFiles], aliases, filesBySpelling };
 	}
 
 	private resolveLocalEntries(

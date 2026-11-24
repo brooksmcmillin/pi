@@ -2265,6 +2265,42 @@ describe("DefaultPackageManager git update", () => {
 		]);
 	});
 
+	it.skipIf(process.platform === "win32")(
+		"keeps the same filtered prompt winner with interleaved Git aliases",
+		async () => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "shared.md", "Aliased prompt", "Add shared prompt");
+			for (const dir of ["a", "b", "c"]) mkdirSync(join(remoteDir, dir));
+			createCommit(remoteDir, "b/review.md", "Independent prompt", "Add independent prompt");
+			for (const path of ["a/first.md", "c/review.md"])
+				symlinkSync(join(installedDir, "shared.md"), join(remoteDir, path));
+			git(["add", "a/first.md", "c/review.md"], remoteDir);
+			git(["commit", "-m", "Add interleaved aliases"], remoteDir);
+			createCommit(
+				remoteDir,
+				"package.json",
+				JSON.stringify({
+					pi: { prompts: ["a/first.md", "b/review.md", "c/review.md", "!a/first.md", "+a/first.md"] },
+				}),
+				"Declare filtered prompts",
+			);
+			git(["pull", "--ff-only"], installedDir);
+			settingsManager.setPackages([{ source: gitSource, prompts: ["**/*.md"] }]);
+			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			const verifyWinner = async (checkout: string) => {
+				await loader.reload();
+				expect(loader.getPrompts().prompts.find(({ name }) => name === "review")).toMatchObject({
+					content: "Independent prompt",
+					filePath: join(checkout, "b", "review.md"),
+				});
+			};
+			await verifyWinner(installedDir);
+			createCommit(remoteDir, "extension.ts", "// advance revision", "Advance revision");
+			await packageManager.update();
+			await verifyWinner(selected());
+		},
+	);
+
 	it("preserves the fallback name of a manifest-declared root skill across publication", async () => {
 		setupRemoteAndInstall();
 		vi.stubEnv(process.platform === "win32" ? "USERPROFILE" : "HOME", tempDir);
