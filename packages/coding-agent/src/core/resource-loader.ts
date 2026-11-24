@@ -532,17 +532,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async loadProjectTrustExtensions(): Promise<LoadExtensionsResult> {
-		return this.loadTrustBootstrap(
-			await this.packageManager.prepareTemporaryGitSources(this.additionalExtensionPaths),
-		);
+		return (await this.loadTrustBootstrap()).extensions;
 	}
 
-	private async loadTrustBootstrap(temporaryGit: TemporaryGitSelection): Promise<LoadExtensionsResult> {
+	private async loadTrustBootstrap(): Promise<{
+		extensions: LoadExtensionsResult;
+		temporaryGit: TemporaryGitSelection;
+	}> {
 		// Force untrusted project settings for the bootstrap pass. This keeps project-local
 		// extensions/packages out while still loading user/global and temporary CLI extensions.
 		this.settingsManager.setProjectTrusted(false);
 		await this.settingsManager.reload();
-		return this.loadCurrentExtensionSet({ includeInlineFactories: true }, temporaryGit);
+		const temporaryGit = await this.packageManager.prepareTemporaryGitSources(this.additionalExtensionPaths);
+		const extensions = await this.loadCurrentExtensionSet({ includeInlineFactories: true }, temporaryGit);
+		return { extensions, temporaryGit };
 	}
 
 	async reload(options?: ResourceLoaderReloadOptions): Promise<void> {
@@ -555,8 +558,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		let temporaryGit: TemporaryGitSelection | undefined;
 		let preTrustExtensions: LoadExtensionsResult | undefined;
 		if (options?.resolveProjectTrust) {
-			temporaryGit = await this.packageManager.prepareTemporaryGitSources(this.additionalExtensionPaths);
-			preTrustExtensions = await this.loadTrustBootstrap(temporaryGit);
+			const bootstrap = await this.loadTrustBootstrap();
+			temporaryGit = bootstrap.temporaryGit;
+			preTrustExtensions = bootstrap.extensions;
 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
 			this.settingsManager.setProjectTrusted(projectTrusted);
 		}

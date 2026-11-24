@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ExtensionRunner } from "../src/core/extensions/runner.ts";
+import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { DefaultResourceLoader, loadProjectContextFiles } from "../src/core/resource-loader.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -31,6 +32,33 @@ describe("DefaultResourceLoader", () => {
 	});
 
 	describe("reload", () => {
+		it.each(["bootstrap", "reload"])(
+			"prepares temporary Git with only user settings during %s",
+			async (entryPoint) => {
+				mkdirSync(join(cwd, ".pi"));
+				writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ npmCommand: ["project-setting"] }));
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ npmCommand: ["user-setting"] }));
+				const settingsManager = SettingsManager.create(cwd, agentDir);
+				expect(settingsManager.isProjectTrusted()).toBe(true);
+				expect(settingsManager.getNpmCommand()).toEqual(["project-setting"]);
+				const prepare = vi
+					.spyOn(DefaultPackageManager.prototype, "prepareTemporaryGitSources")
+					.mockImplementation(async () => {
+						expect(settingsManager.isProjectTrusted()).toBe(false);
+						expect(settingsManager.getNpmCommand()).toEqual(["user-setting"]);
+						return { checkouts: new Map(), gitRevisions: new Map(), installFailures: [] };
+					});
+				try {
+					const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+					if (entryPoint === "bootstrap") await loader.loadProjectTrustExtensions();
+					else await loader.reload({ resolveProjectTrust: async () => false });
+					expect(prepare).toHaveBeenCalledTimes(1);
+				} finally {
+					prepare.mockRestore();
+				}
+			},
+		);
+
 		it("should initialize with empty results before reload", () => {
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 
