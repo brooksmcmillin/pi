@@ -379,6 +379,7 @@ function splitPatterns(entries: string[]): { plain: string[]; patterns: string[]
 interface DiscoverySelection {
 	selectPath: (path: string) => string;
 	rememberAlias: (file: string, alias: string) => void;
+	recordDirect?: boolean;
 }
 
 function collectFiles(
@@ -427,7 +428,7 @@ function collectFiles(
 				files.push(...collectFiles(selected, filePattern, skipNodeModules, ig, root, selection, logical));
 			} else if (isFile && filePattern.test(entry.name)) {
 				files.push(fullPath);
-				if (logical !== fullPath) selection?.rememberAlias(fullPath, logical);
+				if (selection?.recordDirect || logical !== fullPath) selection?.rememberAlias(fullPath, logical);
 			}
 		}
 	} catch {
@@ -455,7 +456,7 @@ function collectSkillEntries(
 	addIgnoreRules(ig, dir, root, logicalDir);
 	const addEntry = (file: string, logical: string) => {
 		entries.push(file);
-		if (file !== logical) selection?.rememberAlias(file, logical);
+		if (selection?.recordDirect || file !== logical) selection?.rememberAlias(file, logical);
 	};
 
 	try {
@@ -670,6 +671,7 @@ function collectAutoExtensionEntries(
 	originalDir: string,
 	selectPath = (path: string) => path,
 	rememberAlias?: (file: string, alias: string) => void,
+	recordDirect = false,
 ): string[] {
 	const dir = selectPath(originalDir);
 	const entries: string[] = [];
@@ -678,7 +680,7 @@ function collectAutoExtensionEntries(
 	// First check if this directory itself has explicit extension entries (package.json or index)
 	const discover = (original: string, selected: string) => {
 		const files = resolveExtensionEntries(selected, selectPath);
-		if (original !== selected && rememberAlias) {
+		if ((recordDirect || original !== selected) && rememberAlias) {
 			for (const file of files ?? []) {
 				if (isPathInside(selected, file)) rememberAlias(file, join(original, relative(selected, file)));
 			}
@@ -718,7 +720,7 @@ function collectAutoExtensionEntries(
 
 			if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
 				entries.push(fullPath);
-				if (originalDir !== dir) rememberAlias?.(fullPath, join(originalDir, entry.name));
+				if (recordDirect || originalDir !== dir) rememberAlias?.(fullPath, join(originalDir, entry.name));
 			} else if (isDir) {
 				const resolvedEntries = discover(join(originalDir, entry.name), selectPath(fullPath));
 				if (resolvedEntries) {
@@ -3293,7 +3295,6 @@ export class DefaultPackageManager implements PackageManager {
 		selectPath: (path: string) => string,
 		directoriesOnly = false,
 	) {
-		const direct = new Set<string>();
 		const aliases = new Map<string, Set<string>>();
 		const allFiles = new Set<string>();
 		const rememberAlias = (file: string, alias: string) => {
@@ -3316,16 +3317,20 @@ export class DefaultPackageManager implements PackageManager {
 					: path;
 			const rememberDiscoveredAlias = (file: string, alias: string) =>
 				rememberAlias(selectPath(file), logicalPath(alias));
-			for (const path of this.collectFilesFromPaths([selected], resourceType, selectPath, rememberDiscoveredAlias)) {
+			for (const path of this.collectFilesFromPaths(
+				[selected],
+				resourceType,
+				selectPath,
+				rememberDiscoveredAlias,
+				true,
+			)) {
 				const active = selectPath(path);
-				if (!existsSync(active)) continue;
-				const logical = logicalPath(path);
-				if (logical !== active) rememberAlias(active, logical);
-				else if (path === selected || isPathInside(selected, path)) direct.add(active);
-				allFiles.add(active);
+				if (existsSync(active)) allFiles.add(active);
 			}
 		}
-		for (const path of direct) if (aliases.has(path)) rememberAlias(path, path);
+		for (const [file, spellings] of aliases) {
+			if (spellings.size === 1 && spellings.has(file)) aliases.delete(file);
+		}
 		return { allFiles: [...allFiles], aliases };
 	}
 
@@ -3687,6 +3692,7 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		selectPath?: (path: string) => string,
 		rememberAlias?: (file: string, alias: string) => void,
+		recordDirect = false,
 	): string[] {
 		const files: string[] = [];
 		for (const p of paths) {
@@ -3696,18 +3702,22 @@ export class DefaultPackageManager implements PackageManager {
 				const stats = statSync(p);
 				if (stats.isFile()) {
 					files.push(p);
+					if (recordDirect) rememberAlias?.(p, p);
 				} else if (stats.isDirectory()) {
 					if (!selectPath || !rememberAlias) {
 						files.push(...collectResourceFiles(p, resourceType));
 					} else if (resourceType === "extensions") {
-						files.push(...collectAutoExtensionEntries(p, selectPath, rememberAlias));
+						files.push(...collectAutoExtensionEntries(p, selectPath, rememberAlias, recordDirect));
 					} else if (resourceType === "skills") {
-						files.push(...collectSkillEntries(p, "pi", undefined, undefined, { selectPath, rememberAlias }));
+						files.push(
+							...collectSkillEntries(p, "pi", undefined, undefined, { selectPath, rememberAlias, recordDirect }),
+						);
 					} else {
 						files.push(
 							...collectFiles(p, FILE_PATTERNS[resourceType], true, undefined, undefined, {
 								selectPath,
 								rememberAlias,
+								recordDirect,
 							}),
 						);
 					}

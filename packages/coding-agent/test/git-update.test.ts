@@ -1778,55 +1778,113 @@ describe("DefaultPackageManager git update", () => {
 
 	it
 		.skipIf(process.platform === "win32")
-		.each(["default", "delta", "absolute-delta", "manifest", "manifest-only", "manifest-undeclared-target"])(
-		"loads a selected checkout's prompt symlink from its selected target (%s)",
-		async (mode) => {
+		.each([
+			"default",
+			"delta",
+			"absolute-delta",
+			"manifest",
+			"manifest-only",
+			"manifest-undeclared-target",
+			"manifest-direct-first",
+		])("loads a selected checkout's prompt symlink from its selected target (%s)", async (mode) => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "prompts"));
+		const target = mode === "default" ? "review.md" : "prompts/review.md";
+		createCommit(remoteDir, target, "Retained review", "Add review target");
+		symlinkSync(join(installedDir, target), join(remoteDir, "prompts", "quick.md"));
+		if (mode === "delta" || mode === "absolute-delta" || mode === "manifest") {
+			const exclusion = mode === "absolute-delta" ? join(installedDir, target) : target;
+			settingsManager.setPackages([
+				{ source: gitSource, autoload: mode === "manifest", prompts: ["+prompts/quick.md", `-${exclusion}`] },
+			]);
+		}
+		if (mode.startsWith("manifest")) {
+			createCommit(
+				remoteDir,
+				"package.json",
+				JSON.stringify({
+					pi: {
+						prompts:
+							mode === "manifest-direct-first"
+								? [target, "prompts/quick.md"]
+								: [
+										"prompts/quick.md",
+										...(mode === "manifest-undeclared-target" ? [] : [target]),
+										...(mode === "manifest" ? [] : [`-${target}`]),
+									],
+					},
+				}),
+				"Declare prompts",
+			);
+		}
+		git(["add", "prompts/quick.md"], remoteDir);
+		git(["commit", "-m", "Declare prompt alias"], remoteDir);
+		git(["pull", "--ff-only"], installedDir);
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await loader.reload();
+		expect(loader.getPrompts().prompts).toEqual([
+			expect.objectContaining({
+				name: mode === "manifest-direct-first" ? "review" : "quick",
+				content: "Retained review",
+			}),
+		]);
+		createCommit(remoteDir, target, "Selected review", "Update review target");
+		await packageManager.update();
+		await loader.reload();
+		expect(loader.getPrompts().prompts).toEqual([
+			expect.objectContaining({
+				name: mode === "manifest-direct-first" ? "review" : "quick",
+				content: "Selected review",
+				filePath: join(selected(), target),
+			}),
+		]);
+		if (mode === "manifest-direct-first") {
+			const active = selected();
+			expect((await packageManager.resolve()).prompts[0]?.metadata.packageAliases).toEqual([
+				join(active, target),
+				join(active, "prompts", "quick.md"),
+			]);
+		}
+		expect(readFileSync(join(installedDir, target), "utf8")).toBe("Retained review");
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"does not discover a hidden prompt target independently of its excluded directory alias",
+		async () => {
 			setupRemoteAndInstall();
-			mkdirSync(join(remoteDir, "prompts"));
-			const target = mode === "default" ? "review.md" : "prompts/review.md";
-			createCommit(remoteDir, target, "Retained review", "Add review target");
-			symlinkSync(join(installedDir, target), join(remoteDir, "prompts", "quick.md"));
-			if (mode === "delta" || mode === "absolute-delta" || mode === "manifest") {
-				const exclusion = mode === "absolute-delta" ? join(installedDir, target) : target;
-				settingsManager.setPackages([
-					{ source: gitSource, autoload: mode === "manifest", prompts: ["+prompts/quick.md", `-${exclusion}`] },
-				]);
-			}
-			if (mode.startsWith("manifest")) {
-				createCommit(
-					remoteDir,
-					"package.json",
-					JSON.stringify({
-						pi: {
-							prompts: [
-								"prompts/quick.md",
-								...(mode === "manifest-undeclared-target" ? [] : [target]),
-								...(mode === "manifest" ? [] : [`-${target}`]),
-							],
-						},
-					}),
-					"Declare prompts",
-				);
-			}
-			git(["add", "prompts/quick.md"], remoteDir);
-			git(["commit", "-m", "Declare prompt alias"], remoteDir);
+			mkdirSync(join(remoteDir, "prompts", ".hidden"), { recursive: true });
+			createCommit(remoteDir, "prompts/.hidden/note.md", "Original note", "Add hidden note");
+			symlinkSync(join(installedDir, "prompts", ".hidden"), join(remoteDir, "prompts", "shortcut"), "dir");
+			git(["add", "prompts/shortcut"], remoteDir);
+			git(["commit", "-m", "Add shortcut"], remoteDir);
+			createCommit(
+				remoteDir,
+				"package.json",
+				JSON.stringify({ pi: { prompts: ["prompts", "-prompts/shortcut/note.md"] } }),
+				"Exclude shortcut note",
+			);
 			git(["pull", "--ff-only"], installedDir);
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await loader.reload();
-			expect(loader.getPrompts().prompts).toEqual([
-				expect.objectContaining({ name: "quick", content: "Retained review" }),
-			]);
-			createCommit(remoteDir, target, "Selected review", "Update review target");
+			expect(loader.getPrompts().prompts).toEqual([]);
+			createCommit(remoteDir, "prompts/.hidden/note.md", "Selected note", "Update note");
 			await packageManager.update();
 			await loader.reload();
-			expect(loader.getPrompts().prompts).toEqual([
+			expect(loader.getPrompts().prompts).toEqual([]);
+			createCommit(
+				remoteDir,
+				"package.json",
+				JSON.stringify({ pi: { prompts: ["prompts"] } }),
+				"Allow shortcut note",
+			);
+			await packageManager.update();
+			const active = selected();
+			expect((await packageManager.resolve()).prompts).toEqual([
 				expect.objectContaining({
-					name: "quick",
-					content: "Selected review",
-					filePath: join(selected(), target),
+					path: join(active, "prompts", ".hidden", "note.md"),
+					metadata: expect.objectContaining({ packageAliases: [join(active, "prompts", "shortcut", "note.md")] }),
 				}),
 			]);
-			expect(readFileSync(join(installedDir, target), "utf8")).toBe("Retained review");
 		},
 	);
 
