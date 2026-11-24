@@ -3268,16 +3268,23 @@ export class DefaultPackageManager implements PackageManager {
 		for (const entry of plain) {
 			const original = this.resolvePathFromBase(entry, baseDir);
 			const selected = this.redirectGitResource(original, gitRevisions);
+			const childAliases = new Map<string, Set<string>>();
 			for (const file of this.collectFilesFromPaths(
 				[selected],
 				resourceType,
 				(path) => this.redirectGitResource(path, gitRevisions),
-				rememberAlias,
+				(path, alias) => {
+					const spellings = childAliases.get(path) ?? new Set<string>();
+					spellings.add(alias);
+					childAliases.set(path, spellings);
+				},
 			)) {
 				const active = this.redirectGitResource(file, gitRevisions);
 				if (active !== file && !existsSync(active)) continue;
 				allFiles.add(active);
-				if (active === file && original === selected && file === original) rememberAlias(active, file);
+				const discovered = childAliases.get(file);
+				for (const alias of discovered ?? []) rememberAlias(active, alias);
+				if (active === file && original === selected && !discovered) rememberAlias(active, file);
 				if (active !== file || original !== selected) {
 					const spellings = aliases.get(active) ?? new Set<string>();
 					if (active !== file) spellings.add(file);

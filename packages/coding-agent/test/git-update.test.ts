@@ -1064,6 +1064,7 @@ describe("DefaultPackageManager git update", () => {
 			"auto-first",
 			"configured-first",
 			"configured-direct",
+			"configured-directory",
 			"package-include",
 			"manifest-directory",
 			"package-toggle",
@@ -1104,9 +1105,13 @@ describe("DefaultPackageManager git update", () => {
 			);
 		}
 		await packageManager.update();
-		if (kind === "configured-direct") {
+		if (kind === "configured-direct" || kind === "configured-directory") {
 			const alias = join(dir, "keep.md");
-			settingsManager.setPromptTemplatePaths([alias, join(selected(), "review.md"), `-${alias}`]);
+			settingsManager.setPromptTemplatePaths([
+				alias,
+				kind === "configured-directory" ? selected() : join(selected(), "review.md"),
+				`-${alias}`,
+			]);
 		}
 		await settingsManager.flush();
 		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
@@ -1114,7 +1119,7 @@ describe("DefaultPackageManager git update", () => {
 		expect(loader.getPrompts().prompts).toEqual([
 			expect.objectContaining({
 				name:
-					kind === "configured-direct"
+					kind === "configured-direct" || kind === "configured-directory"
 						? "review"
 						: firstExcluded || kind === "package-include" || kind === "manifest-directory"
 							? "z-hide"
