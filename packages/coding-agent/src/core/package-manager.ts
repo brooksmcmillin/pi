@@ -925,7 +925,8 @@ function canonicalizeGitResourcePath(path: string): string {
 			return join(realpathSync(ancestor), relative(ancestor, path));
 		} catch (error) {
 			const parent = dirname(ancestor);
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === ancestor) return path;
+			const code = (error as NodeJS.ErrnoException).code;
+			if ((code !== "ENOENT" && code !== "ENOTDIR") || parent === ancestor) return path;
 			ancestor = parent;
 		}
 	}
@@ -2312,7 +2313,7 @@ export class DefaultPackageManager implements PackageManager {
 		const packageRoot = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
 		const stateRoot = join(packageRoot, ".git-update-state");
 		let identity = relative(packageRoot, targetDir);
-		if (process.platform === "darwin") {
+		if (process.platform === "darwin" || process.platform === "win32") {
 			// Use the stored spelling only when the volume actually resolves the alias.
 			let parent = packageRoot;
 			identity = identity
@@ -2336,12 +2337,7 @@ export class DefaultPackageManager implements PackageManager {
 				})
 				.join(sep);
 		}
-		return join(
-			stateRoot,
-			createHash("sha256")
-				.update(process.platform === "win32" ? identity.toLowerCase() : identity)
-				.digest("hex"),
-		);
+		return join(stateRoot, createHash("sha256").update(identity).digest("hex"));
 	}
 
 	private lockGitCheckout(state: string): () => void {

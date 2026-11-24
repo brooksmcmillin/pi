@@ -402,7 +402,7 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.each(["root", "child", "explicit child", "explicit file", "retained alias exclusion"])(
+	it.each(["root", "child", "explicit child", "explicit file", "explicit nested file", "retained alias exclusion"])(
 		"uses the selected manifest through a %s alias",
 		async (kind) => {
 			setupRemoteAndInstall();
@@ -411,6 +411,9 @@ describe("DefaultPackageManager git update", () => {
 			const manifest = (entry: string) =>
 				JSON.stringify({ name: "fixture", version: "1.0.0", pi: { extensions: [entry] } });
 			createCommit(remoteDir, "package.json", manifest("./old.ts"), "Declare old entry");
+			const nested = kind === "explicit nested file";
+			const replacement = nested ? "assets/new.ts" : "new.ts";
+			if (nested) createCommit(remoteDir, "assets", "old file", "Add old assets file");
 			git(["pull", "--ff-only"], installedDir);
 			const root = join(agentDir, kind.startsWith("explicit") ? "custom-extensions" : "extensions");
 			const alias = kind === "root" ? root : join(root, "alias");
@@ -418,23 +421,27 @@ describe("DefaultPackageManager git update", () => {
 			symlinkSync(installedDir, alias, process.platform === "win32" ? "junction" : "dir");
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 			const declarations =
-				kind === "explicit child" ? [root] : kind === "explicit file" ? [join(alias, "new.ts")] : [];
-			settingsManager.setExtensionPaths([...declarations, `-${relative(agentDir, join(alias, "new.ts"))}`]);
-			createCommit(remoteDir, "new.ts", "export default function() {}", "Add replacement");
-			createCommit(remoteDir, "package.json", manifest("./new.ts"), "Select replacement");
+				kind === "explicit child" ? [root] : kind.startsWith("explicit") ? [join(alias, replacement)] : [];
+			settingsManager.setExtensionPaths([...declarations, `-${relative(agentDir, join(alias, replacement))}`]);
+			if (nested) {
+				git(["rm", "assets"], remoteDir);
+				mkdirSync(join(remoteDir, "assets"));
+			}
+			createCommit(remoteDir, replacement, "export default function() {}", "Add replacement");
+			createCommit(remoteDir, "package.json", manifest(`./${replacement}`), "Select replacement");
 			await packageManager.update();
 			const entries = (await packageManager.resolve()).extensions.filter((entry) =>
 				["old.ts", "new.ts"].includes(basename(entry.path)),
 			);
-			const first = join(selected(), "new.ts");
-			expect(existsSync(join(alias, "new.ts"))).toBe(false);
+			const first = join(selected(), replacement);
+			expect(existsSync(join(alias, replacement))).toBe(false);
 			expect(entries).toEqual([expect.objectContaining({ path: first, enabled: false })]);
 			if (kind !== "retained alias exclusion") {
 				settingsManager.setExtensionPaths([...declarations, `-${relative(agentDir, first)}`]);
 			}
 			createCommit(remoteDir, "extension.ts", "// v3", "Advance revision again");
 			await packageManager.update();
-			const next = join(selected(), "new.ts");
+			const next = join(selected(), replacement);
 			expect(next).not.toBe(first);
 			const resolved = await packageManager.resolve();
 			const entriesAfterUpdate = resolved.extensions.filter((entry) =>
@@ -805,15 +812,23 @@ describe("DefaultPackageManager git update", () => {
 			fsFixture.aliasFrom = aliasPath;
 			fsFixture.aliasTo = installedDir;
 			try {
-				Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
-				expect(selected(aliasSource)).toBe(active);
+				for (const value of ["darwin", "win32"]) {
+					Object.defineProperty(process, "platform", { ...platform, value });
+					expect(selected(aliasSource)).toBe(active);
+				}
 			} finally {
 				Object.defineProperty(process, "platform", platform);
 				fsFixture.aliasFrom = "";
 				fsFixture.aliasTo = "";
 			}
 			mkdirSync(aliasPath);
-			expect(selected(aliasSource)).toBe(aliasPath);
+			try {
+				Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+				expect(selected(aliasSource)).toBe(aliasPath);
+				expect(selected()).toBe(active);
+			} finally {
+				Object.defineProperty(process, "platform", platform);
+			}
 			await packageManager.remove(aliasSource);
 			expect(getFileContent(active, "extension.ts")).toBe("// v2");
 		}
@@ -835,9 +850,7 @@ describe("DefaultPackageManager git update", () => {
 		setupRemoteAndInstall();
 		const original = getCurrentCommit(installedDir);
 		const identity = relative(join(agentDir, "git"), installedDir);
-		const key = createHash("sha256")
-			.update(process.platform === "win32" ? identity.toLowerCase() : identity)
-			.digest("hex");
+		const key = createHash("sha256").update(identity).digest("hex");
 		const previous = join(agentDir, "git", ".git-update-state", `${key}.previous`);
 		mkdirSync(previous, { recursive: true });
 		writeFileSync(join(previous, "extension.ts"), "// old backup");
