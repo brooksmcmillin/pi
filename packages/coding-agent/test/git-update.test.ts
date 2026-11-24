@@ -1054,23 +1054,33 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
-	it.skipIf(process.platform === "win32").each([false, true])(
-		"keeps the first prompt when a second alias is excluded (package: %s)",
-		async (asPackage) => {
+	it.skipIf(process.platform === "win32").each(["auto", "package", "manifest", "configured"])(
+		"keeps the first prompt when a second alias is excluded (%s)",
+		async (kind) => {
+			const asPackage = kind === "package" || kind === "manifest";
 			setupRemoteAndInstall();
 			createCommit(remoteDir, "review.md", "Selected review", "Add prompt");
-			const dir = join(agentDir, asPackage ? "local-prompts" : "prompts");
+			const dir = join(agentDir, kind === "auto" ? "prompts" : "local-prompts");
 			mkdirSync(dir);
 			for (const name of ["keep.md", "z-hide.md"]) symlinkSync(join(installedDir, "review.md"), join(dir, name));
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 			if (asPackage) {
-				writeFileSync(join(dir, "package.json"), JSON.stringify({ pi: { prompts: ["keep.md", "z-hide.md"] } }));
+				writeFileSync(
+					join(dir, "package.json"),
+					JSON.stringify({
+						pi: { prompts: ["keep.md", "z-hide.md", ...(kind === "manifest" ? ["-z-hide.md"] : [])] },
+					}),
+				);
 				settingsManager.setPackages([
 					{ source: gitSource, autoload: false },
-					{ source: dir, prompts: ["-z-hide.md"] },
+					kind === "manifest" ? dir : { source: dir, prompts: ["-z-hide.md"] },
 				]);
 			} else {
-				settingsManager.setPromptTemplatePaths(["-prompts/z-hide.md"]);
+				settingsManager.setPromptTemplatePaths(
+					kind === "configured"
+						? [join(dir, "keep.md"), join(dir, "z-hide.md"), `-${join(dir, "z-hide.md")}`]
+						: ["-prompts/z-hide.md"],
+				);
 			}
 			await packageManager.update();
 			await settingsManager.flush();
@@ -1092,8 +1102,7 @@ describe("DefaultPackageManager git update", () => {
 			readFileSync(join(process.cwd(), "src", "modes", "interactive", "theme", "dark.json"), "utf8"),
 		);
 		const fixtures = [
-			["prompts", "quick.md", "review", "Selected review"],
-			["skills", "guide.md", "guide", "---\nname: guide\ndescription: Selected guide\n---\nBody"],
+			["prompts", "quick.md", "review", "---\nname: guide\ndescription: Selected guide\n---\nSelected review"],
 			["themes", "style.json", "style", JSON.stringify({ ...theme, name: "selected-style" })],
 		] as const;
 		for (const [kind, alias, target, content] of fixtures) {
@@ -1101,6 +1110,8 @@ describe("DefaultPackageManager git update", () => {
 			mkdirSync(join(agentDir, kind));
 			symlinkSync(join(installedDir, target), join(agentDir, kind, alias));
 		}
+		mkdirSync(join(agentDir, "skills"));
+		symlinkSync(join(installedDir, "review"), join(agentDir, "skills", "guide.md"));
 		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 		await packageManager.update();
 		await settingsManager.flush();
@@ -1117,9 +1128,7 @@ describe("DefaultPackageManager git update", () => {
 		expect(loader.getPrompts().prompts).toEqual([
 			expect.objectContaining({ name: "quick", filePath: review, content: "Selected review" }),
 		]);
-		expect(loader.getSkills().skills).toContainEqual(
-			expect.objectContaining({ name: "guide", filePath: join(active, "guide") }),
-		);
+		expect(loader.getSkills().skills).toContainEqual(expect.objectContaining({ name: "guide", filePath: review }));
 		expect(loader.getThemes().themes).toContainEqual(
 			expect.objectContaining({ name: "selected-style", sourcePath: join(active, "style") }),
 		);

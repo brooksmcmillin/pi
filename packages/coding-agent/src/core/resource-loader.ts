@@ -398,6 +398,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private extensionPromptSourceInfos: Map<string, SourceInfo>;
 	private extensionThemeSourceInfos: Map<string, SourceInfo>;
 	private resourceMetadataByPath: Map<string, PathMetadata>;
+	private discoveredMetadata?: Record<"skills" | "prompts" | "themes", Map<string, PathMetadata>>;
 	private lastPromptPaths: string[];
 	private resourceSelectors?: Record<
 		"skills" | "prompts" | "themes",
@@ -626,6 +627,15 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliEnabledSkills = getEnabledPaths(cliExtensionPaths.skills);
 		const cliEnabledPrompts = getEnabledPaths(cliExtensionPaths.prompts);
 		const cliEnabledThemes = getEnabledPaths(cliExtensionPaths.themes);
+		const metadataFor = (configured: ResolvedResource[], cli: ResolvedResource[]) =>
+			new Map(
+				[...configured, ...cli].filter((entry) => entry.enabled).map(({ path, metadata }) => [path, metadata]),
+			);
+		this.discoveredMetadata = {
+			skills: metadataFor(this.noSkills ? [] : resolvedPaths.skills, cliExtensionPaths.skills),
+			prompts: metadataFor(this.noPromptTemplates ? [] : resolvedPaths.prompts, cliExtensionPaths.prompts),
+			themes: metadataFor(this.noThemes ? [] : resolvedPaths.themes, cliExtensionPaths.themes),
+		};
 
 		const extensionPaths = (
 			this.noExtensions ? cliEnabledExtensions : this.mergePaths(cliEnabledExtensions, enabledExtensions)
@@ -954,7 +964,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 				agentDir: this.agentDir,
 				skillPaths,
 				selectPathForRoot: this.resourceSelectors?.skills,
-				getDiscoveredPath: (path) => this.getDiscoveredResourceAlias(metadataByPath?.get(path), ".md"),
+				getDiscoveredPath: (path) =>
+					this.getDiscoveredResourceAlias(this.discoveredMetadata?.skills.get(path), ".md"),
 				includeDefaults: false,
 			});
 		}
@@ -979,7 +990,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 				agentDir: this.agentDir,
 				promptPaths,
 				selectPathForRoot: this.resourceSelectors?.prompts,
-				getDiscoveredPath: (path) => this.getDiscoveredResourceAlias(metadataByPath?.get(path), ".md"),
+				getDiscoveredPath: (path) =>
+					this.getDiscoveredResourceAlias(this.discoveredMetadata?.prompts.get(path), ".md"),
 				includeDefaults: false,
 			});
 			const deduped = this.dedupePrompts(loaded.templates);
@@ -1009,7 +1021,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				...detectCapabilities(() => false),
 				...this.settingsManager.getTerminalCapabilityOverrides(),
 			});
-			const loaded = this.loadThemes(themePaths, false, colorMode, metadataByPath);
+			const loaded = this.loadThemes(themePaths, false, colorMode, this.discoveredMetadata?.themes);
 			const deduped = this.dedupeThemes(loaded.themes);
 			themesResult = { themes: deduped.themes, diagnostics: [...loaded.diagnostics, ...deduped.diagnostics] };
 		}

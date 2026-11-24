@@ -3132,12 +3132,7 @@ export class DefaultPackageManager implements PackageManager {
 				resourceType,
 				selectPath,
 			);
-			const manifestPatterns = entries.filter(isOverridePattern);
-			const enabledByManifest =
-				manifestPatterns.length > 0
-					? applyPatterns(allFiles, manifestPatterns, packageRoot, packageRoot, aliases)
-					: new Set(allFiles);
-			return { allFiles: Array.from(enabledByManifest), enabledByManifest, aliases };
+			return { allFiles, enabledByManifest: new Set(allFiles), aliases };
 		}
 
 		const { allFiles, aliases } = this.collectSelectedPackagePaths(
@@ -3160,13 +3155,8 @@ export class DefaultPackageManager implements PackageManager {
 		if (!entries) return;
 
 		const { allFiles, aliases } = this.collectFilesFromManifestEntries(entries, root, resourceType, selectPath);
-		const patterns = entries.filter(isOverridePattern);
-		const enabledPaths = applyPatterns(allFiles, patterns, root, root, aliases);
-
 		for (const f of allFiles) {
-			if (enabledPaths.has(f)) {
-				this.addResource(target, f, this.withPackageAliases(metadata, aliases.get(f)), true);
-			}
+			this.addResource(target, f, this.withPackageAliases(metadata, aliases.get(f)), true);
 		}
 	}
 
@@ -3188,7 +3178,19 @@ export class DefaultPackageManager implements PackageManager {
 
 			return expandPackageGlob(entry, root);
 		});
-		return this.collectSelectedPackagePaths(resolved, resourceType, selectPath);
+		const patterns = entries.filter(isOverridePattern);
+		const allFiles = new Set<string>();
+		const aliases = new Map<string, Set<string>>();
+		for (const path of resolved) {
+			const declaration = this.collectSelectedPackagePaths([path], resourceType, selectPath);
+			for (const file of applyPatterns(declaration.allFiles, patterns, root, root, declaration.aliases)) {
+				if (allFiles.has(file)) continue;
+				allFiles.add(file);
+				const spellings = declaration.aliases.get(file);
+				if (spellings) aliases.set(file, spellings);
+			}
+		}
+		return { allFiles: [...allFiles], aliases };
 	}
 
 	private collectSelectedPackagePaths(
@@ -3259,7 +3261,7 @@ export class DefaultPackageManager implements PackageManager {
 				allFiles.add(active);
 				if (active !== file || original !== selected) {
 					const spellings = aliases.get(active) ?? new Set<string>();
-					spellings.add(file);
+					if (active !== file) spellings.add(file);
 					if (original !== selected && (file === selected || isPathInside(selected, file))) {
 						spellings.add(join(original, relative(selected, file)));
 					}
@@ -3270,14 +3272,17 @@ export class DefaultPackageManager implements PackageManager {
 
 		// pi config saves exact paths relative to the settings directory. Resolve them through
 		// the same revision mapping as declarations, even if they name a different revision.
-		const rules = this.redirectGitExactRules(patterns, baseDir, gitRevisions);
-		const enabledPaths = applyPatterns([...allFiles], rules, baseDir, baseDir, aliases);
+		const rules = this.redirectGitExactRules(patterns, baseDir, gitRevisions, aliases);
+		const declarations = new Map(
+			[...aliases].map(([file, spellings]) => [file, new Set([...spellings].slice(0, 1))]),
+		);
+		const enabledPaths = applyPatterns([...allFiles], rules, baseDir, baseDir, declarations);
 
 		for (const f of allFiles) {
 			this.addResource(
 				target,
 				f,
-				this.withGitRevision(metadata, f, gitRevisions, aliases.get(f)),
+				this.withGitRevision(metadata, f, gitRevisions, declarations.get(f)),
 				enabledPaths.has(f),
 			);
 		}
