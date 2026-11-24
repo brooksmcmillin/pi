@@ -553,8 +553,7 @@ class ResourceList implements Component, Focusable {
 		});
 
 		if (enabled) {
-			const declaration = item.metadata.gitRevision?.aliases?.[0];
-			updated.push(`+${declarations.length > 1 && declaration ? relative(baseDir, declaration) : pattern}`);
+			updated.push(`+${pattern}`);
 		} else {
 			for (const target of new Set([pattern, ...this.getRowExclusionPatterns(item, scope)])) {
 				updated.push(`-${target}`);
@@ -757,7 +756,10 @@ class ResourceList implements Component, Focusable {
 	private getNextOverrideState(item: ResourceItem): ProjectOverrideState {
 		const state = this.getProjectOverrideState(item);
 		const inheritedEnabled = this.getInheritedEnabled(item);
-		if (state === "inherit") return inheritedEnabled ? "unload" : "load";
+		if (state === "inherit") {
+			const enabled = this.isInheritedGlobalItem(item) ? inheritedEnabled : item.enabled;
+			return enabled ? "unload" : "load";
+		}
 		if (state === "unload") return inheritedEnabled ? "load" : "inherit";
 		return inheritedEnabled ? "inherit" : "unload";
 	}
@@ -839,7 +841,11 @@ class ResourceList implements Component, Focusable {
 	): boolean {
 		const revision = item.metadata.gitRevision;
 		if (!revision) return false;
-		const path = resolvePath(target, this.getTopLevelBaseDir(scope), { trim: true });
+		const baseDir =
+			scope === this.getItemScope(item)
+				? (item.metadata.baseDir ?? this.getTopLevelBaseDir(scope))
+				: this.getTopLevelBaseDir(scope);
+		const path = resolvePath(target, baseDir, { trim: true });
 		if (matchSkillDirectory && revision.declarations?.length) {
 			const normalized = selectGitDeclarationPath(path, revision);
 			return revision.declarations.some((declaration) => {
@@ -865,7 +871,7 @@ class ResourceList implements Component, Focusable {
 		const declarations = item.metadata.gitRevision?.declarations ?? [];
 		if (declarations.length < 2) return [];
 		const baseDir = this.getTopLevelBaseDir(scope);
-		return declarations.map((path) => relative(baseDir, path));
+		return declarations.map((path) => this.formatTopLevelRulePath(item, baseDir, path));
 	}
 
 	private getTopLevelOverridePatterns(item: ResourceItem, scope: SettingsScope): Set<string> {
@@ -882,8 +888,7 @@ class ResourceList implements Component, Focusable {
 	private getResourcePatternForScope(item: ResourceItem, scope: SettingsScope): string {
 		const sourceScope = this.getItemScope(item);
 		if (scope !== sourceScope || item.metadata.source === "builtin") return item.path;
-		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(sourceScope);
-		return relative(baseDir, this.getTopLevelRulePath(item));
+		return this.formatTopLevelRulePath(item, this.getTopLevelBaseDir(sourceScope), this.getTopLevelRulePath(item));
 	}
 
 	private createPackageOverrideSource(item: ResourceItem): PackageSource {
@@ -940,17 +945,22 @@ class ResourceList implements Component, Focusable {
 	private getResourcePattern(item: ResourceItem): string {
 		if (item.metadata.source === "builtin") return item.path;
 		const scope = item.metadata.scope as "user" | "project";
-		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(scope);
-		return relative(baseDir, this.getTopLevelRulePath(item));
+		return this.formatTopLevelRulePath(item, this.getTopLevelBaseDir(scope), this.getTopLevelRulePath(item));
+	}
+
+	private formatTopLevelRulePath(item: ResourceItem, settingsBase: string, path: string): string {
+		const discoveryBase = item.metadata.baseDir ?? settingsBase;
+		if (item.metadata.gitRevision && discoveryBase !== settingsBase) return path;
+		return relative(discoveryBase, path);
 	}
 
 	private getTopLevelRulePath(item: ResourceItem): string {
 		const revision = item.metadata.gitRevision;
 		const declaration = revision?.aliases?.[0];
 		if (
-			revision?.declarations?.length === 1 &&
+			revision &&
 			declaration &&
-			selectGitDeclarationPath(declaration, revision) !== item.path
+			((revision.declarations?.length ?? 0) > 1 || selectGitDeclarationPath(declaration, revision) !== item.path)
 		) {
 			return declaration;
 		}

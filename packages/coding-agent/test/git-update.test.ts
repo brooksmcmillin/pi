@@ -1859,6 +1859,7 @@ describe("DefaultPackageManager git update", () => {
 			"auto-exact",
 			"auto-glob",
 			"multi-load",
+			"project-multi-load",
 		])(
 		"does not discover a hidden prompt target independently of its excluded directory alias (%s)",
 		async (source) => {
@@ -1879,7 +1880,8 @@ describe("DefaultPackageManager git update", () => {
 			const hiddenTarget = join(declaredRoot, ".hidden", "note.md");
 			const auto = source === "auto-exact" || source === "auto-glob";
 			const external = source === "external-exact" || auto;
-			const multi = source === "multi-load";
+			const projectMode = source === "project-multi-load";
+			const multi = source === "multi-load" || projectMode;
 			const directory = source === "external-directory" || multi;
 			const exact = external || directory || source === "settings-exact";
 			const declared = directory
@@ -1902,11 +1904,13 @@ describe("DefaultPackageManager git update", () => {
 					: `!${relative(agentDir, declaredRoot)}/**/note.md`;
 			if (source !== "manifest") {
 				settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-				settingsManager.setPromptTemplatePaths(
-					auto
-						? [source === "auto-glob" ? `!${dirname(hiddenTarget)}/*.md` : `-${hiddenTarget}`]
-						: [declared, glob, ...(exact ? [`+${hiddenTarget}`] : [])],
-				);
+				if (projectMode) settingsManager.setProjectPromptTemplatePaths([declared, glob]);
+				else
+					settingsManager.setPromptTemplatePaths(
+						auto
+							? [source === "auto-glob" ? `!${dirname(hiddenTarget)}/*.md` : `-${hiddenTarget}`]
+							: [declared, glob, ...(exact ? [`+${hiddenTarget}`] : [])],
+					);
 			}
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await loader.reload();
@@ -1931,13 +1935,24 @@ describe("DefaultPackageManager git update", () => {
 				expect(row.metadata.gitRevision?.declarations).toHaveLength(2);
 				const noop = () => {};
 				const selector = new ConfigSelectorComponent(
-					{ global: resolved, project: resolved },
+					{
+						global: projectMode
+							? await new DefaultPackageManager({
+									cwd: tempDir,
+									agentDir,
+									settingsManager: SettingsManager.inMemory(settingsManager.getGlobalSettings()),
+								}).resolve()
+							: resolved,
+						project: resolved,
+					},
 					settingsManager,
 					tempDir,
 					agentDir,
 					noop,
 					noop,
 					noop,
+					undefined,
+					projectMode ? "project" : "global",
 				);
 				expect(
 					(selector.getResourceList() as unknown as { toggleResource(item: typeof row): boolean }).toggleResource(
@@ -1948,6 +1963,7 @@ describe("DefaultPackageManager git update", () => {
 				expect(loader.getPrompts().prompts).toEqual([
 					expect.objectContaining({ name: "first", content: "Selected note" }),
 				]);
+				if (projectMode) expect(settingsManager.getProjectSettings().prompts).toContain(glob);
 				return;
 			}
 			if (source !== "manifest") {
@@ -2003,6 +2019,55 @@ describe("DefaultPackageManager git update", () => {
 					metadata: expect.objectContaining({ packageAliases: [join(active, "prompts", "shortcut", "note.md")] }),
 				}),
 			]);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"toggles a collapsed user Agent Skills row relative to its discovery base",
+		async () => {
+			setupRemoteAndInstall();
+			vi.stubEnv("HOME", join(tempDir, "home"));
+			const skills = join(tempDir, "home", ".agents", "skills");
+			const target = "assets/tool/SKILL.md";
+			mkdirSync(join(remoteDir, dirname(target)), { recursive: true });
+			createCommit(remoteDir, target, "---\nname: tool\ndescription: Tool fixture\n---\nOld tool", "Add skill");
+			git(["pull", "--ff-only"], installedDir);
+			mkdirSync(skills, { recursive: true });
+			for (const name of ["first", "second"])
+				symlinkSync(join(installedDir, dirname(target)), join(skills, name), "dir");
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			settingsManager.setSkillPaths(["!skills/**/SKILL.md"]);
+			createCommit(remoteDir, target, "---\nname: tool\ndescription: Tool fixture\n---\nNew tool", "Update skill");
+			await packageManager.update();
+			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			const toggle = async () => {
+				const resolved = await packageManager.resolve();
+				const row = { ...resolved.skills[0]!, resourceType: "skills" as const };
+				expect(row.metadata.gitRevision?.declarations).toHaveLength(2);
+				const noop = () => {};
+				const selector = new ConfigSelectorComponent(
+					{ global: resolved, project: resolved },
+					settingsManager,
+					tempDir,
+					agentDir,
+					noop,
+					noop,
+					noop,
+				);
+				return (
+					selector.getResourceList() as unknown as { toggleResource(item: typeof row): boolean }
+				).toggleResource(row);
+			};
+			await loader.reload();
+			expect(loader.getSkills().skills).toEqual([]);
+			expect(await toggle()).toBe(true);
+			await loader.reload();
+			expect(loader.getSkills().skills).toEqual([
+				expect.objectContaining({ name: "tool", filePath: join(selected(), target) }),
+			]);
+			expect(await toggle()).toBe(false);
+			await loader.reload();
+			expect(loader.getSkills().skills).toEqual([]);
 		},
 	);
 
