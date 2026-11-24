@@ -1115,6 +1115,19 @@ function matchesPackageDeclaration(
 	}).has(file);
 }
 
+// Keep the first declaration of an already-resolving canonical path, even if disabled.
+// Distinct or newly available paths can still fall back to a surviving spelling.
+function distinctExistingAliases<T extends string | undefined>(aliases: T[]): T[] {
+	const seen = new Set<string>();
+	return aliases.filter((alias) => {
+		if (alias === undefined || !existsSync(alias)) return true;
+		const key = getResourcePathKey(alias);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
 function chooseResourceAlias(spellings: Set<string> | undefined, matches: (alias?: Set<string>) => boolean) {
 	if (!spellings?.size) return { enabled: matches() };
 	for (const spelling of spellings) {
@@ -1163,8 +1176,9 @@ function applyAutoloadDisabledPatterns(
 			...state,
 			rank: order.get(alias ?? filePath) ?? Number.MAX_SAFE_INTEGER,
 		}));
-		candidates.sort((a, b) => Number(b.enabled) - Number(a.enabled) || a.firstRule - b.firstRule || a.rank - b.rank);
-		return candidates[0]!;
+		candidates.sort((a, b) => a.firstRule - b.firstRule || a.rank - b.rank);
+		const surviving = new Set(distinctExistingAliases(candidates.map(({ alias }) => alias)));
+		return candidates.find(({ alias, enabled }) => surviving.has(alias) && enabled) ?? candidates[0]!;
 	});
 	rows.sort((a, b) => a.firstRule - b.firstRule || a.rank - b.rank);
 	return new Map(rows.map(({ filePath, alias, enabled }) => [filePath, { alias, enabled }]));
@@ -3436,8 +3450,7 @@ export class DefaultPackageManager implements PackageManager {
 			// Before redirection, canonical deduplication keeps the first declaration,
 			// even when disabled. Skip direct duplicates already owned by the package.
 			const existing = target.get(f);
-			const candidates = new Set<string>();
-			const seen = new Set<string>();
+			const candidates: string[] = [];
 			for (const alias of spellings ?? []) {
 				if (
 					revision &&
@@ -3445,14 +3458,12 @@ export class DefaultPackageManager implements PackageManager {
 					(alias === f || !this.isIndependentGitAlias(alias, revision))
 				)
 					continue;
-				if (existsSync(alias)) {
-					const key = getResourcePathKey(alias);
-					if (seen.has(key)) continue;
-					seen.add(key);
-				}
-				candidates.add(alias);
+				candidates.push(alias);
 			}
-			const declaration = chooseResourceAlias(candidates.size ? candidates : undefined, matches);
+			const declaration = chooseResourceAlias(
+				candidates.length ? new Set(distinctExistingAliases(candidates)) : undefined,
+				matches,
+			);
 			return {
 				f,
 				metadata: this.withGitRevision(metadata, f, gitRevisions, declaration.aliases, spellings),
@@ -3656,7 +3667,7 @@ export class DefaultPackageManager implements PackageManager {
 			const rules = this.redirectGitExactRules(overrides, baseDir, accumulator.gitRevisions, discovered);
 			for (const [active, spellings] of discovered) {
 				const revision = this.withGitRevision(metadata, active, accumulator.gitRevisions).gitRevision;
-				const declaration = chooseResourceAlias(spellings, (alias) => {
+				const declaration = chooseResourceAlias(new Set(distinctExistingAliases([...spellings])), (alias) => {
 					if (!alias || !revision) return isEnabledByOverrides(active, rules, baseDir, alias);
 					const spelling = alias.values().next().value!;
 					return isEnabledByOverrides(

@@ -2299,6 +2299,8 @@ describe("DefaultPackageManager git update", () => {
 			"delta-rule-order",
 			"top-level-replacement",
 			"top-level-exclusion-only-aliases",
+			"delta-exclusion-only-aliases",
+			"auto-exclusion-only-aliases",
 		])("keeps the same prompt winner with interleaved Git aliases (%s)", async (mode) => {
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "shared.md", "Aliased prompt", "Add shared prompt");
@@ -2328,7 +2330,13 @@ describe("DefaultPackageManager git update", () => {
 			"Declare filtered prompts",
 		);
 		git(["pull", "--ff-only"], installedDir);
-		if (mode === "delta-rule-order") {
+		if (mode === "auto-exclusion-only-aliases") {
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			const dir = join(agentDir, "prompts");
+			mkdirSync(dir, { recursive: true });
+			for (const name of ["first.md", "review.md"]) symlinkSync(join(installedDir, "shared.md"), join(dir, name));
+			settingsManager.setPromptTemplatePaths(["-prompts/first.md"]);
+		} else if (mode === "delta-rule-order") {
 			settingsManager.setPackages([
 				{ source: gitSource, autoload: false, prompts: ["c/review.md", "b/review.md", "a/first.md"] },
 			]);
@@ -2347,10 +2355,11 @@ describe("DefaultPackageManager git update", () => {
 			settingsManager.setPackages([
 				{
 					source: gitSource,
-					autoload: mode !== "delta-exclusion",
+					autoload: !mode.startsWith("delta-exclusion"),
 					prompts: [
 						"**/*.md",
-						...(mode === "settings-exclusion" || mode === "delta-exclusion" ? ["-a/first.md"] : []),
+						...(mode === "settings-exclusion" || mode.startsWith("delta-exclusion") ? ["-a/first.md"] : []),
+						...(mode === "delta-exclusion-only-aliases" ? ["-b/review.md"] : []),
 					],
 				},
 			]);
@@ -2358,7 +2367,7 @@ describe("DefaultPackageManager git update", () => {
 		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 		const verifyWinner = async (checkout: string) => {
 			await loader.reload();
-			if (mode === "top-level-exclusion-only-aliases") {
+			if (mode.endsWith("exclusion-only-aliases")) {
 				expect(loader.getPrompts().prompts).toEqual([]);
 				return;
 			}
