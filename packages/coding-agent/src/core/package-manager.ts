@@ -9,6 +9,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	readlinkSync,
 	realpathSync,
 	renameSync,
 	rmSync,
@@ -621,7 +622,7 @@ function collectAutoThemeEntries(dir: string, selectPath: (path: string) => stri
 	return entries;
 }
 
-function resolveExtensionEntries(dir: string): string[] | null {
+function resolveExtensionEntries(dir: string, selectPath: (path: string) => string): string[] | null {
 	const packageJsonPath = join(dir, "package.json");
 	if (existsSync(packageJsonPath)) {
 		const manifest = readPiManifest(packageJsonPath);
@@ -639,13 +640,13 @@ function resolveExtensionEntries(dir: string): string[] | null {
 		}
 	}
 
-	const indexTs = join(dir, "index.ts");
-	const indexJs = join(dir, "index.js");
-	if (existsSync(indexTs)) {
-		return [indexTs];
-	}
-	if (existsSync(indexJs)) {
-		return [indexJs];
+	for (const name of ["index.ts", "index.js"]) {
+		const index = join(dir, name);
+		try {
+			if (statSync(selectPath(index), { throwIfNoEntry: false })?.isFile()) return [index];
+		} catch {
+			// An unusable conventional entry should not hide sibling extensions.
+		}
 	}
 
 	return null;
@@ -662,7 +663,7 @@ function collectAutoExtensionEntries(
 
 	// First check if this directory itself has explicit extension entries (package.json or index)
 	const discover = (original: string, selected: string) => {
-		const files = resolveExtensionEntries(selected);
+		const files = resolveExtensionEntries(selected, selectPath);
 		if (original !== selected && rememberAlias) {
 			for (const file of files ?? []) {
 				if (isPathInside(selected, file)) rememberAlias(file, join(original, relative(selected, file)));
@@ -933,19 +934,28 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 		return undefined;
 	}
 
-	const direct = select(path, logical);
-	if (direct) return direct;
-	const root = canonicalizePath(logical);
-	// Check directory aliases too: a missing or redirected leaf in the old
-	// checkout should not hide its path in the selected revision.
-	let selected: string | undefined;
-	for (let ancestor = dirname(path); ; ancestor = dirname(ancestor)) {
-		const canonical = canonicalizePath(ancestor);
-		// An outer checkout alias takes precedence over symlinks inside the old checkout.
-		selected = select(join(canonical, path.slice(ancestor.length)), root) ?? selected;
-		if (dirname(ancestor) === ancestor) break;
+	function selectPath(candidate: string): string | undefined {
+		const direct = select(candidate, logical);
+		if (direct) return direct;
+		const root = canonicalizePath(logical);
+		let selected: string | undefined;
+		for (let ancestor = dirname(candidate); ; ancestor = dirname(ancestor)) {
+			const canonical = canonicalizePath(ancestor);
+			// An outer checkout alias takes precedence over symlinks inside the old checkout.
+			selected = select(join(canonical, candidate.slice(ancestor.length)), root) ?? selected;
+			if (dirname(ancestor) === ancestor) break;
+		}
+		return selected ?? select(canonicalizePath(candidate), root);
 	}
-	return selected ?? select(canonicalizePath(path), root);
+
+	const selected = selectPath(path);
+	if (selected || existsSync(path)) return selected;
+	// realpath cannot resolve a dangling link whose target is new to the selected revision.
+	try {
+		return selectPath(resolve(dirname(path), readlinkSync(path)));
+	} catch {
+		return undefined;
+	}
 }
 
 export function matchesGitPackageExactRule(

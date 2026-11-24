@@ -729,13 +729,33 @@ describe("DefaultPackageManager git update", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
-		"discovers a selected directory index through an old file symlink",
+		"discovers a dangling prompt alias when its target appears in a new revision",
 		async () => {
+			setupRemoteAndInstall();
+			const alias = join(agentDir, "prompts", "tool.md");
+			mkdirSync(dirname(alias));
+			symlinkSync(relative(dirname(alias), join(installedDir, "tool.md")), alias);
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			expect((await packageManager.resolve()).prompts).toEqual([]);
+			createCommit(remoteDir, "tool.md", "Selected prompt", "Add prompt target");
+			await packageManager.update();
+			expect(existsSync(alias)).toBe(false);
+			expect((await packageManager.resolve()).prompts).toContainEqual(
+				expect.objectContaining({ path: join(selected(), "tool.md"), enabled: true }),
+			);
+		},
+	);
+
+	it.skipIf(process.platform === "win32").each(["worker.ts", "index.ts"])(
+		"discovers a selected directory index through an old %s file symlink",
+		async (name) => {
 			setupRemoteAndInstall();
 			createCommit(remoteDir, "worker.ts", "export default function() {}", "Add worker file");
 			git(["pull", "--ff-only"], installedDir);
-			const alias = join(agentDir, "extensions", "worker.ts");
+			const alias = join(agentDir, "extensions", name);
 			mkdirSync(dirname(alias));
+			const sibling = join(dirname(alias), "sibling.ts");
+			writeFileSync(sibling, "export default function() {}");
 			symlinkSync(join(installedDir, "worker.ts"), alias);
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 			settingsManager.setExtensionPaths([`-${relative(agentDir, join(alias, "index.ts"))}`]);
@@ -745,6 +765,7 @@ describe("DefaultPackageManager git update", () => {
 			await packageManager.update();
 			const directory = join(selected(), "worker.ts");
 			const resources = (await packageManager.resolve()).extensions;
+			expect(resources).toContainEqual(expect.objectContaining({ path: sibling, enabled: true }));
 			expect(resources.filter(({ path }) => path === directory || dirname(path) === directory)).toEqual([
 				expect.objectContaining({ path: join(directory, "index.ts"), enabled: false }),
 			]);
