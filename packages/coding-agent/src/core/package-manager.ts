@@ -3357,11 +3357,34 @@ export class DefaultPackageManager implements PackageManager {
 		const rules = this.redirectGitExactRules(patterns, baseDir, gitRevisions, aliases);
 		for (const f of allFiles) {
 			const spellings = aliases.get(f);
-			const matches = (alias?: Set<string>) =>
-				applyPatterns([f], rules, baseDir, baseDir, alias ? new Map([[f, alias]]) : undefined).has(f);
+			const revision = this.withGitRevision(metadata, f, gitRevisions).gitRevision;
+			const matches = (alias?: Set<string>) => {
+				if (!alias || !revision)
+					return applyPatterns([f], rules, baseDir, baseDir, alias ? new Map([[f, alias]]) : undefined).has(f);
+				const spelling = alias.values().next().value!;
+				const { logical, active } = revision;
+				// Match historical exact paths without following links below the checkout boundary.
+				const selectSpelling = (path: string) =>
+					redirectGitRevisionPath(path, logical, active, true) ??
+					redirectGitRevisionPath(path, logical, active) ??
+					path;
+				const candidateRules = patterns.flatMap((pattern) => {
+					if (!pattern.startsWith("+") && !pattern.startsWith("-")) {
+						return this.redirectGitExactRules([pattern], baseDir, gitRevisions, aliases);
+					}
+					const rule = pattern.slice(1);
+					if ([...(spellings ?? [])].some((path) => matchesAnyExactPattern(path, [rule], baseDir)))
+						return [pattern];
+					const original = this.resolvePathFromBase(rule, baseDir);
+					const historical = selectSpelling(original);
+					return matchesAnyExactPattern(selectSpelling(spelling), [historical], baseDir)
+						? [pattern, `${pattern[0]}${spelling}`]
+						: [pattern];
+				});
+				return applyPatterns([spelling], candidateRules, baseDir).has(spelling);
+			};
 			let declaration = chooseResourceAlias(spellings, matches);
 			const existing = target.get(f);
-			const revision = this.withGitRevision(metadata, f, gitRevisions).gitRevision;
 			// A direct spelling cannot override a disabled package row, but a later
 			// independent spelling can, provided its own settings rules enable it.
 			if (revision && existing?.metadata.origin === "package" && !existing.enabled && declaration.enabled) {

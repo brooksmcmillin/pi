@@ -1848,7 +1848,7 @@ describe("DefaultPackageManager git update", () => {
 		expect(readFileSync(join(installedDir, target), "utf8")).toBe("Retained review");
 	});
 
-	it.skipIf(process.platform === "win32").each(["manifest", "settings"])(
+	it.skipIf(process.platform === "win32").each(["manifest", "settings", "settings-exact"])(
 		"does not discover a hidden prompt target independently of its excluded directory alias (%s)",
 		async (source) => {
 			setupRemoteAndInstall();
@@ -1865,9 +1865,14 @@ describe("DefaultPackageManager git update", () => {
 			);
 			git(["pull", "--ff-only"], installedDir);
 			const declaredRoot = join(installedDir, "prompts");
-			if (source === "settings") {
+			const hiddenTarget = join(declaredRoot, ".hidden", "note.md");
+			if (source !== "manifest") {
 				settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-				settingsManager.setPromptTemplatePaths([declaredRoot, `!${relative(agentDir, declaredRoot)}/**/note.md`]);
+				settingsManager.setPromptTemplatePaths([
+					declaredRoot,
+					`!${relative(agentDir, declaredRoot)}/**/note.md`,
+					...(source === "settings-exact" ? [`+${hiddenTarget}`] : []),
+				]);
 			}
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await loader.reload();
@@ -1876,8 +1881,13 @@ describe("DefaultPackageManager git update", () => {
 			await packageManager.update();
 			await loader.reload();
 			expect(loader.getPrompts().prompts).toEqual([]);
-			if (source === "settings") {
-				settingsManager.setPromptTemplatePaths([declaredRoot]);
+			if (source !== "manifest") {
+				settingsManager.setPromptTemplatePaths([
+					declaredRoot,
+					...(source === "settings-exact" ? [`-${hiddenTarget}`] : []),
+				]);
+				await loader.reload();
+				expect(loader.getPrompts().prompts.map(({ content }) => content)).toEqual(["Selected note"]);
 				const [prompt] = (await packageManager.resolve()).prompts;
 				expect(prompt?.metadata.gitRevision?.declarations).toEqual([join(declaredRoot, "shortcut", "note.md")]);
 				return;
