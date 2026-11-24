@@ -394,7 +394,7 @@ function collectFiles(
 
 			if (entry.isSymbolicLink()) {
 				try {
-					const stats = statSync(fullPath);
+					const stats = statSync(selection?.selectPath(fullPath) ?? fullPath);
 					isDir = stats.isDirectory();
 					isFile = stats.isFile();
 				} catch {
@@ -455,7 +455,7 @@ function collectSkillEntries(
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
 				try {
-					isFile = statSync(fullPath).isFile();
+					isFile = statSync(selection?.selectPath(fullPath) ?? fullPath).isFile();
 				} catch {
 					continue;
 				}
@@ -479,7 +479,7 @@ function collectSkillEntries(
 
 			if (entry.isSymbolicLink()) {
 				try {
-					const stats = statSync(fullPath);
+					const stats = statSync(selection?.selectPath(fullPath) ?? fullPath);
 					isDir = stats.isDirectory();
 					isFile = stats.isFile();
 				} catch {
@@ -547,7 +547,7 @@ function collectAncestorAgentsSkillDirs(startDir: string): string[] {
 	return skillDirs;
 }
 
-function collectAutoPromptEntries(dir: string): string[] {
+function collectAutoPromptEntries(dir: string, selectPath: (path: string) => string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
@@ -564,7 +564,7 @@ function collectAutoPromptEntries(dir: string): string[] {
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
 				try {
-					isFile = statSync(fullPath).isFile();
+					isFile = statSync(selectPath(fullPath)).isFile();
 				} catch {
 					continue;
 				}
@@ -584,7 +584,7 @@ function collectAutoPromptEntries(dir: string): string[] {
 	return entries;
 }
 
-function collectAutoThemeEntries(dir: string): string[] {
+function collectAutoThemeEntries(dir: string, selectPath: (path: string) => string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
@@ -601,7 +601,7 @@ function collectAutoThemeEntries(dir: string): string[] {
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
 				try {
-					isFile = statSync(fullPath).isFile();
+					isFile = statSync(selectPath(fullPath)).isFile();
 				} catch {
 					continue;
 				}
@@ -3170,9 +3170,9 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		const discoverSkills = (original: string, mode: SkillDiscoveryMode) =>
 			collectSkillEntries(selectPath(original), mode, undefined, original, { selectPath, rememberAlias }, original);
-		const discoverAtSelectedRoot = (original: string, collect: (path: string) => string[]) => {
+		const discoverAtSelectedRoot = (original: string, collect: typeof collectAutoPromptEntries) => {
 			const selected = selectPath(original);
-			const paths = collect(selected);
+			const paths = collect(selected, selectPath);
 			if (selected !== original) {
 				for (const path of paths) {
 					if (isPathInside(selected, path)) rememberAlias(path, join(original, relative(selected, path)));

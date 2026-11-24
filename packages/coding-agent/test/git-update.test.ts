@@ -688,6 +688,47 @@ describe("DefaultPackageManager git update", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
+		"classifies skill, prompt and theme aliases after file-to-directory updates",
+		async () => {
+			setupRemoteAndInstall();
+			const fixtures = [
+				["skills", "tool.md", "SKILL.md"],
+				["prompts", "tool.md", "nested.md"],
+				["themes", "tool.json", "nested.json"],
+			] as const;
+			for (const [kind, file] of fixtures) createCommit(remoteDir, `${kind}-${file}`, "old", `Add ${kind} file`);
+			git(["pull", "--ff-only"], installedDir);
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			for (const [kind, file, child] of fixtures) {
+				const path = `${kind}-${file}`;
+				mkdirSync(join(agentDir, kind));
+				symlinkSync(join(installedDir, path), join(agentDir, kind, file));
+				git(["rm", path], remoteDir);
+				mkdirSync(join(remoteDir, path));
+				createCommit(remoteDir, `${path}/${child}`, "new", `Replace ${kind} file with directory`);
+			}
+			settingsManager.setSkillPaths([`-${join("skills", "tool.md", "SKILL.md")}`]);
+			await packageManager.update();
+			const active = selected();
+			const resources = await packageManager.resolve();
+			expect(resources.skills).toContainEqual(
+				expect.objectContaining({ path: join(active, "skills-tool.md", "SKILL.md"), enabled: false }),
+			);
+			expect(resources.prompts.map(({ path }) => path)).not.toContain(join(active, "prompts-tool.md"));
+			expect(resources.themes.map(({ path }) => path)).not.toContain(join(active, "themes-tool.json"));
+			settingsManager.setPromptTemplatePaths(["prompts"]);
+			settingsManager.setThemePaths(["themes"]);
+			const recursive = await packageManager.resolve();
+			expect(recursive.prompts).toContainEqual(
+				expect.objectContaining({ path: join(active, "prompts-tool.md", "nested.md") }),
+			);
+			expect(recursive.themes).toContainEqual(
+				expect.objectContaining({ path: join(active, "themes-tool.json", "nested.json") }),
+			);
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
 		"discovers a selected directory index through an old file symlink",
 		async () => {
 			setupRemoteAndInstall();
