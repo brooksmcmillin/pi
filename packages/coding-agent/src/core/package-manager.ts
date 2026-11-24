@@ -1080,7 +1080,7 @@ function applyAutoloadDisabledPatterns(
 	logicalRoot = baseDir,
 	aliases?: ReadonlyMap<string, Set<string>>,
 ): Map<string, { enabled: boolean; alias?: string }> {
-	const result = new Map<string, { enabled: boolean; alias?: string }>();
+	const states = new Map<string, Map<string | undefined, boolean>>();
 	for (const pattern of patterns) {
 		const target = pattern.slice(
 			pattern.startsWith("+") || pattern.startsWith("-") || pattern.startsWith("!") ? 1 : 0,
@@ -1089,11 +1089,24 @@ function applyAutoloadDisabledPatterns(
 		const exact = pattern.startsWith("+") || pattern.startsWith("-");
 		const matcher = exact ? matchesAnyExactPattern : matchesAnyPattern;
 		for (const filePath of allPaths) {
-			const alias = [...(aliases?.get(filePath) ?? [])].find((path) => matcher(path, [target], baseDir));
-			if (alias !== undefined || matchesPackagePath(filePath, [target], baseDir, logicalRoot, matcher)) {
-				result.set(filePath, { enabled, alias });
+			const spellings = [...(aliases?.get(filePath) ?? [])];
+			let matched: (string | undefined)[] = spellings.filter((path) => matcher(path, [target], baseDir));
+			if (!matched.length && matchesPackagePath(filePath, [target], baseDir, logicalRoot, matcher)) {
+				matched = spellings.length ? spellings : [undefined];
 			}
+			if (!matched.length) continue;
+			const declarations = states.get(filePath) ?? new Map<string | undefined, boolean>();
+			for (const alias of matched) declarations.set(alias, enabled);
+			states.set(filePath, declarations);
 		}
+	}
+	const result = new Map<string, { enabled: boolean; alias?: string }>();
+	for (const [filePath, declarations] of states) {
+		const ordered = [...(aliases?.get(filePath) ?? [undefined])];
+		const winner = ordered.find((alias) => declarations.get(alias) === true);
+		if (winner !== undefined || declarations.get(undefined) === true)
+			result.set(filePath, { enabled: true, alias: winner });
+		else result.set(filePath, { enabled: false, alias: ordered.find((alias) => declarations.has(alias)) });
 	}
 	return result;
 }

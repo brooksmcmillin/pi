@@ -1131,6 +1131,7 @@ describe("DefaultPackageManager git update", () => {
 			"configured-directory",
 			"package-include",
 			"package-delta-include",
+			"package-delta-mixed",
 			"package-direct",
 			"manifest-directory",
 			"package-toggle",
@@ -1141,6 +1142,7 @@ describe("DefaultPackageManager git update", () => {
 		const excluded = firstExcluded ? "keep.md" : "z-hide.md";
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "review.md", "Selected review", "Add prompt");
+		if (kind === "package-delta-mixed") git(["pull", "--ff-only"], installedDir);
 		const dir = join(agentDir, kind.startsWith("auto") ? "prompts" : "local-prompts");
 		mkdirSync(dir);
 		for (const name of ["keep.md", "z-hide.md"]) symlinkSync(join(installedDir, "review.md"), join(dir, name));
@@ -1162,7 +1164,9 @@ describe("DefaultPackageManager git update", () => {
 					? dir
 					: kind === "package-delta-include"
 						? { source: dir, autoload: false, prompts: ["+z-hide.md"] }
-						: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] };
+						: kind === "package-delta-mixed"
+							? { source: dir, autoload: false, prompts: ["+keep.md", "-z-hide.md"] }
+							: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] };
 			if (kind === "package-project-toggle") settingsManager.setProjectPackages([declaration]);
 			else settingsManager.setPackages([{ source: gitSource, autoload: false }, declaration]);
 		} else {
@@ -1171,6 +1175,12 @@ describe("DefaultPackageManager git update", () => {
 					? [join(dir, "keep.md"), join(dir, "z-hide.md"), `-${join(dir, excluded)}`]
 					: [`-prompts/${excluded}`],
 			);
+		}
+		if (kind === "package-delta-mixed") {
+			const before = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+			await before.reload();
+			expect(before.getPrompts().prompts.map(({ name }) => name)).toEqual(["keep"]);
+			createCommit(remoteDir, "extension.ts", "// Advance revision", "Advance revision");
 		}
 		await packageManager.update();
 		if (kind === "package-direct") {
@@ -1503,6 +1513,7 @@ describe("DefaultPackageManager git update", () => {
 		{ excluded: true, configured: "parent", directFirst: true },
 		{ excluded: true, configured: "parent", directFirst: true, excludeAlias: true },
 		{ excluded: true, configured: "parent", directFirst: true, toggle: true },
+		{ excluded: true, configured: "parent", directFirst: true, toggle: "project" },
 	])(
 		"keeps the prompt alias name while loading selected content ($excluded/$configured/$linkedAgentDir/$directFirst/$excludeAlias/$toggle)",
 		async ({ excluded, configured, linkedAgentDir, directFirst, excludeAlias, toggle }) => {
@@ -1555,29 +1566,64 @@ describe("DefaultPackageManager git update", () => {
 						],
 			);
 			if (toggle) {
-				settingsManager.setPromptTemplatePaths([join(selected(), "prompts", "review.md"), alias]);
+				const declarations = [join(selected(), "prompts", "review.md"), alias];
+				const project = toggle === "project";
+				if (project) {
+					settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+					settingsManager.setPromptTemplatePaths([]);
+					settingsManager.setProjectPromptTemplatePaths(declarations);
+				} else settingsManager.setPromptTemplatePaths(declarations);
+				const globalManager = new DefaultPackageManager({
+					cwd: tempDir,
+					agentDir,
+					settingsManager: SettingsManager.inMemory(settingsManager.getGlobalSettings()),
+				});
 				const resolved = await packageManager.resolve();
 				const item = resolved.prompts[0]!;
+				if (project) expect(item.metadata).toMatchObject({ scope: "project", origin: "top-level" });
 				const noop = () => {};
-				const selector = new ConfigSelectorComponent(
-					{ global: resolved, project: resolved },
-					settingsManager,
-					tempDir,
-					agentDir,
-					noop,
-					noop,
-					noop,
-				);
-				const list = selector.getResourceList() as unknown as {
-					toggleResource(resource: typeof item & { resourceType: "prompts" }): boolean;
+				const toggleRow = async (current: typeof resolved) => {
+					const selector = new ConfigSelectorComponent(
+						{ global: project ? await globalManager.resolve() : current, project: current },
+						settingsManager,
+						tempDir,
+						agentDir,
+						noop,
+						noop,
+						noop,
+						undefined,
+						project ? "project" : "global",
+					);
+					return selector.getResourceList() as unknown as {
+						toggleResource(resource: typeof item & { resourceType: "prompts" }): boolean;
+						setProjectTopLevelOverride(
+							resource: typeof item & { resourceType: "prompts" },
+							state: "unload" | "inherit",
+						): boolean;
+					};
 				};
-				expect(list.toggleResource({ ...item, resourceType: "prompts" })).toBe(false);
+				const list = await toggleRow(resolved);
+				const row = { ...item, resourceType: "prompts" as const };
+				if (project) expect(list.setProjectTopLevelOverride(row, "unload")).toBe(true);
+				else expect(list.toggleResource(row)).toBe(false);
 				await loader.reload();
 				expect(loader.getPrompts().prompts).toEqual([]);
 				createCommit(remoteDir, "prompts/review.md", "Next review", "Advance selected revision");
 				await packageManager.update();
 				await loader.reload();
 				expect(loader.getPrompts().prompts).toEqual([]);
+				if (project) {
+					const current = await packageManager.resolve();
+					expect(
+						(await toggleRow(current)).setProjectTopLevelOverride(
+							{ ...current.prompts[0]!, resourceType: "prompts" },
+							"inherit",
+						),
+					).toBe(true);
+					expect(settingsManager.getProjectSettings().prompts?.filter((entry) => entry.startsWith("-"))).toEqual(
+						[],
+					);
+				}
 			}
 		},
 	);

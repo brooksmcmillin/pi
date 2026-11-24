@@ -554,10 +554,7 @@ class ResourceList implements Component, Focusable {
 		if (enabled) {
 			updated.push(`+${pattern}`);
 		} else {
-			for (const target of new Set([
-				pattern,
-				...(declarations.length > 1 ? declarations.map((path) => relative(baseDir, path)) : []),
-			])) {
+			for (const target of new Set([pattern, ...this.getRowExclusionPatterns(item, scope)])) {
 				updated.push(`-${target}`);
 			}
 		}
@@ -698,7 +695,10 @@ class ResourceList implements Component, Focusable {
 			// Project entries name inherited files to override them. Built-in paths need no entry.
 			if (this.isInheritedGlobalItem(item) && item.metadata.source !== "builtin" && !updated.includes(pattern))
 				updated.push(pattern);
-			updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+			if (state === "load") updated.push(`+${pattern}`);
+			else
+				for (const path of new Set([pattern, ...this.getRowExclusionPatterns(item, "project")]))
+					updated.push(`-${path}`);
 		}
 		this.setProjectTopLevelPaths(item.resourceType, updated);
 		return true;
@@ -831,11 +831,19 @@ class ResourceList implements Component, Focusable {
 		return (
 			selected === item.path ||
 			revision.aliases?.includes(path) === true ||
+			(matchSkillDirectory && revision.declarations?.includes(path) === true) ||
 			(matchSkillDirectory &&
 				item.resourceType === "skills" &&
 				basename(item.path) === "SKILL.md" &&
 				(selected === dirname(item.path) || revision.aliases?.some((alias) => dirname(alias) === path) === true))
 		);
+	}
+
+	private getRowExclusionPatterns(item: ResourceItem, scope: SettingsScope): string[] {
+		const declarations = item.metadata.gitRevision?.declarations ?? [];
+		if (declarations.length < 2) return [];
+		const baseDir = this.getTopLevelBaseDir(scope);
+		return declarations.map((path) => relative(baseDir, path));
 	}
 
 	private getTopLevelOverridePatterns(item: ResourceItem, scope: SettingsScope): Set<string> {
