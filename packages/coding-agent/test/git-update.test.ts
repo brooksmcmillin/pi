@@ -2267,66 +2267,84 @@ describe("DefaultPackageManager git update", () => {
 
 	it
 		.skipIf(process.platform === "win32")
-		.each(["force-include", "manifest-exclusion", "settings-exclusion", "delta-exclusion", "top-level-exclusion"])(
-		"keeps the same prompt winner with interleaved Git aliases (%s)",
-		async (mode) => {
-			setupRemoteAndInstall();
-			createCommit(remoteDir, "shared.md", "Aliased prompt", "Add shared prompt");
-			for (const dir of ["a", "b", "c"]) mkdirSync(join(remoteDir, dir));
-			createCommit(remoteDir, "b/review.md", "Independent prompt", "Add independent prompt");
-			for (const path of ["a/first.md", "c/review.md"])
-				symlinkSync(join(installedDir, "shared.md"), join(remoteDir, path));
-			git(["add", "a/first.md", "c/review.md"], remoteDir);
-			git(["commit", "-m", "Add interleaved aliases"], remoteDir);
-			createCommit(
-				remoteDir,
-				"package.json",
-				JSON.stringify({
-					pi: {
-						prompts: [
-							"a/first.md",
-							"b/review.md",
-							"c/review.md",
-							...(mode === "manifest-exclusion" || mode === "force-include" ? ["!a/first.md"] : []),
-							...(mode === "force-include" ? ["+a/first.md"] : []),
-						],
-					},
-				}),
-				"Declare filtered prompts",
-			);
-			git(["pull", "--ff-only"], installedDir);
-			if (mode === "top-level-exclusion") {
-				settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-				settingsManager.setPromptTemplatePaths([
-					...["a/first.md", "b/review.md", "c/review.md"].map((path) => join(installedDir, path)),
-					`-${join(installedDir, "a/first.md")}`,
-				]);
-			} else if (mode !== "manifest-exclusion") {
-				settingsManager.setPackages([
-					{
-						source: gitSource,
-						autoload: mode !== "delta-exclusion",
-						prompts: [
-							"**/*.md",
-							...(mode === "settings-exclusion" || mode === "delta-exclusion" ? ["-a/first.md"] : []),
-						],
-					},
-				]);
-			}
-			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
-			const verifyWinner = async (checkout: string) => {
-				await loader.reload();
-				expect(loader.getPrompts().prompts.find(({ name }) => name === "review")).toMatchObject({
-					content: "Independent prompt",
-					filePath: join(checkout, "b", "review.md"),
-				});
-			};
-			await verifyWinner(installedDir);
-			createCommit(remoteDir, "extension.ts", "// advance revision", "Advance revision");
-			await packageManager.update();
-			await verifyWinner(selected());
-		},
-	);
+		.each([
+			"force-include",
+			"manifest-exclusion",
+			"settings-exclusion",
+			"delta-exclusion",
+			"top-level-exclusion",
+			"delta-rule-order",
+			"top-level-replacement",
+		])("keeps the same prompt winner with interleaved Git aliases (%s)", async (mode) => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "shared.md", "Aliased prompt", "Add shared prompt");
+		for (const dir of ["a", "b", "c"]) mkdirSync(join(remoteDir, dir));
+		createCommit(remoteDir, "b/review.md", "Independent prompt", "Add independent prompt");
+		for (const path of ["a/first.md", "c/review.md"])
+			symlinkSync(join(installedDir, "shared.md"), join(remoteDir, path));
+		git(["add", "a/first.md", "c/review.md"], remoteDir);
+		git(["commit", "-m", "Add interleaved aliases"], remoteDir);
+		createCommit(
+			remoteDir,
+			"package.json",
+			JSON.stringify({
+				pi: {
+					prompts:
+						mode === "top-level-replacement"
+							? ["shared.md"]
+							: [
+									"a/first.md",
+									"b/review.md",
+									"c/review.md",
+									...(mode === "manifest-exclusion" || mode === "force-include" ? ["!a/first.md"] : []),
+									...(mode === "force-include" ? ["+a/first.md"] : []),
+								],
+				},
+			}),
+			"Declare filtered prompts",
+		);
+		git(["pull", "--ff-only"], installedDir);
+		if (mode === "delta-rule-order") {
+			settingsManager.setPackages([
+				{ source: gitSource, autoload: false, prompts: ["c/review.md", "b/review.md", "a/first.md"] },
+			]);
+		} else if (mode === "top-level-replacement") {
+			settingsManager.setPackages([{ source: gitSource, prompts: [] }]);
+			settingsManager.setPromptTemplatePaths([join(installedDir, "b/review.md"), join(installedDir, "c/review.md")]);
+		} else if (mode === "top-level-exclusion") {
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			settingsManager.setPromptTemplatePaths([
+				...["a/first.md", "b/review.md", "c/review.md"].map((path) => join(installedDir, path)),
+				`-${join(installedDir, "a/first.md")}`,
+			]);
+		} else if (mode !== "manifest-exclusion") {
+			settingsManager.setPackages([
+				{
+					source: gitSource,
+					autoload: mode !== "delta-exclusion",
+					prompts: [
+						"**/*.md",
+						...(mode === "settings-exclusion" || mode === "delta-exclusion" ? ["-a/first.md"] : []),
+					],
+				},
+			]);
+		}
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		const verifyWinner = async (checkout: string) => {
+			await loader.reload();
+			expect(loader.getPrompts().prompts.find(({ name }) => name === "review")).toMatchObject({
+				content: mode === "delta-rule-order" ? "Aliased prompt" : "Independent prompt",
+				filePath: join(
+					checkout,
+					mode === "delta-rule-order" ? (checkout === installedDir ? "c/review.md" : "shared.md") : "b/review.md",
+				),
+			});
+		};
+		await verifyWinner(installedDir);
+		createCommit(remoteDir, "extension.ts", "// advance revision", "Advance revision");
+		await packageManager.update();
+		await verifyWinner(selected());
+	});
 
 	it("keeps a nested extension entry outside its discovery directory when filtering a manifest", async () => {
 		const local = join(tempDir, "local-package");

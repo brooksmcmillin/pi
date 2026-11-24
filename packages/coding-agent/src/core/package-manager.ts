@@ -1157,12 +1157,14 @@ function applyAutoloadDisabledPatterns(
 	}
 	const order = new Map([...(filesBySpelling?.keys() ?? [])].map((spelling, index) => [spelling, index]));
 	const rows = [...states].map(([filePath, declarations]) => {
-		const ordered = [...(aliases?.get(filePath) ?? [undefined])];
-		const alias =
-			ordered.find((spelling) => declarations.get(spelling)?.enabled) ??
-			ordered.find((spelling) => declarations.has(spelling));
-		const state = declarations.get(alias)!;
-		return { filePath, alias, ...state, rank: order.get(alias ?? filePath) ?? Number.MAX_SAFE_INTEGER };
+		const candidates = [...declarations].map(([alias, state]) => ({
+			filePath,
+			alias,
+			...state,
+			rank: order.get(alias ?? filePath) ?? Number.MAX_SAFE_INTEGER,
+		}));
+		candidates.sort((a, b) => Number(b.enabled) - Number(a.enabled) || a.firstRule - b.firstRule || a.rank - b.rank);
+		return candidates[0]!;
 	});
 	rows.sort((a, b) => a.firstRule - b.firstRule || a.rank - b.rank);
 	return new Map(rows.map(({ filePath, alias, enabled }) => [filePath, { alias, enabled }]));
@@ -3876,6 +3878,8 @@ export class DefaultPackageManager implements PackageManager {
 				) &&
 				resourcePrecedenceRank(metadata) < resourcePrecedenceRank(existing.metadata))
 		) {
+			// A replacement takes its position from the winning declaration, not the displaced row.
+			if (existing) map.delete(path);
 			map.set(path, { metadata, enabled });
 		}
 	}
