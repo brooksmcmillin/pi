@@ -214,7 +214,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const result = loadSkillFromFile(fullPath, source);
+			const result = loadSkillFromFile(fullPath, source, join(logicalDir, entry.name));
 			if (result.skill) {
 				skills.push(result.skill);
 			}
@@ -273,7 +273,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const result = loadSkillFromFile(fullPath, source);
+			const result = loadSkillFromFile(fullPath, source, join(logicalDir, entry.name));
 			if (result.skill) {
 				skills.push(result.skill);
 			}
@@ -287,9 +287,10 @@ function loadSkillsFromDirInternal(
 function loadSkillFromFile(
 	filePath: string,
 	source: string,
+	declarationPath = filePath,
 ): { skill: Skill | null; diagnostics: ResourceDiagnostic[] } {
 	const diagnostics: ResourceDiagnostic[] = [];
-	const isDeclaredSkill = basename(filePath) === "SKILL.md";
+	const isDeclaredSkill = basename(declarationPath) === "SKILL.md";
 
 	let rawContent: string;
 	try {
@@ -318,7 +319,7 @@ function loadSkillFromFile(
 	}
 
 	const skillDir = dirname(filePath);
-	const parentDirName = basename(skillDir);
+	const parentDirName = basename(dirname(declarationPath));
 
 	// Validate description
 	const descErrors = validateDescription(description);
@@ -494,13 +495,13 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 		try {
 			const stats = statSync(resolvedPath);
 			const source = getSource(resolvedPath);
+			const declarationPath = (selectPath ? undefined : options.getDiscoveredPath?.(resolvedPath)) ?? original;
 			if (stats.isDirectory()) {
-				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true, undefined, undefined, selectPath));
-			} else if (
-				stats.isFile() &&
-				((selectPath ? undefined : options.getDiscoveredPath?.(resolvedPath)) ?? original).endsWith(".md")
-			) {
-				const result = loadSkillFromFile(resolvedPath, source);
+				addSkills(
+					loadSkillsFromDirInternal(resolvedPath, source, true, undefined, undefined, selectPath, declarationPath),
+				);
+			} else if (stats.isFile() && declarationPath.endsWith(".md")) {
+				const result = loadSkillFromFile(resolvedPath, source, declarationPath);
 				if (result.skill) {
 					addSkills({ skills: [result.skill], diagnostics: result.diagnostics });
 				} else {

@@ -2089,6 +2089,39 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32").each(["file", "directory", "settings"])(
+		"preserves an unnamed skill alias across publication (%s)",
+		async (mode) => {
+			setupRemoteAndInstall();
+			vi.stubEnv("HOME", join(tempDir, "home"));
+			const target = "templates/raw";
+			mkdirSync(join(remoteDir, "templates"));
+			createCommit(remoteDir, target, "---\ndescription: Review fixture\n---\nOld review", "Add review skill");
+			git(["pull", "--ff-only"], installedDir);
+			const directory = join(tempDir, "review");
+			mkdirSync(directory);
+			const alias = join(directory, "SKILL.md");
+			symlinkSync(join(installedDir, target), alias);
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			if (mode === "settings") settingsManager.setSkillPaths([directory]);
+			const loader = new DefaultResourceLoader({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+				additionalSkillPaths: mode === "settings" ? [] : [mode === "file" ? alias : directory],
+			});
+			await loader.reload();
+			expect(loader.getSkills().skills).toEqual([expect.objectContaining({ name: "review" })]);
+			createCommit(remoteDir, target, "---\ndescription: Review fixture\n---\nNew review", "Advance review skill");
+			await packageManager.update();
+			await loader.reload();
+			const filePath = join(selected(), target);
+			expect(loader.getSkills().skills).toEqual([
+				expect.objectContaining({ name: "review", filePath, baseDir: dirname(filePath) }),
+			]);
+		},
+	);
+
 	it.skipIf(process.platform === "win32")(
 		"preserves an inherited prompt alias through project overrides and publication",
 		async () => {
