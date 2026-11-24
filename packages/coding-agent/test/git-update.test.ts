@@ -353,9 +353,11 @@ describe("DefaultPackageManager git update", () => {
 		);
 		settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
 		git(["pull", "--ff-only"], installedDir);
+		const declared = join(installedDir, "worker.ts");
+		settingsManager.setExtensionPaths([declared]);
 		for (const version of ["v2", "v3"]) {
 			const prior = join(selected(), "worker.ts");
-			settingsManager.setExtensionPaths([prior, `-${prior}`]);
+			settingsManager.setExtensionPaths([declared, `-${relative(agentDir, prior)}`]);
 			createCommit(remoteDir, "extension.ts", `// ${version}`, "Advance revision");
 			await packageManager.update();
 			const current = join(selected(), "worker.ts");
@@ -366,6 +368,30 @@ describe("DefaultPackageManager git update", () => {
 			expect(workers).toEqual([expect.objectContaining({ path: current, enabled: false })]);
 		}
 	});
+
+	it.each([true, false])(
+		"deduplicates extensions discovered from a checkout parent (excluded: %s)",
+		async (excluded) => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "index.ts", "export default function() {}", "Add index");
+			createCommit(
+				remoteDir,
+				"package.json",
+				JSON.stringify({ name: "fixture", version: "1.0.0", pi: { extensions: ["./index.ts"] } }),
+				"Declare index",
+			);
+			settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
+			git(["pull", "--ff-only"], installedDir);
+			settingsManager.setExtensionPaths([dirname(installedDir)]);
+			settingsManager.setPackages([{ source: gitSource, extensions: excluded ? ["-index.ts"] : ["*"] }]);
+			createCommit(remoteDir, "extension.ts", "// v2", "Advance revision");
+			await packageManager.update();
+			const indexes = (await packageManager.resolve()).extensions.filter(
+				(entry) => basename(entry.path) === "index.ts",
+			);
+			expect(indexes).toEqual([expect.objectContaining({ path: join(selected(), "index.ts"), enabled: !excluded })]);
+		},
+	);
 
 	it("keeps a pinned fetch result isolated from a competing update", async () => {
 		setupRemoteAndInstall();

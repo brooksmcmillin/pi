@@ -2945,17 +2945,29 @@ export class DefaultPackageManager implements PackageManager {
 			const original = this.resolvePathFromBase(entry, baseDir);
 			const selected = this.redirectGitResource(original, gitRevisions);
 			for (const file of this.collectFilesFromPaths([selected], resourceType)) {
-				allFiles.add(file);
-				if (original !== selected && (file === selected || isPathInside(selected, file))) {
-					const spellings = aliases.get(file) ?? new Set<string>();
-					spellings.add(join(original, relative(selected, file)));
-					aliases.set(file, spellings);
+				const active = this.redirectGitResource(file, gitRevisions);
+				if (active !== file && !existsSync(active)) continue;
+				allFiles.add(active);
+				if (active !== file || original !== selected) {
+					const spellings = aliases.get(active) ?? new Set<string>();
+					spellings.add(file);
+					if (original !== selected && (file === selected || isPathInside(selected, file))) {
+						spellings.add(join(original, relative(selected, file)));
+					}
+					aliases.set(active, spellings);
 				}
 			}
 		}
 
-		// Apply filters once per physical file, with its original setting paths as aliases.
-		const enabledPaths = applyPatterns([...allFiles], patterns, baseDir, baseDir, aliases);
+		// pi config saves exact paths relative to the settings directory. Resolve them through
+		// the same revision mapping as declarations, even if they name a different revision.
+		const rules = patterns.flatMap((pattern) => {
+			if (pattern[0] !== "+" && pattern[0] !== "-") return [pattern];
+			const original = this.resolvePathFromBase(pattern.slice(1), baseDir);
+			const active = this.redirectGitResource(original, gitRevisions);
+			return active === original ? [pattern] : [pattern, `${pattern[0]}${active}`];
+		});
+		const enabledPaths = applyPatterns([...allFiles], rules, baseDir, baseDir, aliases);
 
 		// Add all files with their enabled state
 		for (const f of allFiles) {
