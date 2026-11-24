@@ -3212,7 +3212,8 @@ export class DefaultPackageManager implements PackageManager {
 		const order = new Map([...filesBySpelling.keys()].map((spelling, index) => [spelling, index]));
 		const rows = allFiles.map((f) => {
 			const spellings = aliases?.get(f);
-			const declaration = chooseResourceAlias(spellings, (alias) =>
+			const candidates = spellings && new Set(distinctExistingAliases([...spellings]));
+			const declaration = chooseResourceAlias(candidates, (alias) =>
 				matchesPackageDeclaration(
 					f,
 					alias?.values().next().value,

@@ -2300,6 +2300,7 @@ describe("DefaultPackageManager git update", () => {
 			"top-level-replacement",
 			"top-level-exclusion-only-aliases",
 			"delta-exclusion-only-aliases",
+			"settings-exclusion-only-aliases",
 			"auto-exclusion-only-aliases",
 		])("keeps the same prompt winner with interleaved Git aliases (%s)", async (mode) => {
 		setupRemoteAndInstall();
@@ -2358,8 +2359,10 @@ describe("DefaultPackageManager git update", () => {
 					autoload: !mode.startsWith("delta-exclusion"),
 					prompts: [
 						"**/*.md",
-						...(mode === "settings-exclusion" || mode.startsWith("delta-exclusion") ? ["-a/first.md"] : []),
-						...(mode === "delta-exclusion-only-aliases" ? ["-b/review.md"] : []),
+						...(mode.startsWith("settings-exclusion") || mode.startsWith("delta-exclusion")
+							? ["-a/first.md"]
+							: []),
+						...(mode.endsWith("exclusion-only-aliases") ? ["-b/review.md"] : []),
 					],
 				},
 			]);
