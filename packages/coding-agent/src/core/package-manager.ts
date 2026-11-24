@@ -303,8 +303,8 @@ function prefixIgnorePattern(line: string, prefix: string): string | null {
 	return negated ? `!${prefixed}` : prefixed;
 }
 
-function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
-	const relativeDir = relative(rootDir, dir);
+function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string, logicalDir = dir): void {
+	const relativeDir = relative(rootDir, logicalDir);
 	const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
 
 	for (const filename of IGNORE_FILE_NAMES) {
@@ -418,13 +418,19 @@ function collectSkillEntries(
 	mode: SkillDiscoveryMode,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	selection?: { selectPath: (path: string) => string; rememberAlias: (file: string, alias: string) => void },
+	logicalDir = dir,
 ): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
-	const root = rootDir ?? dir;
+	const root = rootDir ?? logicalDir;
 	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	addIgnoreRules(ig, dir, root, logicalDir);
+	const addEntry = (file: string, logical: string) => {
+		entries.push(file);
+		if (file !== logical) selection?.rememberAlias(file, logical);
+	};
 
 	try {
 		const dirEntries = readdirSync(dir, { withFileTypes: true });
@@ -444,9 +450,10 @@ function collectSkillEntries(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const logical = join(logicalDir, entry.name);
+			const relPath = toPosixPath(relative(root, logical));
 			if (isFile && !ig.ignores(relPath)) {
-				entries.push(fullPath);
+				addEntry(fullPath, logical);
 				return entries;
 			}
 		}
@@ -469,31 +476,29 @@ function collectSkillEntries(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const logical = join(logicalDir, entry.name);
+			const relPath = toPosixPath(relative(root, logical));
 			const shouldIncludeMarkdownFile =
 				isFile &&
 				entry.name.endsWith(".md") &&
 				!ig.ignores(relPath) &&
-				((mode === "pi" && dir === root) || (mode === "agents" && dir !== root));
+				((mode === "pi" && logicalDir === root) || (mode === "agents" && logicalDir !== root));
 			if (shouldIncludeMarkdownFile) {
-				entries.push(fullPath);
+				addEntry(fullPath, logical);
 				continue;
 			}
 
 			if (!isDir) continue;
 			if (ig.ignores(`${relPath}/`)) continue;
 
-			entries.push(...collectSkillEntries(fullPath, mode, ig, root));
+			const selected = selection?.selectPath(fullPath) ?? fullPath;
+			entries.push(...collectSkillEntries(selected, mode, ig, root, selection, logical));
 		}
 	} catch {
 		// Ignore errors
 	}
 
 	return entries;
-}
-
-function collectAutoSkillEntries(dir: string, mode: SkillDiscoveryMode): string[] {
-	return collectSkillEntries(dir, mode);
 }
 
 function findGitRepoRoot(startDir: string): string | null {
@@ -2964,11 +2969,19 @@ export class DefaultPackageManager implements PackageManager {
 		const { plain, patterns } = splitPatterns(entries);
 		const allFiles = new Set<string>();
 		const aliases = new Map<string, Set<string>>();
+		const rememberAlias = (file: string, alias: string) => {
+			const spellings = aliases.get(file) ?? new Set<string>();
+			spellings.add(alias);
+			aliases.set(file, spellings);
+		};
 		for (const entry of plain) {
 			const original = this.resolvePathFromBase(entry, baseDir);
 			const selected = this.redirectGitResource(original, gitRevisions);
-			for (const file of this.collectFilesFromPaths([selected], resourceType, (path) =>
-				this.redirectGitResource(path, gitRevisions),
+			for (const file of this.collectFilesFromPaths(
+				[selected],
+				resourceType,
+				(path) => this.redirectGitResource(path, gitRevisions),
+				rememberAlias,
 			)) {
 				const active = this.redirectGitResource(file, gitRevisions);
 				if (active !== file && !existsSync(active)) continue;
@@ -2986,18 +2999,26 @@ export class DefaultPackageManager implements PackageManager {
 
 		// pi config saves exact paths relative to the settings directory. Resolve them through
 		// the same revision mapping as declarations, even if they name a different revision.
-		const rules = patterns.flatMap((pattern) => {
+		const rules = this.redirectGitExactRules(patterns, baseDir, gitRevisions);
+		const enabledPaths = applyPatterns([...allFiles], rules, baseDir, baseDir, aliases);
+
+		for (const f of allFiles) {
+			this.addResource(target, f, metadata, enabledPaths.has(f));
+		}
+	}
+
+	private redirectGitExactRules(
+		patterns: string[],
+		baseDir: string,
+		gitRevisions: ReadonlyMap<string, string>,
+	): string[] {
+		if (gitRevisions.size === 0) return patterns;
+		return patterns.flatMap((pattern) => {
 			if (pattern[0] !== "+" && pattern[0] !== "-") return [pattern];
 			const original = this.resolvePathFromBase(pattern.slice(1), baseDir);
 			const active = this.redirectGitResource(original, gitRevisions);
 			return active === original ? [pattern] : [pattern, `${pattern[0]}${active}`];
 		});
-		const enabledPaths = applyPatterns([...allFiles], rules, baseDir, baseDir, aliases);
-
-		// Add all files with their enabled state
-		for (const f of allFiles) {
-			this.addResource(target, f, metadata, enabledPaths.has(f));
-		}
 	}
 
 	private redirectGitResource(path: string, revisions: ReadonlyMap<string, string>): string {
@@ -3079,15 +3100,17 @@ export class DefaultPackageManager implements PackageManager {
 			spellings.add(alias);
 			aliases.set(file, spellings);
 		};
-		const discoverSkills = (original: string, mode: SkillDiscoveryMode) => {
+		const discoverSkills = (original: string, mode: SkillDiscoveryMode) =>
+			collectSkillEntries(selectPath(original), mode, undefined, original, { selectPath, rememberAlias }, original);
+		const discoverAtSelectedRoot = (original: string, collect: (path: string) => string[]) => {
 			const selected = selectPath(original);
-			const skills = collectAutoSkillEntries(selected, mode);
+			const paths = collect(selected);
 			if (selected !== original) {
-				for (const skill of skills) {
-					if (isPathInside(selected, skill)) rememberAlias(skill, join(original, relative(selected, skill)));
+				for (const path of paths) {
+					if (isPathInside(selected, path)) rememberAlias(path, join(original, relative(selected, path)));
 				}
 			}
-			return skills;
+			return paths;
 		};
 		const addResources = (
 			resourceType: ResourceType,
@@ -3106,8 +3129,9 @@ export class DefaultPackageManager implements PackageManager {
 				for (const alias of aliases.get(path) ?? []) spellings.add(alias);
 				discovered.set(active, spellings);
 			}
+			const rules = this.redirectGitExactRules(overrides, baseDir, accumulator.gitRevisions);
 			for (const [active, spellings] of discovered) {
-				this.addResource(target, active, metadata, isEnabledByOverrides(active, overrides, baseDir, spellings));
+				this.addResource(target, active, metadata, isEnabledByOverrides(active, rules, baseDir, spellings));
 			}
 			aliases.clear();
 		};
@@ -3151,14 +3175,14 @@ export class DefaultPackageManager implements PackageManager {
 		if (projectTrusted) {
 			addResources(
 				"prompts",
-				collectAutoPromptEntries(projectDirs.prompts),
+				discoverAtSelectedRoot(projectDirs.prompts, collectAutoPromptEntries),
 				projectMetadata,
 				projectOverrides.prompts,
 				projectBaseDir,
 			);
 			addResources(
 				"themes",
-				collectAutoThemeEntries(projectDirs.themes),
+				discoverAtSelectedRoot(projectDirs.themes, collectAutoThemeEntries),
 				projectMetadata,
 				projectOverrides.themes,
 				projectBaseDir,
@@ -3193,14 +3217,14 @@ export class DefaultPackageManager implements PackageManager {
 
 		addResources(
 			"prompts",
-			collectAutoPromptEntries(userDirs.prompts),
+			discoverAtSelectedRoot(userDirs.prompts, collectAutoPromptEntries),
 			userMetadata,
 			userOverrides.prompts,
 			globalBaseDir,
 		);
 		addResources(
 			"themes",
-			collectAutoThemeEntries(userDirs.themes),
+			discoverAtSelectedRoot(userDirs.themes, collectAutoThemeEntries),
 			userMetadata,
 			userOverrides.themes,
 			globalBaseDir,
@@ -3211,6 +3235,7 @@ export class DefaultPackageManager implements PackageManager {
 		paths: string[],
 		resourceType: ResourceType,
 		selectPath?: (path: string) => string,
+		rememberAlias?: (file: string, alias: string) => void,
 	): string[] {
 		const files: string[] = [];
 		for (const p of paths) {
@@ -3223,7 +3248,7 @@ export class DefaultPackageManager implements PackageManager {
 				} else if (stats.isDirectory()) {
 					files.push(
 						...(resourceType === "extensions" && selectPath
-							? collectAutoExtensionEntries(p, selectPath)
+							? collectAutoExtensionEntries(p, selectPath, rememberAlias)
 							: collectResourceFiles(p, resourceType)),
 					);
 				}
