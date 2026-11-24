@@ -1054,7 +1054,7 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
-	it.skipIf(process.platform === "win32").each(["direct", "symlinked parent", "chained"])(
+	it.skipIf(process.platform === "win32").each(["direct", "symlinked parent", "chained", "dangling directory"])(
 		"discovers a dangling prompt alias when its target appears (%s)",
 		async (kind) => {
 			const linkedParent = kind === "symlinked parent";
@@ -1063,8 +1063,14 @@ describe("DefaultPackageManager git update", () => {
 			const containingDir = linkedParent ? join(dirname(installedDir), "prompt-aliases") : dirname(alias);
 			mkdirSync(containingDir);
 			if (linkedParent) symlinkSync(containingDir, dirname(alias));
-			const target = join(installedDir, "tool.md");
-			if (kind === "chained") {
+			const targetPath = kind === "dangling directory" ? "new-dir/tool.md" : "tool.md";
+			const target = join(installedDir, targetPath);
+			if (kind === "dangling directory") {
+				const bridge = join(tempDir, "bridge");
+				symlinkSync(dirname(target), bridge, "dir");
+				symlinkSync(relative(containingDir, join(bridge, "tool.md")), alias);
+				mkdirSync(join(remoteDir, "new-dir"));
+			} else if (kind === "chained") {
 				const intermediate = join(tempDir, "intermediate.md");
 				symlinkSync(relative(tempDir, target), intermediate);
 				symlinkSync(relative(containingDir, intermediate), alias);
@@ -1075,11 +1081,11 @@ describe("DefaultPackageManager git update", () => {
 			}
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 			expect((await packageManager.resolve()).prompts).toEqual([]);
-			createCommit(remoteDir, "tool.md", "Selected prompt", "Add prompt target");
+			createCommit(remoteDir, targetPath, "Selected prompt", "Add prompt target");
 			await packageManager.update();
 			expect(existsSync(alias)).toBe(false);
 			expect((await packageManager.resolve()).prompts).toEqual([
-				expect.objectContaining({ path: join(selected(), "tool.md"), enabled: true }),
+				expect.objectContaining({ path: join(selected(), targetPath), enabled: true }),
 			]);
 		},
 	);

@@ -960,16 +960,24 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 
 	const seen = new Set<string>();
 	let candidate = path;
-	while (!seen.has(candidate)) {
+	// Bound even cycles that grow the remaining suffix at each hop.
+	for (let hops = 0; hops < 40 && !seen.has(candidate); hops++) {
 		seen.add(candidate);
 		const selected = selectPath(candidate);
 		if (selected || existsSync(candidate)) return selected;
-		// realpath cannot resolve a dangling link whose target is new to the selected revision.
-		try {
-			candidate = resolve(realpathSync(dirname(candidate)), readlinkSync(candidate));
-		} catch {
-			return undefined;
+		// A dangling link may be an ancestor of the requested file.
+		let next: string | undefined;
+		for (let component = candidate; dirname(component) !== component; component = dirname(component)) {
+			try {
+				const target = resolve(realpathSync(dirname(component)), readlinkSync(component));
+				next = join(target, candidate.slice(component.length));
+				break;
+			} catch {
+				// Try an earlier component when the parent or link is unavailable.
+			}
 		}
+		if (!next) return undefined;
+		candidate = next;
 	}
 	return undefined;
 }
