@@ -918,10 +918,23 @@ function applyPatterns(
 	return new Set(result);
 }
 
+function canonicalizeGitResourcePath(path: string): string {
+	let ancestor = path;
+	while (true) {
+		try {
+			return join(realpathSync(ancestor), relative(ancestor, path));
+		} catch (error) {
+			const parent = dirname(ancestor);
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === ancestor) return path;
+			ancestor = parent;
+		}
+	}
+}
+
 export function redirectGitRevisionPath(path: string, logical: string, active: string): string | undefined {
 	for (const [candidate, root] of [
 		[path, logical],
-		[canonicalizePath(path), canonicalizePath(logical)],
+		[canonicalizeGitResourcePath(path), canonicalizePath(logical)],
 	] as const) {
 		if (candidate === root || isPathInside(root, candidate)) return join(active, relative(root, candidate));
 		const parent = dirname(root);

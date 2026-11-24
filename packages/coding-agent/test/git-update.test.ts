@@ -402,7 +402,7 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.each(["root", "child", "explicit child", "retained alias exclusion"])(
+	it.each(["root", "child", "explicit child", "explicit file", "retained alias exclusion"])(
 		"uses the selected manifest through a %s alias",
 		async (kind) => {
 			setupRemoteAndInstall();
@@ -412,12 +412,13 @@ describe("DefaultPackageManager git update", () => {
 				JSON.stringify({ name: "fixture", version: "1.0.0", pi: { extensions: [entry] } });
 			createCommit(remoteDir, "package.json", manifest("./old.ts"), "Declare old entry");
 			git(["pull", "--ff-only"], installedDir);
-			const root = join(agentDir, kind === "explicit child" ? "custom-extensions" : "extensions");
+			const root = join(agentDir, kind.startsWith("explicit") ? "custom-extensions" : "extensions");
 			const alias = kind === "root" ? root : join(root, "alias");
 			mkdirSync(dirname(alias), { recursive: true });
 			symlinkSync(installedDir, alias, process.platform === "win32" ? "junction" : "dir");
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-			const declarations = kind === "explicit child" ? [root] : [];
+			const declarations =
+				kind === "explicit child" ? [root] : kind === "explicit file" ? [join(alias, "new.ts")] : [];
 			settingsManager.setExtensionPaths([...declarations, `-${relative(agentDir, join(alias, "new.ts"))}`]);
 			createCommit(remoteDir, "new.ts", "export default function() {}", "Add replacement");
 			createCommit(remoteDir, "package.json", manifest("./new.ts"), "Select replacement");
@@ -426,6 +427,7 @@ describe("DefaultPackageManager git update", () => {
 				["old.ts", "new.ts"].includes(basename(entry.path)),
 			);
 			const first = join(selected(), "new.ts");
+			expect(existsSync(join(alias, "new.ts"))).toBe(false);
 			expect(entries).toEqual([expect.objectContaining({ path: first, enabled: false })]);
 			if (kind !== "retained alias exclusion") {
 				settingsManager.setExtensionPaths([...declarations, `-${relative(agentDir, first)}`]);
@@ -474,6 +476,59 @@ describe("DefaultPackageManager git update", () => {
 			);
 		},
 	);
+
+	it("keeps a directory skill exclusion when toggling an adjacent standalone skill", async () => {
+		setupRemoteAndInstall();
+		await packageManager.update();
+		createCommit(
+			remoteDir,
+			"SKILL.md",
+			"---\nname: fixture\ndescription: Fixture skill\n---\nDirectory skill.\n",
+			"Add directory skill",
+		);
+		createCommit(
+			remoteDir,
+			"standalone.md",
+			"---\nname: standalone\ndescription: Standalone skill\n---\nStandalone skill.\n",
+			"Add standalone skill",
+		);
+		await packageManager.update();
+		const prior = selected();
+		const directoryOverride = `-${relative(agentDir, prior)}`;
+		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+		settingsManager.setSkillPaths([
+			join(prior, "SKILL.md"),
+			join(prior, "standalone.md"),
+			directoryOverride,
+			`-${relative(agentDir, join(prior, "standalone.md"))}`,
+		]);
+		createCommit(remoteDir, "extension.ts", "// v3", "Advance revision");
+		await packageManager.update();
+		const resolved = await packageManager.resolve();
+		const standalone = resolved.skills.find((entry) => entry.path === join(selected(), "standalone.md"));
+		if (!standalone) throw new Error("Expected standalone skill");
+		expect(standalone.enabled).toBe(false);
+		const noop = () => {};
+		const selector = new ConfigSelectorComponent(
+			{ global: resolved, project: resolved },
+			settingsManager,
+			tempDir,
+			agentDir,
+			noop,
+			noop,
+			noop,
+		);
+		const list = selector.getResourceList() as unknown as {
+			toggleResource(resource: typeof standalone & { resourceType: "skills" }): boolean;
+		};
+		expect(list.toggleResource({ ...standalone, resourceType: "skills" })).toBe(true);
+		expect(settingsManager.getGlobalSettings().skills).toContain(directoryOverride);
+		const refreshed = (await packageManager.resolve()).skills;
+		expect(refreshed).toContainEqual(
+			expect.objectContaining({ path: join(selected(), "standalone.md"), enabled: true }),
+		);
+		expect(refreshed).toContainEqual(expect.objectContaining({ path: join(selected(), "SKILL.md"), enabled: false }));
+	});
 
 	it.each(["root", "child", "explicit"])(
 		"discovers selected skills, prompts and themes through %s aliases",

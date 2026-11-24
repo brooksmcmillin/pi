@@ -807,6 +807,7 @@ class ResourceList implements Component, Focusable {
 			revision.aliases?.includes(path) === true ||
 			(matchSkillDirectory &&
 				item.resourceType === "skills" &&
+				basename(item.path) === "SKILL.md" &&
 				(selected === dirname(item.path) || revision.aliases?.some((alias) => dirname(alias) === path) === true))
 		);
 	}
