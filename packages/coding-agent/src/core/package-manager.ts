@@ -100,6 +100,7 @@ export interface ResolvedResource {
 export interface ResolvedPaths {
 	/** Checkout selection shared with explicit extension sources in the same load. */
 	gitRevisions?: ReadonlyMap<string, string>;
+	missingLocalPaths?: string[];
 	extensions: ResolvedResource[];
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
@@ -1013,6 +1014,7 @@ function applyAutoloadDisabledPatterns(
 	patterns: string[],
 	baseDir: string,
 	logicalRoot = baseDir,
+	aliases?: ReadonlyMap<string, Set<string>>,
 ): Map<string, boolean> {
 	const result = new Map<string, boolean>();
 	for (const pattern of patterns) {
@@ -1021,15 +1023,11 @@ function applyAutoloadDisabledPatterns(
 		);
 		const enabled = !pattern.startsWith("-") && !pattern.startsWith("!");
 		const exact = pattern.startsWith("+") || pattern.startsWith("-");
+		const matcher = exact ? matchesAnyExactPattern : matchesAnyPattern;
 		for (const filePath of allPaths) {
 			if (
-				matchesPackagePath(
-					filePath,
-					[target],
-					baseDir,
-					logicalRoot,
-					exact ? matchesAnyExactPattern : matchesAnyPattern,
-				)
+				[...(aliases?.get(filePath) ?? [])].some((alias) => matcher(alias, [target], baseDir)) ||
+				matchesPackagePath(filePath, [target], baseDir, logicalRoot, matcher)
 			) {
 				result.set(filePath, enabled);
 			}
@@ -1263,8 +1261,15 @@ export class DefaultPackageManager implements PackageManager {
 		const packageSources = sources
 			.filter((source) => !source.startsWith(BUILTIN_PATH_PREFIX))
 			.map((source) => ({ pkg: source as PackageSource, scope }));
-		const installFailures = await this.resolvePackageSources(packageSources, accumulator);
-		return { ...this.toResolvedPaths(accumulator), installFailures };
+		const missingLocalPaths: string[] = [];
+		const installFailures = await this.resolvePackageSources(
+			packageSources,
+			accumulator,
+			undefined,
+			undefined,
+			missingLocalPaths,
+		);
+		return { ...this.toResolvedPaths(accumulator), installFailures, missingLocalPaths };
 	}
 
 	listConfiguredPackages(): ConfiguredPackage[] {
@@ -1620,6 +1625,7 @@ export class DefaultPackageManager implements PackageManager {
 		accumulator: ResourceAccumulator,
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
 		checkoutSnapshot?: ReadonlyMap<string, string>,
+		missingLocalPaths?: string[],
 	): Promise<PackageInstallFailure[]> {
 		const installFailures: PackageInstallFailure[] = [];
 		for (const { pkg, scope } of sources) {
@@ -1633,7 +1639,7 @@ export class DefaultPackageManager implements PackageManager {
 
 			if (parsed.type === "local") {
 				const baseDir = this.getBaseDirForScope(resolvedScope);
-				this.resolveLocalExtensionSource(parsed, accumulator, filter, metadata, baseDir);
+				this.resolveLocalExtensionSource(parsed, accumulator, filter, metadata, baseDir, missingLocalPaths);
 				continue;
 			}
 
@@ -1752,10 +1758,12 @@ export class DefaultPackageManager implements PackageManager {
 		filter: PackageFilter | undefined,
 		metadata: PathMetadata,
 		baseDir: string,
+		missingLocalPaths?: string[],
 	): void {
 		const original = this.resolvePathFromBase(source.path, baseDir);
 		const resolved = this.redirectGitResource(original, accumulator.gitRevisions);
 		if (!existsSync(resolved)) {
+			missingLocalPaths?.push(original);
 			return;
 		}
 
@@ -2873,9 +2881,8 @@ export class DefaultPackageManager implements PackageManager {
 		if (filterRoot !== packageRoot) {
 			metadata.gitRevision = { active: packageRoot, logical: filterRoot };
 		}
-		const manifest = readPiManifest(
-			this.redirectGitResource(join(packageRoot, "package.json"), accumulator.gitRevisions),
-		);
+		const selectPath = (path: string) => this.redirectGitResource(path, accumulator.gitRevisions);
+		const manifest = readPiManifest(selectPath(join(packageRoot, "package.json")));
 		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
 		if (changelogPath) {
 			metadata.changelogPath = changelogPath;
@@ -2896,11 +2903,21 @@ export class DefaultPackageManager implements PackageManager {
 						metadata,
 						filterRoot,
 						manifest,
+						selectPath,
 					);
 				} else if (patterns !== undefined) {
-					this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata, filterRoot, manifest);
+					this.applyPackageFilter(
+						packageRoot,
+						patterns,
+						resourceType,
+						target,
+						metadata,
+						filterRoot,
+						manifest,
+						selectPath,
+					);
 				} else {
-					this.collectDefaultResources(packageRoot, resourceType, target, metadata, manifest);
+					this.collectDefaultResources(packageRoot, resourceType, target, metadata, manifest, selectPath);
 				}
 			}
 			return true;
@@ -2915,6 +2932,7 @@ export class DefaultPackageManager implements PackageManager {
 					resourceType,
 					this.getTargetMap(accumulator, resourceType),
 					metadata,
+					selectPath,
 				);
 			}
 			return true;
@@ -2941,10 +2959,11 @@ export class DefaultPackageManager implements PackageManager {
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
 		manifest: PiManifest | null,
+		selectPath: (path: string) => string,
 	): void {
 		const entries = manifest?.[resourceType];
 		if (entries) {
-			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
+			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata, selectPath);
 			return;
 		}
 		const dir = join(packageRoot, resourceType);
@@ -2965,8 +2984,9 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 		filterRoot: string,
 		manifest: PiManifest | null,
+		selectPath: (path: string) => string,
 	): void {
-		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType, manifest);
+		const { allFiles, aliases } = this.collectManifestFiles(packageRoot, resourceType, manifest, selectPath);
 
 		if (userPatterns.length === 0) {
 			// Empty array explicitly disables all resources of this type
@@ -2977,7 +2997,7 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		// Apply user patterns
-		const enabledByUser = applyPatterns(allFiles, userPatterns, packageRoot, filterRoot);
+		const enabledByUser = applyPatterns(allFiles, userPatterns, packageRoot, filterRoot, aliases);
 
 		for (const f of allFiles) {
 			const enabled = enabledByUser.has(f);
@@ -2993,13 +3013,14 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 		filterRoot: string,
 		manifest: PiManifest | null,
+		selectPath: (path: string) => string,
 	): void {
 		if (userPatterns.length === 0) {
 			return;
 		}
 
-		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType, manifest);
-		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot, filterRoot);
+		const { allFiles, aliases } = this.collectManifestFiles(packageRoot, resourceType, manifest, selectPath);
+		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot, filterRoot, aliases);
 		for (const [filePath, enabled] of enabledByUser) this.addResource(target, filePath, metadata, enabled);
 	}
 
@@ -3012,14 +3033,22 @@ export class DefaultPackageManager implements PackageManager {
 		packageRoot: string,
 		resourceType: ResourceType,
 		manifest: PiManifest | null,
-	): { allFiles: string[]; enabledByManifest: Set<string> } {
+		selectPath: (path: string) => string,
+	): { allFiles: string[]; enabledByManifest: Set<string>; aliases?: Map<string, Set<string>> } {
 		const entries = manifest?.[resourceType];
 		if (entries && entries.length > 0) {
-			const allFiles = this.collectFilesFromManifestEntries(entries, packageRoot, resourceType);
+			const { allFiles, aliases } = this.collectFilesFromManifestEntries(
+				entries,
+				packageRoot,
+				resourceType,
+				selectPath,
+			);
 			const manifestPatterns = entries.filter(isOverridePattern);
 			const enabledByManifest =
-				manifestPatterns.length > 0 ? applyPatterns(allFiles, manifestPatterns, packageRoot) : new Set(allFiles);
-			return { allFiles: Array.from(enabledByManifest), enabledByManifest };
+				manifestPatterns.length > 0
+					? applyPatterns(allFiles, manifestPatterns, packageRoot, packageRoot, aliases)
+					: new Set(allFiles);
+			return { allFiles: Array.from(enabledByManifest), enabledByManifest, aliases };
 		}
 
 		const conventionDir = join(packageRoot, resourceType);
@@ -3036,12 +3065,13 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
+		selectPath: (path: string) => string,
 	): void {
 		if (!entries) return;
 
-		const allFiles = this.collectFilesFromManifestEntries(entries, root, resourceType);
+		const { allFiles, aliases } = this.collectFilesFromManifestEntries(entries, root, resourceType, selectPath);
 		const patterns = entries.filter(isOverridePattern);
-		const enabledPaths = applyPatterns(allFiles, patterns, root);
+		const enabledPaths = applyPatterns(allFiles, patterns, root, root, aliases);
 
 		for (const f of allFiles) {
 			if (enabledPaths.has(f)) {
@@ -3050,7 +3080,12 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private collectFilesFromManifestEntries(entries: string[], root: string, resourceType: ResourceType): string[] {
+	private collectFilesFromManifestEntries(
+		entries: string[],
+		root: string,
+		resourceType: ResourceType,
+		selectPath: (path: string) => string,
+	) {
 		const sourceEntries = entries.filter((entry) => !isOverridePattern(entry));
 		const resolved = sourceEntries.flatMap((entry) => {
 			if (!hasGlobPattern(entry)) {
@@ -3059,7 +3094,25 @@ export class DefaultPackageManager implements PackageManager {
 
 			return expandPackageGlob(entry, root);
 		});
-		return this.collectFilesFromPaths(resolved, resourceType);
+		const aliases = new Map<string, Set<string>>();
+		const allFiles = new Set<string>();
+		const rememberAlias = (file: string, alias: string) => {
+			const spellings = aliases.get(file) ?? new Set<string>();
+			spellings.add(alias);
+			aliases.set(file, spellings);
+		};
+		for (const original of resolved) {
+			const selected = selectPath(original);
+			for (const path of this.collectFilesFromPaths([selected], resourceType)) {
+				const active = selectPath(path);
+				if (active !== path) rememberAlias(active, path);
+				if (selected !== original && (path === selected || isPathInside(selected, path))) {
+					rememberAlias(active, join(original, relative(selected, path)));
+				}
+				allFiles.add(active);
+			}
+		}
+		return { allFiles: [...allFiles], aliases };
 	}
 
 	private resolveLocalEntries(

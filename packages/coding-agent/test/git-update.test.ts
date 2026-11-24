@@ -14,6 +14,7 @@ import { basename, dirname, join, relative } from "node:path";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
+import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { ConfigSelectorComponent } from "../src/modes/interactive/components/config-selector.ts";
 import { allowNetwork } from "./test-network-env.ts";
@@ -367,6 +368,28 @@ describe("DefaultPackageManager git update", () => {
 		});
 		const paths = [...configured.extensions, ...cli.extensions].filter(({ path }) => basename(path) === "worker.ts");
 		expect(paths.map(({ path }) => path)).toEqual(Array(2).fill(join(selected(), "extensions", "worker.ts")));
+	});
+
+	it("reports CLI extension presence from the selected revision", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "removed.ts", "export default function() {}", "Add original extension");
+		git(["pull", "--ff-only"], installedDir);
+		git(["rm", "removed.ts"], remoteDir);
+		createCommit(remoteDir, "added.ts", "export default function() {}", "Replace original extension");
+		await packageManager.update();
+		const removed = join(installedDir, "removed.ts");
+		await settingsManager.flush();
+		const loader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+			additionalExtensionPaths: [join(installedDir, "added.ts"), removed],
+		});
+		await loader.reload();
+		expect(loader.getExtensions().errors).toEqual([
+			{ path: removed, error: `Extension path does not exist: ${removed}` },
+		]);
+		expect(loader.getExtensions().extensions.map(({ path }) => path)).toContain(join(selected(), "added.ts"));
 	});
 
 	it("pins a checkout selection when publication occurs between local and Git collection", async () => {
@@ -850,6 +873,44 @@ describe("DefaultPackageManager git update", () => {
 			const configured = (await packageManager.resolve()).extensions.map(({ path }) => path);
 			expect(configured).toContain(join(local, "src", "new.ts"));
 			expect(configured).not.toContain(join(local, "src", "old.ts"));
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"resolves nested manifest entry aliases for configured and CLI packages",
+		async () => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "worker.ts", "export default function() {}", "Add worker");
+			git(["pull", "--ff-only"], installedDir);
+			const local = join(agentDir, "local-package");
+			mkdirSync(join(local, "src"), { recursive: true });
+			writeFileSync(
+				join(local, "package.json"),
+				JSON.stringify({ pi: { extensions: ["src/worker.ts", "src/new.ts"] } }),
+			);
+			for (const name of ["worker.ts", "new.ts"]) symlinkSync(join(installedDir, name), join(local, "src", name));
+			settingsManager.setPackages([
+				{ source: gitSource, autoload: false },
+				{ source: local, extensions: ["-src/worker.ts"] },
+			]);
+			createCommit(remoteDir, "new.ts", "export default function() {}", "Add dangling alias target");
+			await packageManager.update();
+			const active = selected();
+			const configured = await packageManager.resolve();
+			expect(configured.extensions).toContainEqual(
+				expect.objectContaining({ path: join(active, "worker.ts"), enabled: false }),
+			);
+			expect(configured.extensions).toContainEqual(
+				expect.objectContaining({ path: join(active, "new.ts"), enabled: true }),
+			);
+			const cli = await packageManager.resolveExtensionSources([local], {
+				temporary: true,
+				gitRevisions: configured.gitRevisions,
+			});
+			expect(cli.extensions.map(({ path }) => path).sort()).toEqual([
+				join(active, "new.ts"),
+				join(active, "worker.ts"),
+			]);
 		},
 	);
 
