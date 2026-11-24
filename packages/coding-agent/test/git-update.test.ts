@@ -383,15 +383,42 @@ describe("DefaultPackageManager git update", () => {
 			settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
 			git(["pull", "--ff-only"], installedDir);
 			settingsManager.setExtensionPaths([dirname(installedDir)]);
-			settingsManager.setPackages([{ source: gitSource, extensions: excluded ? ["-index.ts"] : ["*"] }]);
-			createCommit(remoteDir, "extension.ts", "// v2", "Advance revision");
-			await packageManager.update();
-			const indexes = (await packageManager.resolve()).extensions.filter(
-				(entry) => basename(entry.path) === "index.ts",
+			settingsManager.setPackages([{ source: gitSource, extensions: excluded ? ["-replacement.ts"] : ["*"] }]);
+			createCommit(remoteDir, "replacement.ts", "export default function() {}", "Add replacement");
+			createCommit(
+				remoteDir,
+				"package.json",
+				JSON.stringify({ name: "fixture", version: "1.0.0", pi: { extensions: ["./replacement.ts"] } }),
+				"Select replacement and retain old helper",
 			);
-			expect(indexes).toEqual([expect.objectContaining({ path: join(selected(), "index.ts"), enabled: !excluded })]);
+			await packageManager.update();
+			const indexes = (await packageManager.resolve()).extensions.filter((entry) =>
+				["index.ts", "replacement.ts"].includes(basename(entry.path)),
+			);
+			expect(indexes).toEqual([
+				expect.objectContaining({ path: join(selected(), "replacement.ts"), enabled: !excluded }),
+			]);
 		},
 	);
+
+	it.skipIf(process.platform === "win32")("deduplicates an auto-discovered symlink to an old checkout", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		git(["pull", "--ff-only"], installedDir);
+		const original = join(installedDir, "extensions", "worker.ts");
+		const link = join(agentDir, "extensions", "worker.ts");
+		mkdirSync(dirname(link));
+		symlinkSync(original, link);
+		createCommit(remoteDir, "extension.ts", "// v2", "Advance revision");
+		await packageManager.update();
+		const workers = (await packageManager.resolve()).extensions.filter(
+			(entry) => basename(entry.path) === "worker.ts",
+		);
+		expect(workers).toEqual([
+			expect.objectContaining({ path: join(selected(), "extensions", "worker.ts"), enabled: true }),
+		]);
+	});
 
 	it("keeps a pinned fetch result isolated from a competing update", async () => {
 		setupRemoteAndInstall();

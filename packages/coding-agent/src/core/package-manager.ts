@@ -635,7 +635,7 @@ function resolveExtensionEntries(dir: string): string[] | null {
 	return null;
 }
 
-function collectAutoExtensionEntries(dir: string): string[] {
+function collectAutoExtensionEntries(dir: string, selectPath = (path: string) => path): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
@@ -676,7 +676,7 @@ function collectAutoExtensionEntries(dir: string): string[] {
 			if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
 				entries.push(fullPath);
 			} else if (isDir) {
-				const resolvedEntries = resolveExtensionEntries(fullPath);
+				const resolvedEntries = resolveExtensionEntries(selectPath(fullPath));
 				if (resolvedEntries) {
 					entries.push(...resolvedEntries);
 				}
@@ -791,20 +791,22 @@ function getOverridePatterns(entries: string[]): string[] {
 	return entries.filter((pattern) => pattern.startsWith("!") || pattern.startsWith("+") || pattern.startsWith("-"));
 }
 
-function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: string): boolean {
+function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: string, originalPath = filePath): boolean {
+	const matches = (rules: string[], matcher: typeof matchesAnyPattern) =>
+		matcher(filePath, rules, baseDir) || (originalPath !== filePath && matcher(originalPath, rules, baseDir));
 	const overrides = getOverridePatterns(patterns);
 	const excludes = overrides.filter((pattern) => pattern.startsWith("!")).map((pattern) => pattern.slice(1));
 	const forceIncludes = overrides.filter((pattern) => pattern.startsWith("+")).map((pattern) => pattern.slice(1));
 	const forceExcludes = overrides.filter((pattern) => pattern.startsWith("-")).map((pattern) => pattern.slice(1));
 
 	let enabled = true;
-	if (excludes.length > 0 && matchesAnyPattern(filePath, excludes, baseDir)) {
+	if (excludes.length > 0 && matches(excludes, matchesAnyPattern)) {
 		enabled = false;
 	}
-	if (forceIncludes.length > 0 && matchesAnyExactPattern(filePath, forceIncludes, baseDir)) {
+	if (forceIncludes.length > 0 && matches(forceIncludes, matchesAnyExactPattern)) {
 		enabled = true;
 	}
-	if (forceExcludes.length > 0 && matchesAnyExactPattern(filePath, forceExcludes, baseDir)) {
+	if (forceExcludes.length > 0 && matches(forceExcludes, matchesAnyExactPattern)) {
 		enabled = false;
 	}
 	return enabled;
@@ -2944,7 +2946,9 @@ export class DefaultPackageManager implements PackageManager {
 		for (const entry of plain) {
 			const original = this.resolvePathFromBase(entry, baseDir);
 			const selected = this.redirectGitResource(original, gitRevisions);
-			for (const file of this.collectFilesFromPaths([selected], resourceType)) {
+			for (const file of this.collectFilesFromPaths([selected], resourceType, (path) =>
+				this.redirectGitResource(path, gitRevisions),
+			)) {
 				const active = this.redirectGitResource(file, gitRevisions);
 				if (active !== file && !existsSync(active)) continue;
 				allFiles.add(active);
@@ -3056,8 +3060,10 @@ export class DefaultPackageManager implements PackageManager {
 		) => {
 			const target = this.getTargetMap(accumulator, resourceType);
 			for (const path of paths) {
-				const enabled = isEnabledByOverrides(path, overrides, baseDir);
-				this.addResource(target, path, metadata, enabled);
+				const active = this.redirectGitResource(path, accumulator.gitRevisions);
+				if (active !== path && !existsSync(active)) continue;
+				const enabled = isEnabledByOverrides(active, overrides, baseDir, path);
+				this.addResource(target, active, metadata, enabled);
 			}
 		};
 
@@ -3065,7 +3071,9 @@ export class DefaultPackageManager implements PackageManager {
 			// Project extensions from .pi/
 			addResources(
 				"extensions",
-				collectAutoExtensionEntries(projectDirs.extensions),
+				collectAutoExtensionEntries(projectDirs.extensions, (path) =>
+					this.redirectGitResource(path, accumulator.gitRevisions),
+				),
 				projectMetadata,
 				projectOverrides.extensions,
 				projectBaseDir,
@@ -3117,7 +3125,9 @@ export class DefaultPackageManager implements PackageManager {
 		// User extensions from ~/.pi/agent/
 		addResources(
 			"extensions",
-			collectAutoExtensionEntries(userDirs.extensions),
+			collectAutoExtensionEntries(userDirs.extensions, (path) =>
+				this.redirectGitResource(path, accumulator.gitRevisions),
+			),
 			userMetadata,
 			userOverrides.extensions,
 			globalBaseDir,
@@ -3162,7 +3172,11 @@ export class DefaultPackageManager implements PackageManager {
 		);
 	}
 
-	private collectFilesFromPaths(paths: string[], resourceType: ResourceType): string[] {
+	private collectFilesFromPaths(
+		paths: string[],
+		resourceType: ResourceType,
+		selectPath?: (path: string) => string,
+	): string[] {
 		const files: string[] = [];
 		for (const p of paths) {
 			if (!existsSync(p)) continue;
@@ -3172,7 +3186,11 @@ export class DefaultPackageManager implements PackageManager {
 				if (stats.isFile()) {
 					files.push(p);
 				} else if (stats.isDirectory()) {
-					files.push(...collectResourceFiles(p, resourceType));
+					files.push(
+						...(resourceType === "extensions" && selectPath
+							? collectAutoExtensionEntries(p, selectPath)
+							: collectResourceFiles(p, resourceType)),
+					);
 				}
 			} catch {
 				// Ignore errors
