@@ -818,9 +818,20 @@ function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: str
  * - `+path`: force-include exact path (overrides exclusions)
  * - `-path`: force-exclude exact path (overrides force-includes)
  */
-function applyPatterns(allPaths: string[], patterns: string[], baseDir: string, logicalRoot = baseDir): Set<string> {
-	const matches = (file: string, rules: string[], matcher: typeof matchesAnyPattern) =>
-		matchesPackagePath(file, rules, baseDir, logicalRoot, matcher);
+function applyPatterns(
+	allPaths: string[],
+	patterns: string[],
+	baseDir: string,
+	logicalRoot = baseDir,
+	aliases?: ReadonlyMap<string, Set<string>>,
+): Set<string> {
+	const matches = (file: string, rules: string[], matcher: typeof matchesAnyPattern) => {
+		if (matchesPackagePath(file, rules, baseDir, logicalRoot, matcher)) return true;
+		for (const alias of aliases?.get(file) ?? []) {
+			if (matcher(alias, rules, baseDir)) return true;
+		}
+		return false;
+	};
 	const includes: string[] = [];
 	const excludes: string[] = [];
 	const forceIncludes: string[] = [];
@@ -2928,29 +2939,49 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Collect all files from plain entries (non-pattern entries)
 		const { plain, patterns } = splitPatterns(entries);
-		const resolvedPlain = plain.map((p) => {
-			const path = this.resolvePathFromBase(p, baseDir);
-			for (const [logical, active] of gitRevisions) {
-				if (path === logical || isPathInside(logical, path)) return join(active, relative(logical, path));
-				const parent = dirname(active);
-				if (!isPathInside(parent, path)) continue;
-				const [name, ...parts] = relative(parent, path).split(sep);
-				const prefix = basename(active).slice(0, -6);
-				if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) {
-					return join(active, ...parts);
+		const allFiles = new Set<string>();
+		const aliases = new Map<string, Set<string>>();
+		for (const entry of plain) {
+			const original = this.resolvePathFromBase(entry, baseDir);
+			const selected = this.redirectGitResource(original, gitRevisions);
+			for (const file of this.collectFilesFromPaths([selected], resourceType)) {
+				allFiles.add(file);
+				if (original !== selected && (file === selected || isPathInside(selected, file))) {
+					const spellings = aliases.get(file) ?? new Set<string>();
+					spellings.add(join(original, relative(selected, file)));
+					aliases.set(file, spellings);
 				}
 			}
-			return path;
-		});
-		const allFiles = this.collectFilesFromPaths(resolvedPlain, resourceType);
+		}
 
-		// Determine which files are enabled based on patterns
-		const enabledPaths = applyPatterns(allFiles, patterns, baseDir);
+		// Apply filters once per physical file, with its original setting paths as aliases.
+		const enabledPaths = applyPatterns([...allFiles], patterns, baseDir, baseDir, aliases);
 
 		// Add all files with their enabled state
 		for (const f of allFiles) {
 			this.addResource(target, f, metadata, enabledPaths.has(f));
 		}
+	}
+
+	private redirectGitResource(path: string, revisions: ReadonlyMap<string, string>): string {
+		if (revisions.size === 0) return path;
+		const canonical = canonicalizePath(path);
+		for (const [logical, active] of revisions) {
+			for (const [candidate, root] of [
+				[path, logical],
+				[canonical, canonicalizePath(logical)],
+			] as const) {
+				if (candidate === root || isPathInside(root, candidate)) return join(active, relative(root, candidate));
+				const parent = dirname(root);
+				if (!isPathInside(parent, candidate)) continue;
+				const [name, ...parts] = relative(parent, candidate).split(sep);
+				const prefix = basename(active).slice(0, -6);
+				if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) {
+					return join(active, ...parts);
+				}
+			}
+		}
+		return path;
 	}
 
 	private addAutoDiscoveredResources(

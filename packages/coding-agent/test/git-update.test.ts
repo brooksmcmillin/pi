@@ -331,7 +331,9 @@ describe("DefaultPackageManager git update", () => {
 			expect(first).not.toBe(original);
 			expect(await workers()).toEqual([expect.objectContaining({ path: first, enabled: !excluded })]);
 
-			settingsManager.setExtensionPaths([first]);
+			const alias = join(tempDir, "alias");
+			symlinkSync(dirname(installedDir), alias, process.platform === "win32" ? "junction" : "dir");
+			settingsManager.setExtensionPaths([join(alias, relative(dirname(installedDir), first))]);
 			createCommit(remoteDir, "extension.ts", "// next again", "Advance revision again");
 			await packageManager.update();
 			const second = join(selected(), "extensions", "worker.ts");
@@ -339,6 +341,31 @@ describe("DefaultPackageManager git update", () => {
 			expect(await workers()).toEqual([expect.objectContaining({ path: second, enabled: !excluded })]);
 		},
 	);
+
+	it("preserves top-level exclusions on resources omitted by the package manifest", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "worker.ts", "export default function() {}", "Add standalone worker");
+		createCommit(
+			remoteDir,
+			"package.json",
+			JSON.stringify({ name: "fixture", version: "1.0.0", pi: { extensions: [] } }),
+			"Declare manifest",
+		);
+		settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
+		git(["pull", "--ff-only"], installedDir);
+		for (const version of ["v2", "v3"]) {
+			const prior = join(selected(), "worker.ts");
+			settingsManager.setExtensionPaths([prior, `-${prior}`]);
+			createCommit(remoteDir, "extension.ts", `// ${version}`, "Advance revision");
+			await packageManager.update();
+			const current = join(selected(), "worker.ts");
+			expect(current).not.toBe(prior);
+			const workers = (await packageManager.resolve()).extensions.filter(
+				(entry) => basename(entry.path) === "worker.ts",
+			);
+			expect(workers).toEqual([expect.objectContaining({ path: current, enabled: false })]);
+		}
+	});
 
 	it("keeps a pinned fetch result isolated from a competing update", async () => {
 		setupRemoteAndInstall();
