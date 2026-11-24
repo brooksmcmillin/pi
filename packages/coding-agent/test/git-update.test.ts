@@ -1551,24 +1551,51 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32")("deduplicates an auto-discovered symlink to an old checkout", async () => {
-		setupRemoteAndInstall();
-		mkdirSync(join(remoteDir, "extensions"));
-		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
-		git(["pull", "--ff-only"], installedDir);
-		const original = join(installedDir, "extensions", "worker.ts");
-		const link = join(agentDir, "extensions", "worker.ts");
-		mkdirSync(dirname(link));
-		symlinkSync(original, link);
-		createCommit(remoteDir, "extension.ts", "// v2", "Advance revision");
-		await packageManager.update();
-		const workers = (await packageManager.resolve()).extensions.filter(
-			(entry) => basename(entry.path) === "worker.ts",
-		);
-		expect(workers).toEqual([
-			expect.objectContaining({ path: join(selected(), "extensions", "worker.ts"), enabled: true }),
+	it("keeps package precedence for a non-Git exact-path collision", async () => {
+		const local = join(tempDir, "local-package");
+		mkdirSync(local);
+		const worker = join(local, "worker.ts");
+		writeFileSync(worker, "export default function() {}");
+		writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { extensions: ["worker.ts"] } }));
+		settingsManager.setPackages([local]);
+		settingsManager.setExtensionPaths([worker, `-${worker}`]);
+		const { extensions } = await packageManager.resolve();
+		expect(extensions.filter((entry) => entry.path === worker)).toEqual([
+			expect.objectContaining({ enabled: true, metadata: expect.objectContaining({ origin: "package" }) }),
 		]);
 	});
+
+	it.skipIf(process.platform === "win32").each([false, true])(
+		"deduplicates an auto-discovered symlink to an old checkout (excluded: %s)",
+		async (excluded) => {
+			setupRemoteAndInstall();
+			mkdirSync(join(remoteDir, "extensions"));
+			createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+			git(["pull", "--ff-only"], installedDir);
+			const original = join(installedDir, "extensions", "worker.ts");
+			const link = join(agentDir, "extensions", "worker.ts");
+			mkdirSync(dirname(link));
+			symlinkSync(original, link);
+			if (excluded) settingsManager.setExtensionPaths(["-extensions/worker.ts"]);
+			const assertWorker = async () => {
+				const workers = (await packageManager.resolve()).extensions.filter(
+					(entry) => basename(entry.path) === "worker.ts",
+				);
+				expect(workers).toHaveLength(1);
+				expect(workers[0]?.enabled).toBe(!excluded);
+				const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+				await loader.reload();
+				expect(loader.getExtensions().extensions.some((entry) => basename(entry.path) === "worker.ts")).toBe(
+					!excluded,
+				);
+				return workers[0];
+			};
+			await assertWorker();
+			createCommit(remoteDir, "extension.ts", "// v2", "Advance revision");
+			await packageManager.update();
+			expect((await assertWorker())?.path).toBe(join(selected(), "extensions", "worker.ts"));
+		},
+	);
 
 	it("keeps a pinned fetch result isolated from a competing update", async () => {
 		setupRemoteAndInstall();

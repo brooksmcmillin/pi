@@ -3676,7 +3676,7 @@ export class DefaultPackageManager implements PackageManager {
 			!existing ||
 			(!enabled &&
 				metadata.origin === "top-level" &&
-				metadata.source === "local" &&
+				metadata.gitRevision?.aliases?.some((alias) => alias !== path) &&
 				existing.metadata.origin === "package")
 		) {
 			map.set(path, { metadata, enabled });
