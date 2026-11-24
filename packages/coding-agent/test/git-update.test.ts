@@ -1066,6 +1066,7 @@ describe("DefaultPackageManager git update", () => {
 			"configured-direct",
 			"configured-directory",
 			"package-include",
+			"package-direct",
 			"manifest-directory",
 			"package-toggle",
 			"package-project-toggle",
@@ -1105,6 +1106,16 @@ describe("DefaultPackageManager git update", () => {
 			);
 		}
 		await packageManager.update();
+		if (kind === "package-direct") {
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({ pi: { prompts: ["keep.md", join(selected(), "review.md")] } }),
+			);
+			settingsManager.setPackages([
+				{ source: gitSource, autoload: false },
+				{ source: dir, prompts: ["-keep.md"] },
+			]);
+		}
 		if (kind === "configured-direct" || kind === "configured-directory") {
 			const alias = join(dir, "keep.md");
 			settingsManager.setPromptTemplatePaths([
@@ -1119,7 +1130,7 @@ describe("DefaultPackageManager git update", () => {
 		expect(loader.getPrompts().prompts).toEqual([
 			expect.objectContaining({
 				name:
-					kind === "configured-direct" || kind === "configured-directory"
+					kind === "configured-direct" || kind === "configured-directory" || kind === "package-direct"
 						? "review"
 						: firstExcluded || kind === "package-include" || kind === "manifest-directory"
 							? "z-hide"
@@ -1164,6 +1175,27 @@ describe("DefaultPackageManager git update", () => {
 			expect(await toggle()).toBe(true);
 			expect((await packageManager.resolve()).prompts).toEqual([expect.objectContaining({ enabled: true })]);
 		}
+	});
+
+	it("expands manifest globs from the selected checkout and retains original filter paths", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "removed.md", "Old prompt", "Add old prompt");
+		git(["pull", "--ff-only"], installedDir);
+		git(["rm", "removed.md"], remoteDir);
+		createCommit(remoteDir, "added.md", "Selected prompt", "Replace old prompt");
+		createCommit(remoteDir, "excluded.md", "Excluded prompt", "Add excluded prompt");
+		const local = join(agentDir, "local-package");
+		mkdirSync(local);
+		const prefix = relative(local, installedDir).replaceAll("\\", "/");
+		writeFileSync(
+			join(local, "package.json"),
+			JSON.stringify({ pi: { prompts: [`${prefix}/*.md`, `-${prefix}/excluded.md`] } }),
+		);
+		settingsManager.setPackages([{ source: gitSource, autoload: false }, local]);
+		await packageManager.update();
+		expect((await packageManager.resolve()).prompts).toEqual([
+			expect.objectContaining({ path: join(selected(), "added.md"), enabled: true }),
+		]);
 	});
 
 	it.skipIf(process.platform === "win32")("loads discovered aliases to extensionless selected resources", async () => {

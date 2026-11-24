@@ -3185,7 +3185,15 @@ export class DefaultPackageManager implements PackageManager {
 				return [resolve(root, entry)];
 			}
 
-			return expandPackageGlob(entry, root);
+			// Use a literal cwd for the fixed prefix, leaving only the wildcard suffix to glob.
+			const parts = toPosixPath(entry).split("/");
+			const wildcard = parts.findIndex(hasGlobPattern);
+			const prefix = resolve(root, parts.slice(0, wildcard).join("/") || (isAbsolute(entry) ? sep : "."));
+			const selected = selectPath(prefix);
+			if (selected === prefix) return expandPackageGlob(entry, root);
+			return expandPackageGlob(parts.slice(wildcard).join("/"), selected).map((file) =>
+				join(prefix, relative(selected, file)),
+			);
 		});
 		const patterns = entries.filter(isOverridePattern);
 		const allFiles = new Set<string>();
@@ -3202,8 +3210,8 @@ export class DefaultPackageManager implements PackageManager {
 						alias === undefined ? undefined : new Map([[file, new Set([alias])]]),
 					).has(file);
 				const spellings = declaration.aliases.get(file);
-				const surviving = spellings ? [...spellings].filter(matches) : [];
-				if (spellings?.size ? surviving.length === 0 : !matches()) continue;
+				const surviving = [...(spellings?.size ? spellings : [file])].filter(matches);
+				if (surviving.length === 0) continue;
 				allFiles.add(file);
 				if (surviving.length) aliases.set(file, new Set([...(aliases.get(file) ?? []), ...surviving]));
 			}
