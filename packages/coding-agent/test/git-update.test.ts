@@ -1054,13 +1054,17 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
-	it.skipIf(process.platform === "win32").each(["auto", "package", "manifest", "configured"])(
-		"keeps the first prompt when a second alias is excluded (%s)",
+	it
+		.skipIf(process.platform === "win32")
+		.each(["auto", "package", "manifest", "configured", "auto-first", "configured-first", "package-include"])(
+		"loads the surviving prompt alias (%s)",
 		async (kind) => {
-			const asPackage = kind === "package" || kind === "manifest";
+			const asPackage = kind.startsWith("package") || kind === "manifest";
+			const firstExcluded = kind.endsWith("-first");
+			const excluded = firstExcluded ? "keep.md" : "z-hide.md";
 			setupRemoteAndInstall();
 			createCommit(remoteDir, "review.md", "Selected review", "Add prompt");
-			const dir = join(agentDir, kind === "auto" ? "prompts" : "local-prompts");
+			const dir = join(agentDir, kind.startsWith("auto") ? "prompts" : "local-prompts");
 			mkdirSync(dir);
 			for (const name of ["keep.md", "z-hide.md"]) symlinkSync(join(installedDir, "review.md"), join(dir, name));
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
@@ -1073,13 +1077,15 @@ describe("DefaultPackageManager git update", () => {
 				);
 				settingsManager.setPackages([
 					{ source: gitSource, autoload: false },
-					kind === "manifest" ? dir : { source: dir, prompts: ["-z-hide.md"] },
+					kind === "manifest"
+						? dir
+						: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] },
 				]);
 			} else {
 				settingsManager.setPromptTemplatePaths(
-					kind === "configured"
-						? [join(dir, "keep.md"), join(dir, "z-hide.md"), `-${join(dir, "z-hide.md")}`]
-						: ["-prompts/z-hide.md"],
+					kind.startsWith("configured")
+						? [join(dir, "keep.md"), join(dir, "z-hide.md"), `-${join(dir, excluded)}`]
+						: [`-prompts/${excluded}`],
 				);
 			}
 			await packageManager.update();
@@ -1088,7 +1094,7 @@ describe("DefaultPackageManager git update", () => {
 			await loader.reload();
 			expect(loader.getPrompts().prompts).toEqual([
 				expect.objectContaining({
-					name: "keep",
+					name: firstExcluded || kind === "package-include" ? "z-hide" : "keep",
 					filePath: join(selected(), "review.md"),
 					content: "Selected review",
 				}),
@@ -1110,8 +1116,9 @@ describe("DefaultPackageManager git update", () => {
 			mkdirSync(join(agentDir, kind));
 			symlinkSync(join(installedDir, target), join(agentDir, kind, alias));
 		}
-		mkdirSync(join(agentDir, "skills"));
-		symlinkSync(join(installedDir, "review"), join(agentDir, "skills", "guide.md"));
+		const projectSkills = join(tempDir, ".pi", "skills");
+		mkdirSync(projectSkills, { recursive: true });
+		symlinkSync(join(installedDir, "review"), join(projectSkills, "guide.md"));
 		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 		await packageManager.update();
 		await settingsManager.flush();
@@ -1126,9 +1133,20 @@ describe("DefaultPackageManager git update", () => {
 		});
 		await loader.reload();
 		expect(loader.getPrompts().prompts).toEqual([
-			expect.objectContaining({ name: "quick", filePath: review, content: "Selected review" }),
+			expect.objectContaining({
+				name: "quick",
+				filePath: review,
+				content: "Selected review",
+				sourceInfo: expect.objectContaining({ scope: "user" }),
+			}),
 		]);
-		expect(loader.getSkills().skills).toContainEqual(expect.objectContaining({ name: "guide", filePath: review }));
+		expect(loader.getSkills().skills).toContainEqual(
+			expect.objectContaining({
+				name: "guide",
+				filePath: review,
+				sourceInfo: expect.objectContaining({ scope: "project" }),
+			}),
+		);
 		expect(loader.getThemes().themes).toContainEqual(
 			expect.objectContaining({ name: "selected-style", sourcePath: join(active, "style") }),
 		);

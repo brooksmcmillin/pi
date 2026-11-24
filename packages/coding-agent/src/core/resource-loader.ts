@@ -973,7 +973,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.skills = resolvedSkills.skills.map((skill) => ({
 			...skill,
 			sourceInfo:
-				this.findSourceInfoForPath(skill.filePath, this.extensionSkillSourceInfos, metadataByPath) ??
+				this.findSourceInfoForPath(
+					skill.filePath,
+					this.extensionSkillSourceInfos,
+					metadataByPath,
+					this.discoveredMetadata?.skills,
+				) ??
 				skill.sourceInfo ??
 				this.getDefaultSourceInfoForPath(skill.filePath),
 		}));
@@ -1004,7 +1009,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.prompts = resolvedPrompts.prompts.map((prompt) => ({
 			...prompt,
 			sourceInfo:
-				this.findSourceInfoForPath(prompt.filePath, this.extensionPromptSourceInfos, metadataByPath) ??
+				this.findSourceInfoForPath(
+					prompt.filePath,
+					this.extensionPromptSourceInfos,
+					metadataByPath,
+					this.discoveredMetadata?.prompts,
+				) ??
 				prompt.sourceInfo ??
 				this.getDefaultSourceInfoForPath(prompt.filePath),
 		}));
@@ -1029,7 +1039,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.themes = resolvedThemes.themes.map((theme) => {
 			const sourcePath = theme.sourcePath;
 			theme.sourceInfo = sourcePath
-				? (this.findSourceInfoForPath(sourcePath, this.extensionThemeSourceInfos, metadataByPath) ??
+				? (this.findSourceInfoForPath(
+						sourcePath,
+						this.extensionThemeSourceInfos,
+						metadataByPath,
+						this.discoveredMetadata?.themes,
+					) ??
 					theme.sourceInfo ??
 					this.getDefaultSourceInfoForPath(sourcePath))
 				: theme.sourceInfo;
@@ -1056,6 +1071,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		resourcePath: string,
 		extraSourceInfos?: Map<string, SourceInfo>,
 		metadataByPath?: Map<string, PathMetadata>,
+		typedMetadata?: Map<string, PathMetadata>,
 	): SourceInfo | undefined {
 		if (!resourcePath) {
 			return undefined;
@@ -1073,6 +1089,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 				}
 			}
 		}
+
+		const declaration = typedMetadata?.get(normalizedResourcePath) ?? typedMetadata?.get(resourcePath);
+		if (declaration) return createSourceInfo(resourcePath, declaration);
 
 		if (metadataByPath) {
 			const exact = metadataByPath.get(normalizedResourcePath) ?? metadataByPath.get(resourcePath);

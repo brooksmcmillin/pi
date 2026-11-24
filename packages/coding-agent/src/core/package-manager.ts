@@ -1045,6 +1045,15 @@ function matchesPackagePath(
 	});
 }
 
+function chooseResourceAlias(spellings: Set<string> | undefined, matches: (alias?: Set<string>) => boolean) {
+	if (!spellings?.size) return { enabled: matches() };
+	for (const spelling of spellings) {
+		const aliases = new Set([spelling]);
+		if (matches(aliases)) return { aliases, enabled: true };
+	}
+	return { aliases: new Set([spellings.values().next().value!]), enabled: false };
+}
+
 function applyAutoloadDisabledPatterns(
 	allPaths: string[],
 	patterns: string[],
@@ -3084,11 +3093,10 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Apply user patterns
 		for (const f of allFiles) {
-			// The first declaration wins physical-path deduplication, as for ordinary symlinks.
-			const firstAlias = aliases?.get(f)?.values().next().value;
-			const declaration = firstAlias === undefined ? undefined : new Map([[f, new Set([firstAlias])]]);
-			const enabled = applyPatterns([f], userPatterns, packageRoot, filterRoot, declaration).has(f);
-			this.addResource(target, f, this.withPackageAliases(metadata, declaration?.get(f)), enabled);
+			const declaration = chooseResourceAlias(aliases?.get(f), (alias) =>
+				applyPatterns([f], userPatterns, packageRoot, filterRoot, alias ? new Map([[f, alias]]) : undefined).has(f),
+			);
+			this.addResource(target, f, this.withPackageAliases(metadata, declaration.aliases), declaration.enabled);
 		}
 	}
 
@@ -3184,10 +3192,9 @@ export class DefaultPackageManager implements PackageManager {
 		for (const path of resolved) {
 			const declaration = this.collectSelectedPackagePaths([path], resourceType, selectPath);
 			for (const file of applyPatterns(declaration.allFiles, patterns, root, root, declaration.aliases)) {
-				if (allFiles.has(file)) continue;
 				allFiles.add(file);
 				const spellings = declaration.aliases.get(file);
-				if (spellings) aliases.set(file, spellings);
+				if (spellings) aliases.set(file, new Set([...(aliases.get(file) ?? []), ...spellings]));
 			}
 		}
 		return { allFiles: [...allFiles], aliases };
@@ -3273,17 +3280,15 @@ export class DefaultPackageManager implements PackageManager {
 		// pi config saves exact paths relative to the settings directory. Resolve them through
 		// the same revision mapping as declarations, even if they name a different revision.
 		const rules = this.redirectGitExactRules(patterns, baseDir, gitRevisions, aliases);
-		const declarations = new Map(
-			[...aliases].map(([file, spellings]) => [file, new Set([...spellings].slice(0, 1))]),
-		);
-		const enabledPaths = applyPatterns([...allFiles], rules, baseDir, baseDir, declarations);
-
 		for (const f of allFiles) {
+			const declaration = chooseResourceAlias(aliases.get(f), (alias) =>
+				applyPatterns([f], rules, baseDir, baseDir, alias ? new Map([[f, alias]]) : undefined).has(f),
+			);
 			this.addResource(
 				target,
 				f,
-				this.withGitRevision(metadata, f, gitRevisions, declarations.get(f)),
-				enabledPaths.has(f),
+				this.withGitRevision(metadata, f, gitRevisions, declaration.aliases),
+				declaration.enabled,
 			);
 		}
 	}
@@ -3416,12 +3421,14 @@ export class DefaultPackageManager implements PackageManager {
 			}
 			const rules = this.redirectGitExactRules(overrides, baseDir, accumulator.gitRevisions, discovered);
 			for (const [active, spellings] of discovered) {
-				const declaration = new Set([...spellings].slice(0, 1));
+				const declaration = chooseResourceAlias(spellings, (alias) =>
+					isEnabledByOverrides(active, rules, baseDir, alias),
+				);
 				this.addResource(
 					target,
 					active,
-					this.withGitRevision(metadata, active, accumulator.gitRevisions, declaration),
-					isEnabledByOverrides(active, rules, baseDir, declaration),
+					this.withGitRevision(metadata, active, accumulator.gitRevisions, declaration.aliases),
+					declaration.enabled,
 				);
 			}
 			aliases.clear();
