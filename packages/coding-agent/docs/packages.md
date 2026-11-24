@@ -18,7 +18,9 @@ pi install ./local-package
 
 If a configured package fails to install at startup, for example because npm cannot reach the registry, Pi warns about it, skips that package's resources, and keeps running. Pi tries to install it again on the next start or `/reload`. `pi install` and `pi update --extensions` still report the failure and exit non-zero.
 
-During a Git package update, Pi checks out the new revision and installs its dependencies in a temporary directory before replacing the installed package. If preparation fails, the previous checkout and dependencies stay in place.
+During a Git package update, Pi checks out the new revision and installs its dependencies beside the installed package before replacing it. If preparation fails, the previous checkout and dependencies stay in place. If Pi is interrupted during replacement, the next load can restore the previous checkout, including offline. Recovery may wait about 10 seconds for an abandoned update lock to expire.
+
+Staged updates support ordinary Pi-managed clones with a standalone `.git` directory and no symlinks inside that directory. The checkout and Pi's recovery directory must be on the same filesystem. Do not share a checkout across distinct managed Git roots. Use a local package declaration for checkouts you manage yourself.
 
 Personal installs are written to `~/.pi/agent/settings.json`. Add `--local` or `-l` to write the package declaration to `.pi/settings.json`. Pi reads declarations from that file only after project trust is granted.
 

@@ -7,7 +7,17 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -214,6 +224,25 @@ describe("DefaultPackageManager git update", () => {
 		await expect(packageManager.update()).rejects.toThrow("symbolic link in Git metadata");
 		expect(getCurrentCommit(installedDir)).toBe(original);
 		expect(getFileContent(installedDir, "extension.ts")).toBe("// v1");
+	});
+
+	it("reclaims a leftover backup without replacing the up-to-date checkout", async () => {
+		setupRemoteAndInstall();
+		const original = getCurrentCommit(installedDir);
+		const identity = join(realpathSync(dirname(installedDir)), "extension");
+		const key = createHash("sha256")
+			.update(process.platform === "win32" ? identity.toLowerCase() : identity)
+			.digest("hex");
+		const previous = join(agentDir, "git", ".git-update-state", `${key}.previous`);
+		mkdirSync(previous, { recursive: true });
+		writeFileSync(join(previous, "extension.ts"), "// old backup");
+		writeFileSync(join(installedDir, "local.txt"), "keep");
+
+		await packageManager.update();
+
+		expect(existsSync(previous)).toBe(false);
+		expect(getCurrentCommit(installedDir)).toBe(original);
+		expect(getFileContent(installedDir, "local.txt")).toBe("keep");
 	});
 
 	describe("legacy interrupted updates", () => {

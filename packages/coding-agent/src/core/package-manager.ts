@@ -2200,11 +2200,13 @@ export class DefaultPackageManager implements PackageManager {
 		const markerPath = this.getGitUpdateMarkerPath(targetDir);
 		const interruptedLegacyUpdate = statSync(markerPath, { throwIfNoEntry: false })?.isFile();
 		const state = this.getGitUpdateStatePath(targetDir, scope);
+		const previous = `${state}.previous`;
 		if (localHead.trim() === targetHead.trim() && !interruptedLegacyUpdate) {
-			if (this.hasMissingGitDependencies(targetDir)) {
+			if (existsSync(previous) || this.hasMissingGitDependencies(targetDir)) {
 				const release = this.lockGitCheckout(state);
 				try {
 					this.assertSameGitCheckout(targetDir, installed);
+					this.removeGitUpdateFiles(previous);
 					if (this.hasMissingGitDependencies(targetDir)) {
 						await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
 					}
@@ -2267,7 +2269,6 @@ export class DefaultPackageManager implements PackageManager {
 			const release = this.lockGitCheckout(state);
 			try {
 				this.assertSameGitCheckout(targetDir, installed);
-				const previous = `${state}.previous`;
 				this.removeGitUpdateFiles(previous);
 				try {
 					renameSync(targetDir, previous);
@@ -2294,11 +2295,19 @@ export class DefaultPackageManager implements PackageManager {
 		const previous = `${state}.previous`;
 		const lockfilePath = `${state}.lock`;
 		if (!existsSync(previous) && !existsSync(lockfilePath)) return existsSync(targetDir);
-		const release = await lockfile.lock(state, {
-			realpath: false,
-			lockfilePath,
-			retries: { retries: 5, minTimeout: 20 },
-		});
+		// Allow an abandoned lock to reach proper-lockfile's default 10-second stale interval.
+		const release = await lockfile
+			.lock(state, {
+				realpath: false,
+				lockfilePath,
+				retries: { retries: 105, factor: 1, minTimeout: 100 },
+			})
+			.catch((error: NodeJS.ErrnoException) => {
+				if (error.code !== "ELOCKED") throw error;
+				throw new Error(`Git package ${targetDir} is still locked. Retry after the other Pi operation finishes.`, {
+					cause: error,
+				});
+			});
 		try {
 			this.restoreGitBackup(targetDir, previous);
 			return existsSync(targetDir);

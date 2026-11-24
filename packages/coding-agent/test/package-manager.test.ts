@@ -1496,27 +1496,32 @@ Content`,
 			},
 		);
 
-		it("restores an interrupted Git package update during offline resolution", async () => {
-			const source = "git:github.com/user/repo";
-			const target = join(agentDir, "git", "github.com", "user", "repo");
-			mkdirSync(dirname(target), { recursive: true });
-			const key = createHash("sha256")
-				.update(join(realpathSync(dirname(target)), "repo"))
-				.digest("hex");
-			const previous = join(agentDir, "git", ".git-update-state", `${key}.previous`);
-			mkdirSync(dirname(previous), { recursive: true });
-			const extension = join(target, "extensions", "worker.ts");
-			mkdirSync(dirname(extension), { recursive: true });
-			writeFileSync(extension, "export default function() {}\n");
-			renameSync(target, previous);
-			settingsManager.setPackages([source]);
-			process.env.PI_OFFLINE = "1";
+		it.each([false, true])(
+			"restores an interrupted Git package update offline (abandoned lock: %s)",
+			async (abandoned) => {
+				const source = "git:github.com/user/repo";
+				const target = join(agentDir, "git", "github.com", "user", "repo");
+				mkdirSync(dirname(target), { recursive: true });
+				const key = createHash("sha256")
+					.update(join(realpathSync(dirname(target)), "repo"))
+					.digest("hex");
+				const previous = join(agentDir, "git", ".git-update-state", `${key}.previous`);
+				mkdirSync(dirname(previous), { recursive: true });
+				const extension = join(target, "extensions", "worker.ts");
+				mkdirSync(dirname(extension), { recursive: true });
+				writeFileSync(extension, "export default function() {}\n");
+				renameSync(target, previous);
+				if (abandoned) mkdirSync(previous.replace(/\.previous$/, ".lock"));
+				settingsManager.setPackages([source]);
+				process.env.PI_OFFLINE = "1";
 
-			const resources = await packageManager.resolve();
-			expect(resources.extensions.some((entry) => entry.path === extension && entry.enabled)).toBe(true);
-			expect(readFileSync(extension, "utf8")).toContain("export default function");
-			expect(existsSync(previous)).toBe(false);
-		});
+				const resources = await packageManager.resolve();
+				expect(resources.extensions.some((entry) => entry.path === extension && entry.enabled)).toBe(true);
+				expect(readFileSync(extension, "utf8")).toContain("export default function");
+				expect(existsSync(previous)).toBe(false);
+			},
+			15_000,
+		);
 
 		it.skipIf(process.platform === "win32")(
 			"reports a blocked Git recovery without dropping other packages",
