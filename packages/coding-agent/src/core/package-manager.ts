@@ -3346,43 +3346,11 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Collect all files from plain entries (non-pattern entries)
 		const { plain, patterns } = splitPatterns(entries);
-		const allFiles = new Set<string>();
-		const aliases = new Map<string, Set<string>>();
-		const rememberAlias = (file: string, alias: string) => {
-			const spellings = aliases.get(file) ?? new Set<string>();
-			spellings.add(alias);
-			aliases.set(file, spellings);
-		};
-		for (const entry of plain) {
-			const original = this.resolvePathFromBase(entry, baseDir);
-			const selected = this.redirectGitResource(original, gitRevisions);
-			const childAliases = new Map<string, Set<string>>();
-			for (const file of this.collectFilesFromPaths(
-				[selected],
-				resourceType,
-				(path) => this.redirectGitResource(path, gitRevisions),
-				(path, alias) => {
-					const spellings = childAliases.get(path) ?? new Set<string>();
-					spellings.add(alias);
-					childAliases.set(path, spellings);
-				},
-			)) {
-				const active = this.redirectGitResource(file, gitRevisions);
-				if (active !== file && !existsSync(active)) continue;
-				allFiles.add(active);
-				const discovered = childAliases.get(file);
-				for (const alias of discovered ?? []) rememberAlias(active, alias);
-				if (active === file && original === selected && !discovered) rememberAlias(active, file);
-				if (active !== file || original !== selected) {
-					const spellings = aliases.get(active) ?? new Set<string>();
-					if (active !== file) spellings.add(file);
-					if (original !== selected && (file === selected || isPathInside(selected, file))) {
-						spellings.add(join(original, relative(selected, file)));
-					}
-					aliases.set(active, spellings);
-				}
-			}
-		}
+		const { allFiles, aliases } = this.collectSelectedPackagePaths(
+			plain.map((entry) => this.resolvePathFromBase(entry, baseDir)),
+			resourceType,
+			(path) => this.redirectGitResource(path, gitRevisions),
+		);
 
 		// pi config saves exact paths relative to the settings directory. Resolve them through
 		// the same revision mapping as declarations, even if they name a different revision.

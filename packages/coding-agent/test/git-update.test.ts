@@ -1848,9 +1848,9 @@ describe("DefaultPackageManager git update", () => {
 		expect(readFileSync(join(installedDir, target), "utf8")).toBe("Retained review");
 	});
 
-	it.skipIf(process.platform === "win32")(
-		"does not discover a hidden prompt target independently of its excluded directory alias",
-		async () => {
+	it.skipIf(process.platform === "win32").each(["manifest", "settings"])(
+		"does not discover a hidden prompt target independently of its excluded directory alias (%s)",
+		async (source) => {
 			setupRemoteAndInstall();
 			mkdirSync(join(remoteDir, "prompts", ".hidden"), { recursive: true });
 			createCommit(remoteDir, "prompts/.hidden/note.md", "Original note", "Add hidden note");
@@ -1864,6 +1864,11 @@ describe("DefaultPackageManager git update", () => {
 				"Exclude shortcut note",
 			);
 			git(["pull", "--ff-only"], installedDir);
+			const declaredRoot = join(installedDir, "prompts");
+			if (source === "settings") {
+				settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+				settingsManager.setPromptTemplatePaths([declaredRoot, `!${relative(agentDir, declaredRoot)}/**/note.md`]);
+			}
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await loader.reload();
 			expect(loader.getPrompts().prompts).toEqual([]);
@@ -1871,6 +1876,12 @@ describe("DefaultPackageManager git update", () => {
 			await packageManager.update();
 			await loader.reload();
 			expect(loader.getPrompts().prompts).toEqual([]);
+			if (source === "settings") {
+				settingsManager.setPromptTemplatePaths([declaredRoot]);
+				const [prompt] = (await packageManager.resolve()).prompts;
+				expect(prompt?.metadata.gitRevision?.declarations).toEqual([join(declaredRoot, "shortcut", "note.md")]);
+				return;
+			}
 			createCommit(
 				remoteDir,
 				"package.json",
