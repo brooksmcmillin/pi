@@ -495,7 +495,7 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 			const source = getSource(resolvedPath);
 			if (stats.isDirectory()) {
 				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true, undefined, undefined, selectPath));
-			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
+			} else if (stats.isFile() && original.endsWith(".md")) {
 				const result = loadSkillFromFile(resolvedPath, source);
 				if (result.skill) {
 					addSkills({ skills: [result.skill], diagnostics: result.diagnostics });

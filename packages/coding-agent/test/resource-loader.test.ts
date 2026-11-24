@@ -159,6 +159,93 @@ describe("DefaultResourceLoader", () => {
 			},
 		);
 
+		it.skipIf(process.platform === "win32").each([false, true])(
+			"preserves an explicit prompt name over discovered alias metadata (directory: %s)",
+			async (directory) => {
+				const logical = join(cwd, "old");
+				const active = join(cwd, "selected");
+				const explicit = join(cwd, "explicit");
+				for (const dir of [logical, active, explicit]) mkdirSync(dir);
+				const target = join(active, "review.md");
+				writeFileSync(target, "Selected review");
+				const alias = join(explicit, "review.md");
+				symlinkSync(join(logical, "review.md"), alias);
+				const snapshot = vi.spyOn(DefaultPackageManager.prototype, "resolve").mockResolvedValue({
+					extensions: [],
+					skills: [],
+					themes: [],
+					gitRevisions: new Map([[logical, active]]),
+					prompts: [
+						{
+							path: target,
+							enabled: true,
+							metadata: {
+								source: "local",
+								scope: "user",
+								origin: "top-level",
+								gitRevision: { logical, active, aliases: [join(agentDir, "prompts", "summary.md")] },
+							},
+						},
+					],
+				});
+				try {
+					const loader = new DefaultResourceLoader({
+						cwd,
+						agentDir,
+						noPromptTemplates: true,
+						additionalPromptTemplatePaths: [directory ? explicit : alias],
+					});
+					await loader.reload();
+					expect(loader.getPrompts().prompts).toEqual([
+						expect.objectContaining({ name: "review", content: "Selected review", filePath: target }),
+					]);
+				} finally {
+					snapshot.mockRestore();
+				}
+			},
+		);
+
+		it.skipIf(process.platform === "win32")(
+			"loads direct skill and theme aliases with extensionless selected targets",
+			async () => {
+				const logical = join(cwd, "old");
+				const active = join(cwd, "selected");
+				mkdirSync(logical);
+				mkdirSync(active);
+				writeFileSync(join(active, "skill"), "---\nname: selected\ndescription: Selected skill\n---\nBody");
+				const theme = JSON.parse(
+					readFileSync(join(process.cwd(), "src", "modes", "interactive", "theme", "dark.json"), "utf8"),
+				);
+				writeFileSync(join(active, "theme"), JSON.stringify({ ...theme, name: "selected-theme" }));
+				const skillAlias = join(cwd, "skill.md");
+				const themeAlias = join(cwd, "theme.json");
+				symlinkSync(join(logical, "skill"), skillAlias);
+				symlinkSync(join(logical, "theme"), themeAlias);
+				const snapshot = vi.spyOn(DefaultPackageManager.prototype, "resolve").mockResolvedValue({
+					extensions: [],
+					skills: [],
+					prompts: [],
+					themes: [],
+					gitRevisions: new Map([[logical, active]]),
+				});
+				try {
+					const loader = new DefaultResourceLoader({
+						cwd,
+						agentDir,
+						additionalSkillPaths: [skillAlias],
+						additionalThemePaths: [themeAlias],
+					});
+					await loader.reload();
+					expect(loader.getSkills().skills).toContainEqual(
+						expect.objectContaining({ filePath: join(active, "skill") }),
+					);
+					expect(loader.getThemes().themes).toContainEqual(expect.objectContaining({ name: "selected-theme" }));
+				} finally {
+					snapshot.mockRestore();
+				}
+			},
+		);
+
 		it("should initialize with empty results before reload", () => {
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 

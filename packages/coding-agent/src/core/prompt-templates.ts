@@ -230,6 +230,8 @@ export interface LoadPromptTemplatesOptions {
 	/** Explicit prompt template paths (files or directories). */
 	promptPaths: string[];
 	selectPathForRoot?: (root: string) => ((path: string) => string) | undefined;
+	/** Logical name for a discovered file, not an explicitly supplied path. */
+	getDiscoveredPromptName?: (filePath: string) => string | undefined;
 	/** Include default prompt directories. */
 	includeDefaults: boolean;
 }
@@ -312,7 +314,8 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions): LoadPr
 			} else if (stats.isFile() && original.endsWith(".md")) {
 				const result = loadTemplateFromFile(resolvedPath, getSourceInfo(resolvedPath));
 				if (result.template) {
-					templates.push({ ...result.template, name: basename(original, ".md") });
+					const name = selectPath ? undefined : options.getDiscoveredPromptName?.(resolvedPath);
+					templates.push({ ...result.template, name: name ?? basename(original, ".md") });
 				}
 				diagnostics.push(...result.diagnostics);
 			}

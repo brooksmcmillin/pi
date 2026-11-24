@@ -968,18 +968,16 @@ export class DefaultResourceLoader implements ResourceLoader {
 				agentDir: this.agentDir,
 				promptPaths,
 				selectPathForRoot: this.selectPathForRoot,
+				getDiscoveredPromptName: (filePath) => {
+					const metadata = metadataByPath?.get(filePath);
+					const alias = (metadata?.gitRevision?.aliases ?? metadata?.packageAliases)?.find((path) =>
+						path.endsWith(".md"),
+					);
+					return alias ? basename(alias, ".md") : undefined;
+				},
 				includeDefaults: false,
 			});
-			const templates = loaded.templates.map((template) => {
-				const metadata = metadataByPath?.get(template.filePath);
-				const alias = (metadata?.gitRevision?.aliases ?? metadata?.packageAliases)?.find((path) =>
-					path.endsWith(".md"),
-				);
-				return alias && template.name === basename(template.filePath, ".md")
-					? { ...template, name: basename(alias, ".md") }
-					: template;
-			});
-			const deduped = this.dedupePrompts(templates);
+			const deduped = this.dedupePrompts(loaded.templates);
 			promptsResult = {
 				prompts: deduped.prompts,
 				diagnostics: [...loaded.diagnostics, ...deduped.diagnostics],
@@ -1171,7 +1169,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				const stats = statSync(resolved);
 				if (stats.isDirectory()) {
 					this.loadThemesFromDir(resolved, themes, diagnostics, colorMode, selectPath);
-				} else if (stats.isFile() && resolved.endsWith(".json")) {
+				} else if (stats.isFile() && original.endsWith(".json")) {
 					this.loadThemeFromFile(resolved, themes, diagnostics, colorMode);
 				} else {
 					diagnostics.push({ type: "warning", message: "theme path is not a json file", path: resolved });
