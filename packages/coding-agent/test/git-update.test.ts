@@ -1056,51 +1056,93 @@ describe("DefaultPackageManager git update", () => {
 
 	it
 		.skipIf(process.platform === "win32")
-		.each(["auto", "package", "manifest", "configured", "auto-first", "configured-first", "package-include"])(
-		"loads the surviving prompt alias (%s)",
-		async (kind) => {
-			const asPackage = kind.startsWith("package") || kind === "manifest";
-			const firstExcluded = kind.endsWith("-first");
-			const excluded = firstExcluded ? "keep.md" : "z-hide.md";
-			setupRemoteAndInstall();
-			createCommit(remoteDir, "review.md", "Selected review", "Add prompt");
-			const dir = join(agentDir, kind.startsWith("auto") ? "prompts" : "local-prompts");
-			mkdirSync(dir);
-			for (const name of ["keep.md", "z-hide.md"]) symlinkSync(join(installedDir, "review.md"), join(dir, name));
-			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-			if (asPackage) {
-				writeFileSync(
-					join(dir, "package.json"),
-					JSON.stringify({
-						pi: { prompts: ["keep.md", "z-hide.md", ...(kind === "manifest" ? ["-z-hide.md"] : [])] },
-					}),
-				);
-				settingsManager.setPackages([
-					{ source: gitSource, autoload: false },
-					kind === "manifest"
-						? dir
-						: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] },
-				]);
-			} else {
-				settingsManager.setPromptTemplatePaths(
-					kind.startsWith("configured")
-						? [join(dir, "keep.md"), join(dir, "z-hide.md"), `-${join(dir, excluded)}`]
-						: [`-prompts/${excluded}`],
-				);
-			}
-			await packageManager.update();
-			await settingsManager.flush();
-			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
-			await loader.reload();
-			expect(loader.getPrompts().prompts).toEqual([
-				expect.objectContaining({
-					name: firstExcluded || kind === "package-include" ? "z-hide" : "keep",
-					filePath: join(selected(), "review.md"),
-					content: "Selected review",
+		.each([
+			"auto",
+			"package",
+			"manifest",
+			"configured",
+			"auto-first",
+			"configured-first",
+			"package-include",
+			"manifest-directory",
+			"package-toggle",
+		])("loads the surviving prompt alias (%s)", async (kind) => {
+		const asPackage = kind.startsWith("package") || kind.startsWith("manifest");
+		const firstExcluded = kind.endsWith("-first");
+		const excluded = firstExcluded ? "keep.md" : "z-hide.md";
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "review.md", "Selected review", "Add prompt");
+		const dir = join(agentDir, kind.startsWith("auto") ? "prompts" : "local-prompts");
+		mkdirSync(dir);
+		for (const name of ["keep.md", "z-hide.md"]) symlinkSync(join(installedDir, "review.md"), join(dir, name));
+		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+		if (asPackage) {
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					pi: {
+						prompts:
+							kind === "manifest-directory"
+								? [".", "-keep.md"]
+								: ["keep.md", "z-hide.md", ...(kind === "manifest" ? ["-z-hide.md"] : [])],
+					},
 				}),
+			);
+			settingsManager.setPackages([
+				{ source: gitSource, autoload: false },
+				kind.startsWith("manifest") || kind === "package-toggle"
+					? dir
+					: { source: dir, prompts: [kind === "package-include" ? "z-hide.md" : `-${excluded}`] },
 			]);
-		},
-	);
+		} else {
+			settingsManager.setPromptTemplatePaths(
+				kind.startsWith("configured")
+					? [join(dir, "keep.md"), join(dir, "z-hide.md"), `-${join(dir, excluded)}`]
+					: [`-prompts/${excluded}`],
+			);
+		}
+		await packageManager.update();
+		await settingsManager.flush();
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await loader.reload();
+		expect(loader.getPrompts().prompts).toEqual([
+			expect.objectContaining({
+				name: firstExcluded || kind === "package-include" || kind === "manifest-directory" ? "z-hide" : "keep",
+				filePath: join(selected(), "review.md"),
+				content: "Selected review",
+			}),
+		]);
+		if (kind === "package-toggle") {
+			const toggle = async () => {
+				const resolved = await packageManager.resolve();
+				const [item] = resolved.prompts;
+				if (!item) throw new Error("Missing prompt row");
+				const noop = () => {};
+				const selector = new ConfigSelectorComponent(
+					{ global: resolved, project: resolved },
+					settingsManager,
+					tempDir,
+					agentDir,
+					noop,
+					noop,
+					noop,
+				);
+				const list = selector.getResourceList() as unknown as {
+					toggleResource(resource: typeof item & { resourceType: "prompts" }): boolean;
+				};
+				return list.toggleResource({ ...item, resourceType: "prompts" });
+			};
+			expect(await toggle()).toBe(false);
+			expect((await packageManager.resolve()).prompts).toEqual([expect.objectContaining({ enabled: false })]);
+			createCommit(remoteDir, "review.md", "Updated review", "Advance selection");
+			await packageManager.update();
+			expect((await packageManager.resolve()).prompts).toEqual([
+				expect.objectContaining({ path: join(selected(), "review.md"), enabled: false }),
+			]);
+			expect(await toggle()).toBe(true);
+			expect((await packageManager.resolve()).prompts).toEqual([expect.objectContaining({ enabled: true })]);
+		}
+	});
 
 	it.skipIf(process.platform === "win32")("loads discovered aliases to extensionless selected resources", async () => {
 		setupRemoteAndInstall();

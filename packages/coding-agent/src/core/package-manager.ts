@@ -3096,7 +3096,8 @@ export class DefaultPackageManager implements PackageManager {
 			const declaration = chooseResourceAlias(aliases?.get(f), (alias) =>
 				applyPatterns([f], userPatterns, packageRoot, filterRoot, alias ? new Map([[f, alias]]) : undefined).has(f),
 			);
-			this.addResource(target, f, this.withPackageAliases(metadata, declaration.aliases), declaration.enabled);
+			const allAliases = new Set([...(declaration.aliases ?? []), ...(aliases?.get(f) ?? [])]);
+			this.addResource(target, f, this.withPackageAliases(metadata, allAliases), declaration.enabled);
 		}
 	}
 
@@ -3191,10 +3192,20 @@ export class DefaultPackageManager implements PackageManager {
 		const aliases = new Map<string, Set<string>>();
 		for (const path of resolved) {
 			const declaration = this.collectSelectedPackagePaths([path], resourceType, selectPath);
-			for (const file of applyPatterns(declaration.allFiles, patterns, root, root, declaration.aliases)) {
-				allFiles.add(file);
+			for (const file of declaration.allFiles) {
+				const matches = (alias?: string) =>
+					applyPatterns(
+						[file],
+						patterns,
+						root,
+						root,
+						alias === undefined ? undefined : new Map([[file, new Set([alias])]]),
+					).has(file);
 				const spellings = declaration.aliases.get(file);
-				if (spellings) aliases.set(file, new Set([...(aliases.get(file) ?? []), ...spellings]));
+				const surviving = spellings ? [...spellings].filter(matches) : [];
+				if (spellings?.size ? surviving.length === 0 : !matches()) continue;
+				allFiles.add(file);
+				if (surviving.length) aliases.set(file, new Set([...(aliases.get(file) ?? []), ...surviving]));
 			}
 		}
 		return { allFiles: [...allFiles], aliases };

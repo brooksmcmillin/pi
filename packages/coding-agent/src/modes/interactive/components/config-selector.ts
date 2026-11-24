@@ -602,9 +602,11 @@ class ResourceList implements Component, Focusable {
 		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
 		const current = (pkg[arrayKey] ?? []) as string[];
 
-		// Generate pattern relative to package root
+		// Write exclusions for each declaration so another alias cannot re-enable the row.
 		const pattern = this.getPackageResourcePattern(item);
-		const disablePattern = `-${pattern}`;
+		const { baseDir, packageAliases } = item.metadata;
+		const patterns = new Set([pattern]);
+		if (baseDir) for (const alias of packageAliases ?? []) patterns.add(relative(baseDir, alias));
 		const enablePattern = `+${pattern}`;
 
 		// Filter out existing patterns for this resource
@@ -616,7 +618,7 @@ class ResourceList implements Component, Focusable {
 		if (enabled) {
 			updated.push(enablePattern);
 		} else {
-			updated.push(disablePattern);
+			for (const path of patterns) updated.push(`-${path}`);
 		}
 
 		(pkg as Record<string, unknown>)[arrayKey] = updated.length > 0 ? updated : undefined;
