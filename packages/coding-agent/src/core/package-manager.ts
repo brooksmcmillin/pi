@@ -2947,7 +2947,7 @@ export class DefaultPackageManager implements PackageManager {
 		for (const resourceType of RESOURCE_TYPES) {
 			const dir = join(packageRoot, resourceType);
 			if (existsSync(selectPath(dir))) {
-				const { allFiles, aliases } = this.collectSelectedPackagePaths([dir], resourceType, selectPath);
+				const { allFiles, aliases } = this.collectSelectedPackagePaths([dir], resourceType, selectPath, true);
 				for (const f of allFiles) {
 					this.addResource(
 						this.getTargetMap(accumulator, resourceType),
@@ -2979,6 +2979,7 @@ export class DefaultPackageManager implements PackageManager {
 			[join(packageRoot, resourceType)],
 			resourceType,
 			selectPath,
+			true,
 		);
 		for (const f of allFiles) this.addResource(target, f, this.withPackageAliases(metadata, aliases.get(f)), true);
 	}
@@ -3064,6 +3065,7 @@ export class DefaultPackageManager implements PackageManager {
 			[join(packageRoot, resourceType)],
 			resourceType,
 			selectPath,
+			true,
 		);
 		return { allFiles, aliases, enabledByManifest: new Set(allFiles) };
 	}
@@ -3114,6 +3116,7 @@ export class DefaultPackageManager implements PackageManager {
 		resolved: string[],
 		resourceType: ResourceType,
 		selectPath: (path: string) => string,
+		directoriesOnly = false,
 	) {
 		const aliases = new Map<string, Set<string>>();
 		const allFiles = new Set<string>();
@@ -3124,6 +3127,13 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		for (const original of resolved) {
 			const selected = selectPath(original);
+			if (directoriesOnly) {
+				try {
+					if (!statSync(selected, { throwIfNoEntry: false })?.isDirectory()) continue;
+				} catch {
+					continue;
+				}
+			}
 			for (const path of this.collectFilesFromPaths([selected], resourceType, selectPath, rememberAlias)) {
 				const active = selectPath(path);
 				if (!existsSync(active)) continue;

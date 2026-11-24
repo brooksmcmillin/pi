@@ -776,7 +776,7 @@ class ResourceList implements Component, Focusable {
 		return (
 			(packageAliases !== undefined &&
 				baseDir !== undefined &&
-				matchesPackageAliasExactRule(packageAliases, rule, baseDir)) ||
+				matchesPackageAliasExactRule([item.path, ...packageAliases], rule, baseDir)) ||
 			(gitRevision !== undefined && matchesGitPackageExactRule(item.path, rule, gitRevision))
 		);
 	}

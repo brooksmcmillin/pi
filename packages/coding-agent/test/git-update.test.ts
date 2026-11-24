@@ -392,9 +392,10 @@ describe("DefaultPackageManager git update", () => {
 		expect(loader.getExtensions().extensions.map(({ path }) => path)).toContain(join(selected(), "added.ts"));
 	});
 
-	it.each([false, true])(
-		"defers a project checkout alias until project trust resolves (nested: %s)",
-		async (nested) => {
+	it.each(["direct", "nested", "configured"])(
+		"defers a project checkout alias until project trust resolves (%s)",
+		async (kind) => {
+			const nested = kind === "nested";
 			setupRemoteAndInstall();
 			const marker = join(tempDir, "initialized");
 			const extension = (value: string) =>
@@ -422,12 +423,14 @@ describe("DefaultPackageManager git update", () => {
 				);
 			}
 			writeFileSync(ordinary, extension("ordinary\n"));
+			if (kind === "configured") settingsManager.setExtensionPaths([join(alias, "worker.ts"), ordinary]);
 			await settingsManager.flush();
 			const loader = new DefaultResourceLoader({
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
-				additionalExtensionPaths: nested ? [cliPackage] : [join(alias, "worker.ts"), ordinary],
+				additionalExtensionPaths:
+					kind === "configured" ? [] : nested ? [cliPackage] : [join(alias, "worker.ts"), ordinary],
 			});
 			await loader.reload({
 				resolveProjectTrust: async ({ extensionsResult }) => {
@@ -476,6 +479,20 @@ describe("DefaultPackageManager git update", () => {
 		expect(await workers()).toEqual([expect.objectContaining({ path: join(previous, "extensions", "worker.ts") })]);
 		expect(publish).toHaveBeenCalledTimes(1);
 		expect(await workers()).toEqual([expect.objectContaining({ path: join(next, "extensions", "worker.ts") })]);
+	});
+
+	it.each(["plain", "default", "filtered"])("ignores a regular file at a %s convention root", async (kind) => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "extensions", "not an extension", "Add incidental file");
+		await packageManager.update();
+		settingsManager.setPackages([
+			kind === "plain"
+				? gitSource
+				: kind === "default"
+					? { source: gitSource, skills: [] }
+					: { source: gitSource, extensions: ["*"] },
+		]);
+		expect((await packageManager.resolve()).extensions).toEqual([]);
 	});
 
 	it("preserves a historical exclusion for a nested local package", async () => {
@@ -951,6 +968,10 @@ describe("DefaultPackageManager git update", () => {
 			createCommit(remoteDir, "new.ts", "export default function() {}", "Add dangling alias target");
 			await packageManager.update();
 			const active = selected();
+			settingsManager.setPackages([
+				{ source: gitSource, autoload: false },
+				{ source: local, extensions: ["-src/worker.ts", `-${join(active, "worker.ts")}`] },
+			]);
 			const configured = await packageManager.resolve();
 			expect(configured.extensions).toContainEqual(
 				expect.objectContaining({ path: join(active, "worker.ts"), enabled: false }),
