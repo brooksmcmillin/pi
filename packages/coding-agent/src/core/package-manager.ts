@@ -3681,7 +3681,14 @@ export class DefaultPackageManager implements PackageManager {
 				if (component === path) return true;
 				// A link to the checkout or a directory inside it adds another declaration.
 				// An alias of its storage parent just re-spells the same checkout path.
-				if (redirectGitRevisionPath(canonicalizePath(component), revision.logical, revision.active, true))
+				if (
+					redirectGitRevisionPath(
+						canonicalizePath(component),
+						canonicalizePath(revision.logical),
+						revision.active,
+						true,
+					)
+				)
 					return true;
 			} catch {
 				// An inaccessible component does not prove a separate alias.

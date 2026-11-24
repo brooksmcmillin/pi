@@ -1493,9 +1493,16 @@ describe("DefaultPackageManager git update", () => {
 		{ excluded: true, configured: false },
 		{ excluded: true, configured: true },
 		{ excluded: true, configured: "parent" },
+		{ excluded: true, configured: "parent", linkedAgentDir: true },
 	])(
-		"keeps the prompt alias name while loading selected content ($excluded/$configured)",
-		async ({ excluded, configured }) => {
+		"keeps the prompt alias name while loading selected content ($excluded/$configured/$linkedAgentDir)",
+		async ({ excluded, configured, linkedAgentDir }) => {
+			if (linkedAgentDir) {
+				const realAgentDir = join(tempDir, "real-agent");
+				mkdirSync(realAgentDir);
+				rmSync(agentDir, { recursive: true });
+				symlinkSync(realAgentDir, agentDir, "dir");
+			}
 			setupRemoteAndInstall();
 			mkdirSync(join(remoteDir, "prompts"));
 			createCommit(remoteDir, "prompts/review.md", "Old review", "Add review prompt");
