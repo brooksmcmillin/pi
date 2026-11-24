@@ -689,7 +689,7 @@ function collectAutoExtensionEntries(
 
 			if (entry.isSymbolicLink()) {
 				try {
-					const stats = statSync(fullPath);
+					const stats = statSync(selectPath(fullPath));
 					isDir = stats.isDirectory();
 					isFile = stats.isFile();
 				} catch {

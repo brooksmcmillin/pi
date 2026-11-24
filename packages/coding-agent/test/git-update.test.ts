@@ -687,6 +687,29 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"discovers a selected directory index through an old file symlink",
+		async () => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "worker.ts", "export default function() {}", "Add worker file");
+			git(["pull", "--ff-only"], installedDir);
+			const alias = join(agentDir, "extensions", "worker.ts");
+			mkdirSync(dirname(alias));
+			symlinkSync(join(installedDir, "worker.ts"), alias);
+			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+			settingsManager.setExtensionPaths([`-${relative(agentDir, join(alias, "index.ts"))}`]);
+			git(["rm", "worker.ts"], remoteDir);
+			mkdirSync(join(remoteDir, "worker.ts"));
+			createCommit(remoteDir, "worker.ts/index.ts", "export default function() {}", "Replace worker with directory");
+			await packageManager.update();
+			const directory = join(selected(), "worker.ts");
+			const resources = (await packageManager.resolve()).extensions;
+			expect(resources.filter(({ path }) => path === directory || dirname(path) === directory)).toEqual([
+				expect.objectContaining({ path: join(directory, "index.ts"), enabled: false }),
+			]);
+		},
+	);
+
 	it.skipIf(process.platform === "win32")("deduplicates an auto-discovered symlink to an old checkout", async () => {
 		setupRemoteAndInstall();
 		mkdirSync(join(remoteDir, "extensions"));
