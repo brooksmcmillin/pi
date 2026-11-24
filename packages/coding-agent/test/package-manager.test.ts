@@ -1265,7 +1265,7 @@ Content`,
 			"failure",
 			"competing update",
 			"blocked promotion",
-			"cross-device recovery",
+			"cross-device publication (when /dev/shm is distinct)",
 			"repair contention",
 		] as const)("keeps the old Git package usable during a staged %s", async (outcome) => {
 			const source = "git:github.com/user/repo";
@@ -1388,7 +1388,7 @@ writeFileSync('launcher.mjs', 'import ' + JSON.stringify(pathToFileURL(require('
 				}
 			});
 
-			if (outcome === "cross-device recovery") {
+			if (outcome === "cross-device publication (when /dev/shm is distinct)") {
 				if (!existsSync("/dev/shm") || statSync("/dev/shm").dev === statSync(targetDir).dev) return;
 				const external = mkdtempSync("/dev/shm/pi-update-test-");
 				try {
@@ -1414,7 +1414,7 @@ writeFileSync('launcher.mjs', 'import ' + JSON.stringify(pathToFileURL(require('
 				await packageManager.update(source);
 				expect(startWorker(selected())).toBe("2.0.0:new");
 				if (outcome === "success") {
-					expect(git(selected(), "rev-parse", "--show-toplevel")).toBe(selected());
+					expect(realpathSync(git(selected(), "rev-parse", "--show-toplevel"))).toBe(realpathSync(selected()));
 					expect(
 						execFileSync(process.execPath, [join(selected(), "launcher.mjs")], { encoding: "utf8" }).trim(),
 					).toBe("2.0.0:new");

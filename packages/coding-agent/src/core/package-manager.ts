@@ -958,14 +958,20 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 		return selected ?? select(canonicalizePath(candidate), root);
 	}
 
-	const selected = selectPath(path);
-	if (selected || existsSync(path)) return selected;
-	// realpath cannot resolve a dangling link whose target is new to the selected revision.
-	try {
-		return selectPath(resolve(realpathSync(dirname(path)), readlinkSync(path)));
-	} catch {
-		return undefined;
+	const seen = new Set<string>();
+	let candidate = path;
+	while (!seen.has(candidate)) {
+		seen.add(candidate);
+		const selected = selectPath(candidate);
+		if (selected || existsSync(candidate)) return selected;
+		// realpath cannot resolve a dangling link whose target is new to the selected revision.
+		try {
+			candidate = resolve(realpathSync(dirname(candidate)), readlinkSync(candidate));
+		} catch {
+			return undefined;
+		}
 	}
+	return undefined;
 }
 
 export function matchesPackageAliasExactRule(aliases: readonly string[], rule: string, baseDir: string): boolean {

@@ -1054,23 +1054,33 @@ describe("DefaultPackageManager git update", () => {
 		);
 	});
 
-	it.skipIf(process.platform === "win32").each([false, true])(
-		"discovers a dangling prompt alias when its target appears (symlinked parent: %s)",
-		async (linkedParent) => {
+	it.skipIf(process.platform === "win32").each(["direct", "symlinked parent", "chained"])(
+		"discovers a dangling prompt alias when its target appears (%s)",
+		async (kind) => {
+			const linkedParent = kind === "symlinked parent";
 			setupRemoteAndInstall();
 			const alias = join(agentDir, "prompts", "tool.md");
 			const containingDir = linkedParent ? join(dirname(installedDir), "prompt-aliases") : dirname(alias);
 			mkdirSync(containingDir);
 			if (linkedParent) symlinkSync(containingDir, dirname(alias));
-			symlinkSync(relative(containingDir, join(installedDir, "tool.md")), alias);
+			const target = join(installedDir, "tool.md");
+			if (kind === "chained") {
+				const intermediate = join(tempDir, "intermediate.md");
+				symlinkSync(relative(tempDir, target), intermediate);
+				symlinkSync(relative(containingDir, intermediate), alias);
+				symlinkSync("cycle-b.md", join(containingDir, "cycle-a.md"));
+				symlinkSync("cycle-a.md", join(containingDir, "cycle-b.md"));
+			} else {
+				symlinkSync(relative(containingDir, target), alias);
+			}
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 			expect((await packageManager.resolve()).prompts).toEqual([]);
 			createCommit(remoteDir, "tool.md", "Selected prompt", "Add prompt target");
 			await packageManager.update();
 			expect(existsSync(alias)).toBe(false);
-			expect((await packageManager.resolve()).prompts).toContainEqual(
+			expect((await packageManager.resolve()).prompts).toEqual([
 				expect.objectContaining({ path: join(selected(), "tool.md"), enabled: true }),
-			);
+			]);
 		},
 	);
 
