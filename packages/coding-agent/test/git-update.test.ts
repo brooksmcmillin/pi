@@ -1860,6 +1860,7 @@ describe("DefaultPackageManager git update", () => {
 			"auto-glob",
 			"multi-load",
 			"project-multi-load",
+			"project-mixed",
 		])(
 		"does not discover a hidden prompt target independently of its excluded directory alias (%s)",
 		async (source) => {
@@ -1880,7 +1881,8 @@ describe("DefaultPackageManager git update", () => {
 			const hiddenTarget = join(declaredRoot, ".hidden", "note.md");
 			const auto = source === "auto-exact" || source === "auto-glob";
 			const external = source === "external-exact" || auto;
-			const projectMode = source === "project-multi-load";
+			const mixed = source === "project-mixed";
+			const projectMode = source === "project-multi-load" || mixed;
 			const multi = source === "multi-load" || projectMode;
 			const directory = source === "external-directory" || multi;
 			const exact = external || directory || source === "settings-exact";
@@ -1928,10 +1930,19 @@ describe("DefaultPackageManager git update", () => {
 				return;
 			}
 			if (multi) {
+				if (mixed) {
+					settingsManager.setProjectPromptTemplatePaths([
+						declared,
+						`+${join(declared, "first.md")}`,
+						`-${join(declared, "second.md")}`,
+					]);
+					await loader.reload();
+					expect(loader.getPrompts().prompts.map(({ name }) => name)).toEqual(["first"]);
+				}
 				const resolved = await packageManager.resolve();
 				expect(resolved.prompts).toHaveLength(1);
 				const row = { ...resolved.prompts[0]!, resourceType: "prompts" as const };
-				expect(row.enabled).toBe(false);
+				expect(row.enabled).toBe(mixed);
 				expect(row.metadata.gitRevision?.declarations).toHaveLength(2);
 				const noop = () => {};
 				const selector = new ConfigSelectorComponent(
@@ -1954,12 +1965,17 @@ describe("DefaultPackageManager git update", () => {
 					undefined,
 					projectMode ? "project" : "global",
 				);
-				expect(
-					(selector.getResourceList() as unknown as { toggleResource(item: typeof row): boolean }).toggleResource(
-						row,
-					),
-				).toBe(true);
+				const list = selector.getResourceList() as unknown as {
+					getProjectOverrideState(item: typeof row): string;
+					toggleResource(item: typeof row): boolean;
+				};
+				if (mixed) expect(list.getProjectOverrideState(row)).toBe("load");
+				expect(list.toggleResource(row)).toBe(!mixed);
 				await loader.reload();
+				if (mixed) {
+					expect(loader.getPrompts().prompts).toEqual([]);
+					return;
+				}
 				expect(loader.getPrompts().prompts).toEqual([
 					expect.objectContaining({ name: "first", content: "Selected note" }),
 				]);

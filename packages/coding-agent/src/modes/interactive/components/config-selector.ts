@@ -761,12 +761,29 @@ class ResourceList implements Component, Focusable {
 			return enabled ? "unload" : "load";
 		}
 		if (state === "unload") return inheritedEnabled ? "load" : "inherit";
+		if (this.hasMixedProjectDeclarationOverrides(item) && !this.isInheritedGlobalItem(item)) return "unload";
 		return inheritedEnabled ? "inherit" : "unload";
+	}
+
+	private hasMixedProjectDeclarationOverrides(item: ResourceItem): boolean {
+		if (
+			item.metadata.origin !== "top-level" ||
+			item.metadata.scope !== "project" ||
+			(item.metadata.gitRevision?.declarations?.length ?? 0) < 2
+		)
+			return false;
+		const entries = this.settingsManager.getProjectSettings()[item.resourceType] ?? [];
+		const matches = (prefix: string) =>
+			entries.some(
+				(entry) => entry.startsWith(prefix) && this.matchesGitRevisionOverride(item, entry.slice(1), "project"),
+			);
+		return matches("+") && matches("-");
 	}
 
 	private getProjectOverrideState(item: ResourceItem): ProjectOverrideState {
 		if (this.writeScope !== "project") return "inherit";
 		if (item.metadata.origin === "top-level") {
+			if (this.hasMixedProjectDeclarationOverrides(item)) return item.enabled ? "load" : "unload";
 			const entries = (this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[];
 			const patterns = this.getTopLevelOverridePatterns(item, "project");
 			for (const entry of entries) {
