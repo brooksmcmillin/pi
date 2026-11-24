@@ -337,6 +337,21 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
+	it.each([false, true])("deduplicates managed local package aliases (local first: %s)", async (localFirst) => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		git(["pull", "--ff-only"], installedDir);
+		const original = join(installedDir, "extensions", "worker.ts");
+		settingsManager.setPackages(localFirst ? [original, gitSource] : [gitSource, original]);
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() { return 2; }", "Update worker");
+		await packageManager.update();
+		const workers = (await packageManager.resolve()).extensions.filter(({ path }) => basename(path) === "worker.ts");
+		expect(workers).toEqual([
+			expect.objectContaining({ path: join(selected(), "extensions", "worker.ts"), enabled: true }),
+		]);
+	});
+
 	it("redirects explicit user paths when a trusted project shadows the package", async () => {
 		setupRemoteAndInstall();
 		mkdirSync(join(remoteDir, "extensions"));
@@ -728,13 +743,29 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32")(
-		"discovers a dangling prompt alias when its target appears in a new revision",
-		async () => {
+	it.skipIf(process.platform === "win32")("discovers a newly available nested extension manifest alias", async () => {
+		setupRemoteAndInstall();
+		const root = join(agentDir, "extensions");
+		mkdirSync(join(root, "src"), { recursive: true });
+		writeFileSync(join(root, "package.json"), JSON.stringify({ pi: { extensions: ["src/tool.ts"] } }));
+		symlinkSync(join(installedDir, "tool.ts"), join(root, "src", "tool.ts"));
+		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+		createCommit(remoteDir, "tool.ts", "export default function() {}", "Add extension target");
+		await packageManager.update();
+		expect((await packageManager.resolve()).extensions).toContainEqual(
+			expect.objectContaining({ path: join(selected(), "tool.ts"), enabled: true }),
+		);
+	});
+
+	it.skipIf(process.platform === "win32").each([false, true])(
+		"discovers a dangling prompt alias when its target appears (symlinked parent: %s)",
+		async (linkedParent) => {
 			setupRemoteAndInstall();
 			const alias = join(agentDir, "prompts", "tool.md");
-			mkdirSync(dirname(alias));
-			symlinkSync(relative(dirname(alias), join(installedDir, "tool.md")), alias);
+			const containingDir = linkedParent ? join(dirname(installedDir), "prompt-aliases") : dirname(alias);
+			mkdirSync(containingDir);
+			if (linkedParent) symlinkSync(containingDir, dirname(alias));
+			symlinkSync(relative(containingDir, join(installedDir, "tool.md")), alias);
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 			expect((await packageManager.resolve()).prompts).toEqual([]);
 			createCommit(remoteDir, "tool.md", "Selected prompt", "Add prompt target");

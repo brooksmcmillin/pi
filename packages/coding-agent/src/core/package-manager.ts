@@ -630,7 +630,7 @@ function resolveExtensionEntries(dir: string, selectPath: (path: string) => stri
 			const entries: string[] = [];
 			for (const extPath of manifest.extensions) {
 				const resolvedExtPath = resolve(dir, extPath);
-				if (existsSync(resolvedExtPath)) {
+				if (existsSync(selectPath(resolvedExtPath))) {
 					entries.push(resolvedExtPath);
 				}
 			}
@@ -952,7 +952,7 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 	if (selected || existsSync(path)) return selected;
 	// realpath cannot resolve a dangling link whose target is new to the selected revision.
 	try {
-		return selectPath(resolve(dirname(path), readlinkSync(path)));
+		return selectPath(resolve(realpathSync(dirname(path)), readlinkSync(path)));
 	} catch {
 		return undefined;
 	}
@@ -1163,20 +1163,23 @@ export class DefaultPackageManager implements PackageManager {
 			allPackages.push({ pkg, scope: "user" });
 		}
 
+		// Seed installed revision paths before resolving local aliases, regardless of declaration order.
+		for (const entry of allPackages) {
+			if (entry.scope === "project" && !this.settingsManager.isProjectTrusted()) continue;
+			const parsed = this.parseSource(this.getPackageSourceString(entry.pkg));
+			if (parsed.type !== "git") continue;
+			try {
+				const logical = this.getGitStoragePath(parsed, entry.scope);
+				const selected = this.readSelectedGitRevision(logical, this.getGitUpdateStatePath(logical, entry.scope));
+				if (logical !== selected && existsSync(selected)) accumulator.gitRevisions.set(logical, selected);
+			} catch {
+				// Normal package resolution reports failures for packages that are actually loaded.
+			}
+		}
+
 		// Dedupe: project scope wins over global for same package identity
 		const packageSources = this.dedupePackages(allPackages);
 		const installFailures = await this.resolvePackageSources(packageSources, accumulator, onMissing);
-		const loaded = new Set(packageSources);
-		for (const entry of allPackages) {
-			if (loaded.has(entry) || (entry.scope === "project" && !this.settingsManager.isProjectTrusted())) continue;
-			const source = this.getPackageSourceString(entry.pkg);
-			const parsed = this.parseSource(source);
-			if (parsed.type !== "git") continue;
-			const selected = this.getInstalledPath(source, entry.scope);
-			if (!selected) continue;
-			const logical = this.getGitStoragePath(parsed, entry.scope);
-			if (logical !== selected) accumulator.gitRevisions.set(logical, selected);
-		}
 
 		const globalBaseDir = this.agentDir;
 		const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
@@ -1730,7 +1733,8 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 		baseDir: string,
 	): void {
-		const resolved = this.resolvePathFromBase(source.path, baseDir);
+		const original = this.resolvePathFromBase(source.path, baseDir);
+		const resolved = this.redirectGitResource(original, accumulator.gitRevisions);
 		if (!existsSync(resolved)) {
 			return;
 		}
