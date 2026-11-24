@@ -15,6 +15,7 @@ import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { ConfigSelectorComponent } from "../src/modes/interactive/components/config-selector.ts";
 import { allowNetwork } from "./test-network-env.ts";
 
 const fsFixture = vi.hoisted(() => ({
@@ -429,31 +430,63 @@ describe("DefaultPackageManager git update", () => {
 		await packageManager.update();
 		const next = join(selected(), "new.ts");
 		expect(next).not.toBe(first);
-		expect(
-			(await packageManager.resolve()).extensions.filter((entry) =>
-				["old.ts", "new.ts"].includes(basename(entry.path)),
-			),
-		).toEqual([expect.objectContaining({ path: next, enabled: false })]);
+		const resolved = await packageManager.resolve();
+		const entriesAfterUpdate = resolved.extensions.filter((entry) =>
+			["old.ts", "new.ts"].includes(basename(entry.path)),
+		);
+		expect(entriesAfterUpdate).toEqual([expect.objectContaining({ path: next, enabled: false })]);
+		const item = entriesAfterUpdate[0];
+		if (!item) throw new Error("Expected discovered extension");
+		const noop = () => {};
+		const selector = new ConfigSelectorComponent(
+			{ global: resolved, project: resolved },
+			settingsManager,
+			tempDir,
+			agentDir,
+			noop,
+			noop,
+			noop,
+		);
+		const list = selector.getResourceList() as unknown as {
+			toggleResource(resource: typeof item & { resourceType: "extensions" }): boolean;
+		};
+		expect(list.toggleResource({ ...item, resourceType: "extensions" })).toBe(true);
+		expect(settingsManager.getGlobalSettings().extensions).toEqual([...declarations, `+${relative(agentDir, next)}`]);
+		expect((await packageManager.resolve()).extensions).toContainEqual(
+			expect.objectContaining({ path: next, enabled: true }),
+		);
 	});
 
-	it.each(["root", "child"])(
-		"discovers selected skills, prompts and themes through automatic aliases (%s skill)",
+	it.each(["root", "child", "explicit"])(
+		"discovers selected skills, prompts and themes through %s aliases",
 		async (kind) => {
 			setupRemoteAndInstall();
 			mkdirSync(join(remoteDir, "skills"));
 			createCommit(remoteDir, "skills/README.md", "Existing skills directory", "Add directory");
 			git(["pull", "--ff-only"], installedDir);
 			const linkType = process.platform === "win32" ? "junction" : "dir";
-			const skillRoot = join(agentDir, "skills");
-			if (kind === "child") mkdirSync(skillRoot);
-			symlinkSync(join(installedDir, "skills"), kind === "child" ? join(skillRoot, "alias") : skillRoot, linkType);
+			const skillRoot = join(agentDir, kind === "explicit" ? "explicit-skills" : "skills");
+			if (kind !== "root") mkdirSync(skillRoot);
+			symlinkSync(join(installedDir, "skills"), kind === "root" ? skillRoot : join(skillRoot, "alias"), linkType);
 			for (const type of ["prompts", "themes"]) {
 				mkdirSync(join(remoteDir, type));
 				createCommit(remoteDir, `${type}/.keep`, "Existing directory", `Add ${type} directory`);
 			}
 			git(["pull", "--ff-only"], installedDir);
-			symlinkSync(join(installedDir, "prompts"), join(agentDir, "prompts"), linkType);
-			symlinkSync(join(installedDir, "themes"), join(agentDir, "themes"), linkType);
+			if (kind === "explicit") {
+				const prompts = join(agentDir, "explicit-prompts");
+				const themes = join(agentDir, "explicit-themes");
+				mkdirSync(prompts);
+				mkdirSync(themes);
+				symlinkSync(join(installedDir, "prompts"), join(prompts, "alias"), linkType);
+				symlinkSync(join(installedDir, "themes"), join(themes, "alias"), linkType);
+				settingsManager.setSkillPaths([skillRoot]);
+				settingsManager.setPromptTemplatePaths([prompts]);
+				settingsManager.setThemePaths([themes]);
+			} else {
+				symlinkSync(join(installedDir, "prompts"), join(agentDir, "prompts"), linkType);
+				symlinkSync(join(installedDir, "themes"), join(agentDir, "themes"), linkType);
+			}
 			settingsManager.setPackages([{ source: gitSource, autoload: false }]);
 			mkdirSync(join(remoteDir, "skills", "added"));
 			createCommit(

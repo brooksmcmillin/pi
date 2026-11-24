@@ -15,7 +15,12 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { CONFIG_DIR_NAME } from "../../../config.ts";
-import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/package-manager.ts";
+import {
+	type PathMetadata,
+	type ResolvedPaths,
+	type ResolvedResource,
+	redirectGitRevisionPath,
+} from "../../../core/package-manager.ts";
 import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
 import { BUILTIN_PATH_PREFIX, getResourcePathKey } from "../../../core/source-info.ts";
 import { isLocalPath, resolvePath, shortenHomePath } from "../../../utils/paths.ts";
@@ -535,10 +540,10 @@ class ResourceList implements Component, Focusable {
 		const disablePattern = `-${pattern}`;
 		const enablePattern = `+${pattern}`;
 
-		// Filter out existing patterns for this resource
 		const updated = current.filter((p) => {
-			const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
-			return stripped !== pattern;
+			const stripped = this.getPatternEntryTarget(p);
+			if (item.metadata.gitRevision && stripped === p) return true;
+			return stripped !== pattern && !this.matchesGitRevisionOverride(item, stripped, scope);
 		});
 
 		if (enabled) {
@@ -667,7 +672,10 @@ class ResourceList implements Component, Focusable {
 		const patterns = this.getTopLevelOverridePatterns(item, "project");
 		const updated = current.filter((entry) => {
 			const target = this.getPatternEntryTarget(entry);
-			if ((entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-")) && patterns.has(target))
+			if (
+				(entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-")) &&
+				(patterns.has(target) || this.matchesGitRevisionOverride(item, target, "project"))
+			)
 				return false;
 			return !(state === "inherit" && this.isInheritedGlobalItem(item) && target === pattern);
 		});
@@ -734,11 +742,13 @@ class ResourceList implements Component, Focusable {
 	private getProjectOverrideState(item: ResourceItem): ProjectOverrideState {
 		if (this.writeScope !== "project") return "inherit";
 		if (item.metadata.origin === "top-level") {
-			return this.getOverrideStateFromEntries(
-				(this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[],
-				this.getTopLevelOverridePatterns(item, "project"),
-				false,
-			);
+			const entries = (this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[];
+			const patterns = this.getTopLevelOverridePatterns(item, "project");
+			for (const entry of entries) {
+				const target = this.getPatternEntryTarget(entry);
+				if (target !== entry && this.matchesGitRevisionOverride(item, target, "project")) patterns.add(target);
+			}
+			return this.getOverrideStateFromEntries(entries, patterns, false);
 		}
 		const pkg = this.findMatchingPackageSource(item, "project");
 		if (typeof pkg !== "object") return "inherit";
@@ -775,6 +785,14 @@ class ResourceList implements Component, Focusable {
 
 	private isInheritedGlobalItem(item: ResourceItem): boolean {
 		return this.getItemScope(item) === "user" || this.inheritedEnabledByKey.has(this.getResourceItemKey(item));
+	}
+
+	private matchesGitRevisionOverride(item: ResourceItem, target: string, scope: SettingsScope): boolean {
+		const revision = item.metadata.gitRevision;
+		if (!revision) return false;
+		const path = resolvePath(target, this.getTopLevelBaseDir(scope), { trim: true });
+		const selected = redirectGitRevisionPath(path, revision.logical, revision.active);
+		return selected === item.path || (item.resourceType === "skills" && selected === dirname(item.path));
 	}
 
 	private getTopLevelOverridePatterns(item: ResourceItem, scope: SettingsScope): Set<string> {

@@ -87,6 +87,7 @@ export interface PathMetadata {
 	baseDir?: string;
 	changelogPath?: string;
 	packageRoot?: string;
+	gitRevision?: { logical: string; active: string };
 }
 
 export interface ResolvedResource {
@@ -360,19 +361,26 @@ function splitPatterns(entries: string[]): { plain: string[]; patterns: string[]
 	return { plain, patterns };
 }
 
+interface DiscoverySelection {
+	selectPath: (path: string) => string;
+	rememberAlias: (file: string, alias: string) => void;
+}
+
 function collectFiles(
 	dir: string,
 	filePattern: RegExp,
 	skipNodeModules = true,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	selection?: DiscoverySelection,
+	logicalDir = dir,
 ): string[] {
 	const files: string[] = [];
 	if (!existsSync(dir)) return files;
 
-	const root = rootDir ?? dir;
+	const root = rootDir ?? logicalDir;
 	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	addIgnoreRules(ig, dir, root, logicalDir);
 
 	try {
 		const entries = readdirSync(dir, { withFileTypes: true });
@@ -394,14 +402,17 @@ function collectFiles(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const logical = join(logicalDir, entry.name);
+			const relPath = toPosixPath(relative(root, logical));
 			const ignorePath = isDir ? `${relPath}/` : relPath;
 			if (ig.ignores(ignorePath)) continue;
 
 			if (isDir) {
-				files.push(...collectFiles(fullPath, filePattern, skipNodeModules, ig, root));
+				const selected = selection?.selectPath(fullPath) ?? fullPath;
+				files.push(...collectFiles(selected, filePattern, skipNodeModules, ig, root, selection, logical));
 			} else if (isFile && filePattern.test(entry.name)) {
 				files.push(fullPath);
+				if (logical !== fullPath) selection?.rememberAlias(fullPath, logical);
 			}
 		}
 	} catch {
@@ -418,7 +429,7 @@ function collectSkillEntries(
 	mode: SkillDiscoveryMode,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
-	selection?: { selectPath: (path: string) => string; rememberAlias: (file: string, alias: string) => void },
+	selection?: DiscoverySelection,
 	logicalDir = dir,
 ): string[] {
 	const entries: string[] = [];
@@ -905,6 +916,21 @@ function applyPatterns(
 	}
 
 	return new Set(result);
+}
+
+export function redirectGitRevisionPath(path: string, logical: string, active: string): string | undefined {
+	for (const [candidate, root] of [
+		[path, logical],
+		[canonicalizePath(path), canonicalizePath(logical)],
+	] as const) {
+		if (candidate === root || isPathInside(root, candidate)) return join(active, relative(root, candidate));
+		const parent = dirname(root);
+		if (!isPathInside(parent, candidate)) continue;
+		const [name, ...parts] = relative(parent, candidate).split(sep);
+		const prefix = basename(active).slice(0, -6);
+		if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) return join(active, ...parts);
+	}
+	return undefined;
 }
 
 function matchesPackagePath(
@@ -3003,7 +3029,7 @@ export class DefaultPackageManager implements PackageManager {
 		const enabledPaths = applyPatterns([...allFiles], rules, baseDir, baseDir, aliases);
 
 		for (const f of allFiles) {
-			this.addResource(target, f, metadata, enabledPaths.has(f));
+			this.addResource(target, f, this.withGitRevision(metadata, f, gitRevisions), enabledPaths.has(f));
 		}
 	}
 
@@ -3022,24 +3048,18 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private redirectGitResource(path: string, revisions: ReadonlyMap<string, string>): string {
-		if (revisions.size === 0) return path;
-		const canonical = canonicalizePath(path);
 		for (const [logical, active] of revisions) {
-			for (const [candidate, root] of [
-				[path, logical],
-				[canonical, canonicalizePath(logical)],
-			] as const) {
-				if (candidate === root || isPathInside(root, candidate)) return join(active, relative(root, candidate));
-				const parent = dirname(root);
-				if (!isPathInside(parent, candidate)) continue;
-				const [name, ...parts] = relative(parent, candidate).split(sep);
-				const prefix = basename(active).slice(0, -6);
-				if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) {
-					return join(active, ...parts);
-				}
-			}
+			const selected = redirectGitRevisionPath(path, logical, active);
+			if (selected !== undefined) return selected;
 		}
 		return path;
+	}
+
+	private withGitRevision(metadata: PathMetadata, path: string, revisions: ReadonlyMap<string, string>): PathMetadata {
+		for (const [logical, active] of revisions) {
+			if (isPathInside(active, path)) return { ...metadata, gitRevision: { logical, active } };
+		}
+		return metadata;
 	}
 
 	private addAutoDiscoveredResources(
@@ -3131,7 +3151,12 @@ export class DefaultPackageManager implements PackageManager {
 			}
 			const rules = this.redirectGitExactRules(overrides, baseDir, accumulator.gitRevisions);
 			for (const [active, spellings] of discovered) {
-				this.addResource(target, active, metadata, isEnabledByOverrides(active, rules, baseDir, spellings));
+				this.addResource(
+					target,
+					active,
+					this.withGitRevision(metadata, active, accumulator.gitRevisions),
+					isEnabledByOverrides(active, rules, baseDir, spellings),
+				);
 			}
 			aliases.clear();
 		};
@@ -3246,11 +3271,20 @@ export class DefaultPackageManager implements PackageManager {
 				if (stats.isFile()) {
 					files.push(p);
 				} else if (stats.isDirectory()) {
-					files.push(
-						...(resourceType === "extensions" && selectPath
-							? collectAutoExtensionEntries(p, selectPath, rememberAlias)
-							: collectResourceFiles(p, resourceType)),
-					);
+					if (!selectPath || !rememberAlias) {
+						files.push(...collectResourceFiles(p, resourceType));
+					} else if (resourceType === "extensions") {
+						files.push(...collectAutoExtensionEntries(p, selectPath, rememberAlias));
+					} else if (resourceType === "skills") {
+						files.push(...collectSkillEntries(p, "pi", undefined, undefined, { selectPath, rememberAlias }));
+					} else {
+						files.push(
+							...collectFiles(p, FILE_PATTERNS[resourceType], true, undefined, undefined, {
+								selectPath,
+								rememberAlias,
+							}),
+						);
+					}
 				}
 			} catch {
 				// Ignore errors
