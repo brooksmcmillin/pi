@@ -882,15 +882,23 @@ function matchesPackagePath(
 
 	// A saved absolute filter can name an earlier revision of this same package.
 	const revisionPrefix = basename(baseDir).slice(0, -6);
-	const parent = `${toPosixPath(dirname(baseDir))}/`;
+	const parent = dirname(baseDir);
+	const revisionPath = /^(.+)\/(\.pi-revision-[a-f0-9]{64}-[a-zA-Z0-9]{6})\//;
 	return rules.some((rule) => {
 		const normalized = toPosixPath(normalizePath(rule));
-		if (!normalized.startsWith(parent)) return false;
-		const revision = normalized.slice(parent.length).split("/", 1)[0];
-		if (!revision?.startsWith(revisionPrefix) || !/^[a-zA-Z0-9]{6}$/.test(revision.slice(revisionPrefix.length))) {
-			return false;
+		if (!isAbsolute(normalized)) return false;
+		const [, savedParent, revision] = revisionPath.exec(normalized) ?? [];
+		if (!savedParent || !revision?.startsWith(revisionPrefix)) return false;
+		if (savedParent !== toPosixPath(parent)) {
+			try {
+				const saved = statSync(savedParent);
+				const current = statSync(parent);
+				if (saved.dev !== current.dev || saved.ino !== current.ino) return false;
+			} catch {
+				return false;
+			}
 		}
-		const historicalRoot = join(dirname(baseDir), revision);
+		const historicalRoot = join(savedParent, revision);
 		return matcher(join(historicalRoot, suffix), [rule], historicalRoot);
 	});
 }

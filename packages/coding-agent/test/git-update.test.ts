@@ -263,13 +263,20 @@ describe("DefaultPackageManager git update", () => {
 			if (kind === "active exact" || kind === "active delta") {
 				const reported = packageManager.listConfiguredPackages()[0]?.installedPath;
 				expect(reported).toBe(active);
+				const aliasParent = join(tempDir, "alias-parent");
+				symlinkSync(dirname(active), aliasParent, process.platform === "win32" ? "junction" : "dir");
+				const historical = join(aliasParent, basename(active));
+				const distinctParent = join(tempDir, "distinct-parent");
+				mkdirSync(distinctParent);
 				settingsManager.setPackages([
 					{
 						source: gitSource,
 						autoload: kind !== "active delta",
 						extensions: [
-							`-${join(reported!, "extensions", "excluded.ts")}`,
-							`+${join(reported!, "extensions", "enabled.ts")}`,
+							...(kind === "active exact" ? ["!**/*.ts"] : []),
+							`-${join(historical, "extensions", "excluded.ts")}`,
+							`+${join(historical, "extensions", "enabled.ts")}`,
+							`-${join(distinctParent, basename(active), "extensions", "enabled.ts")}`,
 						],
 					},
 				]);
