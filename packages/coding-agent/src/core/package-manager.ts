@@ -1067,6 +1067,21 @@ function matchesPackagePath(
 	});
 }
 
+function matchesPackageDeclaration(
+	file: string,
+	declaration: string | undefined,
+	spellings: ReadonlySet<string> | undefined,
+	patterns: string[],
+	root: string,
+	logicalRoot = root,
+): boolean {
+	return applyPatterns([file], patterns, root, logicalRoot, undefined, (rule, matcher) => {
+		const matches = (path: string) => matchesPackagePath(path, [rule], root, logicalRoot, matcher);
+		if (declaration !== undefined && [...(spellings ?? [])].some(matches)) return matches(declaration);
+		return matches(file);
+	}).has(file);
+}
+
 function chooseResourceAlias(spellings: Set<string> | undefined, matches: (alias?: Set<string>) => boolean) {
 	if (!spellings?.size) return { enabled: matches() };
 	for (const spelling of spellings) {
@@ -3138,13 +3153,16 @@ export class DefaultPackageManager implements PackageManager {
 		// Apply user patterns
 		for (const f of allFiles) {
 			const spellings = aliases?.get(f);
-			const declaration = chooseResourceAlias(spellings, (alias) => {
-				return applyPatterns([f], userPatterns, packageRoot, filterRoot, undefined, (rule, matcher) => {
-					const matches = (path: string) => matchesPackagePath(path, [rule], packageRoot, filterRoot, matcher);
-					if (alias && [...(spellings ?? [])].some(matches)) return [...alias].some(matches);
-					return matches(f);
-				}).has(f);
-			});
+			const declaration = chooseResourceAlias(spellings, (alias) =>
+				matchesPackageDeclaration(
+					f,
+					alias?.values().next().value,
+					spellings,
+					userPatterns,
+					packageRoot,
+					filterRoot,
+				),
+			);
 			const allAliases = new Set([...(declaration.aliases ?? []), ...(aliases?.get(f) ?? [])]);
 			this.addResource(target, f, this.withPackageAliases(metadata, allAliases), declaration.enabled);
 		}
@@ -3252,27 +3270,19 @@ export class DefaultPackageManager implements PackageManager {
 				.filter((file) => isVisibleGlobPath(root, file));
 		});
 		const patterns = entries.filter(isOverridePattern);
-		const allFiles = new Set<string>();
+		const discovered = this.collectSelectedPackagePaths(resolved, resourceType, selectPath);
+		const allFiles: string[] = [];
 		const aliases = new Map<string, Set<string>>();
-		for (const path of resolved) {
-			const declaration = this.collectSelectedPackagePaths([path], resourceType, selectPath);
-			for (const file of declaration.allFiles) {
-				const matches = (alias?: string) =>
-					applyPatterns(
-						[file],
-						patterns,
-						root,
-						root,
-						alias === undefined ? undefined : new Map([[file, new Set([alias])]]),
-					).has(file);
-				const spellings = declaration.aliases.get(file);
-				const surviving = [...(spellings?.size ? spellings : [file])].filter(matches);
-				if (surviving.length === 0) continue;
-				allFiles.add(file);
-				if (surviving.length) aliases.set(file, new Set([...(aliases.get(file) ?? []), ...surviving]));
-			}
+		for (const file of discovered.allFiles) {
+			const spellings = discovered.aliases.get(file) ?? new Set([file]);
+			const surviving = [...spellings].filter((alias) =>
+				matchesPackageDeclaration(file, alias, spellings, patterns, root),
+			);
+			if (surviving.length === 0) continue;
+			allFiles.push(file);
+			aliases.set(file, new Set(surviving));
 		}
-		return { allFiles: [...allFiles], aliases };
+		return { allFiles, aliases };
 	}
 
 	private collectSelectedPackagePaths(

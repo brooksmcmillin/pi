@@ -1776,7 +1776,7 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32").each(["default", "delta", "absolute-delta", "manifest"])(
+	it.skipIf(process.platform === "win32").each(["default", "delta", "absolute-delta", "manifest", "manifest-only"])(
 		"loads a selected checkout's prompt symlink from its selected target (%s)",
 		async (mode) => {
 			setupRemoteAndInstall();
@@ -1784,17 +1784,19 @@ describe("DefaultPackageManager git update", () => {
 			const target = mode === "default" ? "review.md" : "prompts/review.md";
 			createCommit(remoteDir, target, "Retained review", "Add review target");
 			symlinkSync(join(installedDir, target), join(remoteDir, "prompts", "quick.md"));
-			if (mode !== "default") {
+			if (mode !== "default" && mode !== "manifest-only") {
 				const exclusion = mode === "absolute-delta" ? join(installedDir, target) : target;
 				settingsManager.setPackages([
 					{ source: gitSource, autoload: mode === "manifest", prompts: ["+prompts/quick.md", `-${exclusion}`] },
 				]);
 			}
-			if (mode === "manifest") {
+			if (mode === "manifest" || mode === "manifest-only") {
 				createCommit(
 					remoteDir,
 					"package.json",
-					JSON.stringify({ pi: { prompts: ["prompts/quick.md", target] } }),
+					JSON.stringify({
+						pi: { prompts: ["prompts/quick.md", target, ...(mode === "manifest-only" ? [`-${target}`] : [])] },
+					}),
 					"Declare prompts",
 				);
 			}
