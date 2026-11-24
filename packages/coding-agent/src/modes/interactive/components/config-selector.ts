@@ -761,11 +761,11 @@ class ResourceList implements Component, Focusable {
 			return enabled ? "unload" : "load";
 		}
 		if (state === "unload") return inheritedEnabled ? "load" : "inherit";
-		if (this.hasMixedProjectDeclarationOverrides(item) && !this.isInheritedGlobalItem(item)) return "unload";
+		if (this.hasProjectDeclarationExclusion(item) && !this.isInheritedGlobalItem(item)) return "unload";
 		return inheritedEnabled ? "inherit" : "unload";
 	}
 
-	private hasMixedProjectDeclarationOverrides(item: ResourceItem): boolean {
+	private hasProjectDeclarationExclusion(item: ResourceItem): boolean {
 		if (
 			item.metadata.origin !== "top-level" ||
 			item.metadata.scope !== "project" ||
@@ -773,17 +773,16 @@ class ResourceList implements Component, Focusable {
 		)
 			return false;
 		const entries = this.settingsManager.getProjectSettings()[item.resourceType] ?? [];
-		const matches = (prefix: string) =>
-			entries.some(
-				(entry) => entry.startsWith(prefix) && this.matchesGitRevisionOverride(item, entry.slice(1), "project"),
-			);
-		return matches("+") && matches("-");
+		// Excluding one declaration need not disable the entire row.
+		return entries.some(
+			(entry) => entry.startsWith("-") && this.matchesGitRevisionOverride(item, entry.slice(1), "project"),
+		);
 	}
 
 	private getProjectOverrideState(item: ResourceItem): ProjectOverrideState {
 		if (this.writeScope !== "project") return "inherit";
 		if (item.metadata.origin === "top-level") {
-			if (this.hasMixedProjectDeclarationOverrides(item)) return item.enabled ? "load" : "unload";
+			if (this.hasProjectDeclarationExclusion(item)) return item.enabled ? "load" : "unload";
 			const entries = (this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[];
 			const patterns = this.getTopLevelOverridePatterns(item, "project");
 			for (const entry of entries) {

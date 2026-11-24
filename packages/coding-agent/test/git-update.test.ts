@@ -1861,6 +1861,7 @@ describe("DefaultPackageManager git update", () => {
 			"multi-load",
 			"project-multi-load",
 			"project-mixed",
+			"project-exclusion-only",
 		])(
 		"does not discover a hidden prompt target independently of its excluded directory alias (%s)",
 		async (source) => {
@@ -1882,7 +1883,8 @@ describe("DefaultPackageManager git update", () => {
 			const auto = source === "auto-exact" || source === "auto-glob";
 			const external = source === "external-exact" || auto;
 			const mixed = source === "project-mixed";
-			const projectMode = source === "project-multi-load" || mixed;
+			const partial = mixed || source === "project-exclusion-only";
+			const projectMode = source === "project-multi-load" || partial;
 			const multi = source === "multi-load" || projectMode;
 			const directory = source === "external-directory" || multi;
 			const exact = external || directory || source === "settings-exact";
@@ -1930,10 +1932,10 @@ describe("DefaultPackageManager git update", () => {
 				return;
 			}
 			if (multi) {
-				if (mixed) {
+				if (partial) {
 					settingsManager.setProjectPromptTemplatePaths([
 						declared,
-						`+${join(declared, "first.md")}`,
+						...(mixed ? [`+${join(declared, "first.md")}`] : []),
 						`-${join(declared, "second.md")}`,
 					]);
 					await loader.reload();
@@ -1942,7 +1944,7 @@ describe("DefaultPackageManager git update", () => {
 				const resolved = await packageManager.resolve();
 				expect(resolved.prompts).toHaveLength(1);
 				const row = { ...resolved.prompts[0]!, resourceType: "prompts" as const };
-				expect(row.enabled).toBe(mixed);
+				expect(row.enabled).toBe(partial);
 				expect(row.metadata.gitRevision?.declarations).toHaveLength(2);
 				const noop = () => {};
 				const selector = new ConfigSelectorComponent(
@@ -1969,10 +1971,10 @@ describe("DefaultPackageManager git update", () => {
 					getProjectOverrideState(item: typeof row): string;
 					toggleResource(item: typeof row): boolean;
 				};
-				if (mixed) expect(list.getProjectOverrideState(row)).toBe("load");
-				expect(list.toggleResource(row)).toBe(!mixed);
+				if (partial) expect(list.getProjectOverrideState(row)).toBe("load");
+				expect(list.toggleResource(row)).toBe(!partial);
 				await loader.reload();
-				if (mixed) {
+				if (partial) {
 					expect(loader.getPrompts().prompts).toEqual([]);
 					return;
 				}
