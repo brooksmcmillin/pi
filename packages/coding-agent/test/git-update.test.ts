@@ -2265,9 +2265,9 @@ describe("DefaultPackageManager git update", () => {
 		]);
 	});
 
-	it.skipIf(process.platform === "win32")(
-		"keeps the same filtered prompt winner with interleaved Git aliases",
-		async () => {
+	it.skipIf(process.platform === "win32").each(["force-include", "manifest-exclusion", "settings-exclusion"])(
+		"keeps the same prompt winner with interleaved Git aliases (%s)",
+		async (mode) => {
 			setupRemoteAndInstall();
 			createCommit(remoteDir, "shared.md", "Aliased prompt", "Add shared prompt");
 			for (const dir of ["a", "b", "c"]) mkdirSync(join(remoteDir, dir));
@@ -2280,12 +2280,23 @@ describe("DefaultPackageManager git update", () => {
 				remoteDir,
 				"package.json",
 				JSON.stringify({
-					pi: { prompts: ["a/first.md", "b/review.md", "c/review.md", "!a/first.md", "+a/first.md"] },
+					pi: {
+						prompts: [
+							"a/first.md",
+							"b/review.md",
+							"c/review.md",
+							...(mode === "settings-exclusion" ? [] : ["!a/first.md"]),
+							...(mode === "force-include" ? ["+a/first.md"] : []),
+						],
+					},
 				}),
 				"Declare filtered prompts",
 			);
 			git(["pull", "--ff-only"], installedDir);
-			settingsManager.setPackages([{ source: gitSource, prompts: ["**/*.md"] }]);
+			if (mode !== "manifest-exclusion")
+				settingsManager.setPackages([
+					{ source: gitSource, prompts: ["**/*.md", ...(mode === "settings-exclusion" ? ["-a/first.md"] : [])] },
+				]);
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			const verifyWinner = async (checkout: string) => {
 				await loader.reload();
@@ -2300,6 +2311,20 @@ describe("DefaultPackageManager git update", () => {
 			await verifyWinner(selected());
 		},
 	);
+
+	it("keeps a nested extension entry outside its discovery directory when filtering a manifest", async () => {
+		const local = join(tempDir, "local-package");
+		const nested = join(local, "extensions", "plugin");
+		mkdirSync(nested, { recursive: true });
+		writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { extensions: ["extensions"] } }));
+		writeFileSync(join(nested, "package.json"), JSON.stringify({ pi: { extensions: ["../../worker.ts"] } }));
+		const worker = join(local, "worker.ts");
+		writeFileSync(worker, "export default function() {}");
+		settingsManager.setPackages([{ source: local, extensions: ["**/*.ts"] }]);
+		expect((await packageManager.resolve()).extensions).toContainEqual(
+			expect.objectContaining({ path: worker, enabled: true }),
+		);
+	});
 
 	it("preserves the fallback name of a manifest-declared root skill across publication", async () => {
 		setupRemoteAndInstall();

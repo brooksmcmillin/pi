@@ -682,7 +682,8 @@ function collectAutoExtensionEntries(
 		const files = resolveExtensionEntries(selected, selectPath);
 		if ((recordDirect || original !== selected) && rememberAlias) {
 			for (const file of files ?? []) {
-				if (isPathInside(selected, file)) rememberAlias(file, join(original, relative(selected, file)));
+				if (recordDirect || isPathInside(selected, file))
+					rememberAlias(file, join(original, relative(selected, file)));
 			}
 		}
 		return files;
@@ -3172,7 +3173,12 @@ export class DefaultPackageManager implements PackageManager {
 		manifest: PiManifest | null,
 		selectPath: (path: string) => string,
 	): void {
-		const { allFiles, aliases } = this.collectManifestFiles(packageRoot, resourceType, manifest, selectPath);
+		const { allFiles, aliases, filesBySpelling } = this.collectManifestFiles(
+			packageRoot,
+			resourceType,
+			manifest,
+			selectPath,
+		);
 
 		if (userPatterns.length === 0) {
 			// Empty array explicitly disables all resources of this type
@@ -3182,8 +3188,9 @@ export class DefaultPackageManager implements PackageManager {
 			return;
 		}
 
-		// Apply user patterns
-		for (const f of allFiles) {
+		// Rank each row by its winning spelling, not an earlier rejected alias.
+		const order = new Map([...filesBySpelling.keys()].map((spelling, index) => [spelling, index]));
+		const rows = allFiles.map((f) => {
 			const spellings = aliases?.get(f);
 			const declaration = chooseResourceAlias(spellings, (alias) =>
 				matchesPackageDeclaration(
@@ -3196,8 +3203,12 @@ export class DefaultPackageManager implements PackageManager {
 				),
 			);
 			const allAliases = new Set([...(declaration.aliases ?? []), ...(aliases?.get(f) ?? [])]);
-			this.addResource(target, f, this.withPackageAliases(metadata, allAliases), declaration.enabled);
-		}
+			const spelling = declaration.aliases?.values().next().value ?? f;
+			return { f, allAliases, enabled: declaration.enabled, rank: order.get(spelling) ?? Number.MAX_SAFE_INTEGER };
+		});
+		rows.sort((a, b) => a.rank - b.rank);
+		for (const row of rows)
+			this.addResource(target, row.f, this.withPackageAliases(metadata, row.allAliases), row.enabled);
 	}
 
 	private applyPackageDeltaFilter(
@@ -3238,26 +3249,13 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		manifest: PiManifest | null,
 		selectPath: (path: string) => string,
-	): { allFiles: string[]; enabledByManifest: Set<string>; aliases?: Map<string, Set<string>> } {
+	) {
 		const entries = manifest?.[resourceType];
 		if (entries && entries.length > 0) {
-			const { allFiles, aliases } = this.collectFilesFromManifestEntries(
-				entries,
-				packageRoot,
-				resourceType,
-				selectPath,
-				true,
-			);
-			return { allFiles, enabledByManifest: new Set(allFiles), aliases };
+			return this.collectFilesFromManifestEntries(entries, packageRoot, resourceType, selectPath, true);
 		}
 
-		const { allFiles, aliases } = this.collectSelectedPackagePaths(
-			[join(packageRoot, resourceType)],
-			resourceType,
-			selectPath,
-			true,
-		);
-		return { allFiles, aliases, enabledByManifest: new Set(allFiles) };
+		return this.collectSelectedPackagePaths([join(packageRoot, resourceType)], resourceType, selectPath, true);
 	}
 
 	private addManifestEntries(
@@ -3307,29 +3305,24 @@ export class DefaultPackageManager implements PackageManager {
 		const discovered = this.collectSelectedPackagePaths(resolved, resourceType, selectPath);
 		const allFiles: string[] = [];
 		const aliases = new Map<string, Set<string>>();
-		if (preserveFilterOrder) {
-			// Filters used to consume applyPatterns' order, including restored matches at the end.
-			const filesBySpelling = discovered.filesBySpelling;
-			for (const spelling of applyPatterns([...filesBySpelling.keys()], patterns, root)) {
-				const file = filesBySpelling.get(spelling)!;
-				let spellings = aliases.get(file);
-				if (!spellings) {
-					allFiles.push(file);
-					spellings = new Set<string>();
-					aliases.set(file, spellings);
-				}
-				spellings.add(spelling);
+		const declarations = discovered.filesBySpelling;
+		const enabled = applyPatterns([...declarations.keys()], patterns, root);
+		// Settings filters have historically consumed force-includes at the end.
+		const order = preserveFilterOrder ? enabled : declarations.keys();
+		const filesBySpelling = new Map<string, string>();
+		for (const spelling of order) {
+			if (!enabled.has(spelling)) continue;
+			const file = declarations.get(spelling)!;
+			filesBySpelling.set(spelling, file);
+			let spellings = aliases.get(file);
+			if (!spellings) {
+				allFiles.push(file);
+				spellings = new Set<string>();
+				aliases.set(file, spellings);
 			}
-			return { allFiles, aliases };
+			spellings.add(spelling);
 		}
-		for (const file of discovered.allFiles) {
-			const spellings = discovered.aliases.get(file) ?? new Set([file]);
-			const surviving = [...spellings].filter((alias) => applyPatterns([alias], patterns, root).has(alias));
-			if (surviving.length === 0) continue;
-			allFiles.push(file);
-			aliases.set(file, new Set(surviving));
-		}
-		return { allFiles, aliases };
+		return { allFiles, aliases, filesBySpelling };
 	}
 
 	private collectSelectedPackagePaths(
