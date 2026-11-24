@@ -1776,7 +1776,9 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "win32").each(["default", "delta", "absolute-delta", "manifest", "manifest-only"])(
+	it
+		.skipIf(process.platform === "win32")
+		.each(["default", "delta", "absolute-delta", "manifest", "manifest-only", "manifest-undeclared-target"])(
 		"loads a selected checkout's prompt symlink from its selected target (%s)",
 		async (mode) => {
 			setupRemoteAndInstall();
@@ -1784,18 +1786,24 @@ describe("DefaultPackageManager git update", () => {
 			const target = mode === "default" ? "review.md" : "prompts/review.md";
 			createCommit(remoteDir, target, "Retained review", "Add review target");
 			symlinkSync(join(installedDir, target), join(remoteDir, "prompts", "quick.md"));
-			if (mode !== "default" && mode !== "manifest-only") {
+			if (mode === "delta" || mode === "absolute-delta" || mode === "manifest") {
 				const exclusion = mode === "absolute-delta" ? join(installedDir, target) : target;
 				settingsManager.setPackages([
 					{ source: gitSource, autoload: mode === "manifest", prompts: ["+prompts/quick.md", `-${exclusion}`] },
 				]);
 			}
-			if (mode === "manifest" || mode === "manifest-only") {
+			if (mode.startsWith("manifest")) {
 				createCommit(
 					remoteDir,
 					"package.json",
 					JSON.stringify({
-						pi: { prompts: ["prompts/quick.md", target, ...(mode === "manifest-only" ? [`-${target}`] : [])] },
+						pi: {
+							prompts: [
+								"prompts/quick.md",
+								...(mode === "manifest-undeclared-target" ? [] : [target]),
+								...(mode === "manifest" ? [] : [`-${target}`]),
+							],
+						},
 					}),
 					"Declare prompts",
 				);
@@ -1819,6 +1827,36 @@ describe("DefaultPackageManager git update", () => {
 				}),
 			]);
 			expect(readFileSync(join(installedDir, target), "utf8")).toBe("Retained review");
+		},
+	);
+
+	it.skipIf(process.platform === "win32").each([false, true])(
+		"resolves a checkout-local changelog after publication (external: %s)",
+		async (external) => {
+			setupRemoteAndInstall();
+			mkdirSync(join(remoteDir, "extensions"));
+			createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add extension");
+			createCommit(remoteDir, "notes.md", "Old notes", "Add notes");
+			const outside = join(tempDir, "outside.md");
+			writeFileSync(outside, "External notes");
+			symlinkSync(external ? outside : join(installedDir, "notes.md"), join(remoteDir, "CHANGELOG.md"));
+			git(["add", "CHANGELOG.md"], remoteDir);
+			git(["commit", "-m", "Add changelog link"], remoteDir);
+			git(["pull", "--ff-only"], installedDir);
+			const changelog = async () =>
+				(await packageManager.resolve()).extensions.find(({ path }) => basename(path) === "worker.ts")?.metadata
+					.changelogPath;
+			const before = await changelog();
+			if (external) expect(before).toBeUndefined();
+			else expect(readFileSync(before!, "utf8")).toBe("Old notes");
+			createCommit(remoteDir, "notes.md", "New notes", "Update notes");
+			await packageManager.update();
+			const after = await changelog();
+			if (external) expect(after).toBeUndefined();
+			else {
+				expect(after).toBe(join(selected(), "notes.md"));
+				expect(readFileSync(after!, "utf8")).toBe("New notes");
+			}
 		},
 	);
 

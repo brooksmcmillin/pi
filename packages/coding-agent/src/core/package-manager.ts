@@ -760,11 +760,15 @@ function isPathInside(parent: string, child: string): boolean {
 	);
 }
 
-function resolvePackageChangelogPath(packageRoot: string, manifest: PiManifest | null): string | undefined {
+function resolvePackageChangelogPath(
+	packageRoot: string,
+	manifest: PiManifest | null,
+	selectPath: (path: string) => string,
+): string | undefined {
 	const changelogPath = manifest?.changelogPath ?? "CHANGELOG.md";
 	if (!changelogPath) return undefined;
 
-	const resolvedPath = resolve(packageRoot, changelogPath);
+	const resolvedPath = selectPath(resolve(packageRoot, changelogPath));
 	if (!existsSync(resolvedPath)) return undefined;
 
 	const canonicalPackageRoot = canonicalizePath(packageRoot);
@@ -3034,7 +3038,7 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		const selectPath = (path: string) => DefaultPackageManager.selectGitResourcePath(path, accumulator.gitRevisions);
 		const manifest = readPiManifest(selectPath(join(packageRoot, "package.json")));
-		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
+		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest, selectPath);
 		if (changelogPath) {
 			metadata.changelogPath = changelogPath;
 		} else {
@@ -3275,9 +3279,7 @@ export class DefaultPackageManager implements PackageManager {
 		const aliases = new Map<string, Set<string>>();
 		for (const file of discovered.allFiles) {
 			const spellings = discovered.aliases.get(file) ?? new Set([file]);
-			const surviving = [...spellings].filter((alias) =>
-				matchesPackageDeclaration(file, alias, spellings, patterns, root),
-			);
+			const surviving = [...spellings].filter((alias) => applyPatterns([alias], patterns, root).has(alias));
 			if (surviving.length === 0) continue;
 			allFiles.push(file);
 			aliases.set(file, new Set(surviving));
