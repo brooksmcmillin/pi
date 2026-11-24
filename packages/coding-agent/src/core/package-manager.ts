@@ -3670,14 +3670,14 @@ export class DefaultPackageManager implements PackageManager {
 	): void {
 		if (!path) return;
 		const existing = map.get(path);
-		// An explicit top-level exclusion must survive selection collapsing an alias
-		// onto a package entry. A plain declaration does not undo a package exclusion.
+		// Selection can collapse distinct spellings before canonical precedence runs.
+		// Keep a package exclusion even when a top-level alias is enabled.
 		if (
 			!existing ||
-			(!enabled &&
+			((!enabled || existing.enabled) &&
 				metadata.origin === "top-level" &&
 				metadata.gitRevision?.aliases?.some((alias) => alias !== path) &&
-				existing.metadata.origin === "package")
+				resourcePrecedenceRank(metadata) < resourcePrecedenceRank(existing.metadata))
 		) {
 			map.set(path, { metadata, enabled });
 		}

@@ -1463,12 +1463,15 @@ describe("DefaultPackageManager git update", () => {
 
 	it.skipIf(process.platform === "win32")("keeps the prompt alias name while loading selected content", async () => {
 		setupRemoteAndInstall();
-		createCommit(remoteDir, "review.md", "Old review", "Add review prompt");
+		mkdirSync(join(remoteDir, "prompts"));
+		createCommit(remoteDir, "prompts/review.md", "Old review", "Add review prompt");
 		git(["pull", "--ff-only"], installedDir);
 		mkdirSync(join(agentDir, "prompts"));
-		symlinkSync(join(installedDir, "review.md"), join(agentDir, "prompts", "quick.md"));
-		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
-		createCommit(remoteDir, "review.md", "Selected review", "Update review prompt");
+		symlinkSync(join(installedDir, "prompts", "review.md"), join(agentDir, "prompts", "quick.md"));
+		const before = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await before.reload();
+		expect(before.getPrompts().prompts).toEqual([expect.objectContaining({ name: "quick", content: "Old review" })]);
+		createCommit(remoteDir, "prompts/review.md", "Selected review", "Update review prompt");
 		await packageManager.update();
 		await settingsManager.flush();
 		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
@@ -1477,7 +1480,7 @@ describe("DefaultPackageManager git update", () => {
 			expect.objectContaining({
 				name: "quick",
 				content: "Selected review",
-				filePath: join(selected(), "review.md"),
+				filePath: join(selected(), "prompts", "review.md"),
 			}),
 		]);
 	});
