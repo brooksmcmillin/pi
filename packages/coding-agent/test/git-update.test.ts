@@ -2240,6 +2240,28 @@ describe("DefaultPackageManager git update", () => {
 		expect(getCurrentCommit(selected(pinnedSource))).toBe(pinnedCommit);
 	});
 
+	it("preserves the fallback name of a manifest-declared root skill across publication", async () => {
+		setupRemoteAndInstall();
+		vi.stubEnv(process.platform === "win32" ? "USERPROFILE" : "HOME", tempDir);
+		createCommit(remoteDir, "SKILL.md", "---\ndescription: Root skill fixture\n---\nRoot skill", "Add root skill");
+		createCommit(remoteDir, "package.json", JSON.stringify({ pi: { skills: ["SKILL.md"] } }), "Declare root skill");
+		git(["pull", "--ff-only"], installedDir);
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		const name = basename(installedDir);
+		await loader.reload();
+		expect(loader.getSkills().skills).toEqual([
+			expect.objectContaining({ name, filePath: join(installedDir, "SKILL.md") }),
+		]);
+		createCommit(remoteDir, "extension.ts", "// advance revision", "Advance revision");
+		await packageManager.update();
+		const active = selected();
+		expect(active).not.toBe(installedDir);
+		await loader.reload();
+		expect(loader.getSkills().skills).toEqual([
+			expect.objectContaining({ name, filePath: join(active, "SKILL.md"), baseDir: active }),
+		]);
+	});
+
 	it("preserves an exclusion of a root skill by its previous revision directory", async () => {
 		setupRemoteAndInstall();
 		createCommit(

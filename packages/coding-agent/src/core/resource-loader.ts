@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from "node:fs";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { detectCapabilities, getTerminalColorMode, type TerminalColorMode } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME } from "../config.ts";
@@ -962,8 +962,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 				agentDir: this.agentDir,
 				skillPaths,
 				selectPathForRoot: this.resourceSelectors?.skills,
-				getDiscoveredPath: (path) =>
-					this.getDiscoveredResourceAlias(this.discoveredMetadata?.skills.get(path), ".md"),
+				getDiscoveredPath: (path) => {
+					const metadata = this.discoveredMetadata?.skills.get(path);
+					const alias = this.getDiscoveredResourceAlias(metadata, ".md");
+					const revision = metadata?.gitRevision;
+					if (
+						(!alias || alias === path) &&
+						revision &&
+						path.endsWith(".md") &&
+						isPathWithin(revision.active, path)
+					) {
+						return join(revision.logical, relative(revision.active, path));
+					}
+					return alias;
+				},
 				includeDefaults: false,
 			});
 		}
