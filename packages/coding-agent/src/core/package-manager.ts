@@ -885,6 +885,8 @@ function applyAutoloadDisabledPatterns(allPaths: string[], patterns: string[], b
 	return result;
 }
 
+class GitRevisionPointerError extends Error {}
+
 export class DefaultPackageManager implements PackageManager {
 	private cwd: string;
 	private agentDir: string;
@@ -961,8 +963,13 @@ export class DefaultPackageManager implements PackageManager {
 			return existsSync(path) ? path : undefined;
 		}
 		if (parsed.type === "git") {
-			const path = this.getGitInstallPath(parsed, scope);
-			return existsSync(path) ? path : undefined;
+			try {
+				const path = this.getGitInstallPath(parsed, scope);
+				return existsSync(path) ? path : undefined;
+			} catch (error) {
+				if (error instanceof GitRevisionPointerError) return undefined;
+				throw error;
+			}
 		}
 		if (parsed.type === "local") {
 			const baseDir = this.getBaseDirForScope(scope);
@@ -1530,18 +1537,7 @@ export class DefaultPackageManager implements PackageManager {
 				metadata.baseDir = installedPath;
 				metadata.packageRoot = installedPath;
 				const logicalPath = this.getGitStoragePath(parsed, resolvedScope);
-				const revisionFilter = filter && logicalPath !== installedPath ? { ...filter } : filter;
-				if (revisionFilter && revisionFilter !== filter) {
-					const prefix = `${toPosixPath(logicalPath)}/`;
-					for (const type of RESOURCE_TYPES) {
-						revisionFilter[type] = filter?.[type]?.map((pattern) => {
-							const modifier = /^[!+-]/.test(pattern) ? pattern[0] : "";
-							const body = toPosixPath(pattern.slice(modifier.length));
-							return body.startsWith(prefix) ? `${modifier}${body.slice(prefix.length)}` : pattern;
-						});
-					}
-				}
-				this.collectPackageResources(installedPath, accumulator, revisionFilter, metadata);
+				this.collectPackageResources(installedPath, accumulator, filter, metadata, logicalPath);
 			}
 		}
 		return installFailures;
@@ -2298,7 +2294,7 @@ export class DefaultPackageManager implements PackageManager {
 				writeFileSync(pending, basename(staged), "utf8");
 				renameSync(pending, `${state}.current`);
 				published = true;
-				if (interruptedLegacyUpdate) rmSync(markerPath, { force: true });
+				if (interruptedLegacyUpdate) await this.removeGitUpdateFiles(markerPath, { recursive: false });
 			} finally {
 				release();
 			}
@@ -2345,9 +2341,9 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async removeGitUpdateFiles(path: string): Promise<void> {
+	private async removeGitUpdateFiles(path: string, { recursive } = { recursive: true }): Promise<void> {
 		try {
-			await rm(path, { recursive: true, force: true });
+			await rm(path, { recursive, force: true });
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : String(error);
 			this.emitProgress({
@@ -2388,7 +2384,13 @@ export class DefaultPackageManager implements PackageManager {
 		const state = this.getGitUpdateStatePath(targetDir, scope);
 		const release = this.lockGitCheckout(state);
 		try {
-			const selected = this.readSelectedGitRevision(targetDir, state);
+			let selected = targetDir;
+			try {
+				selected = this.readSelectedGitRevision(targetDir, state);
+			} catch (error) {
+				if (!(error instanceof GitRevisionPointerError)) throw error;
+				// Only remove the logical checkout and revisions belonging to this package key.
+			}
 			if (existsSync(dirname(targetDir))) {
 				const prefix = `.pi-revision-${basename(state)}-`;
 				for (const entry of readdirSync(dirname(targetDir))) {
@@ -2536,11 +2538,11 @@ export class DefaultPackageManager implements PackageManager {
 			name = readFileSync(pointer, "utf8");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return logicalDir;
-			throw error;
+			throw new GitRevisionPointerError(`Could not read Git revision pointer at ${pointer}`, { cause: error });
 		}
 		const prefix = `.pi-revision-${basename(state)}-`;
 		if (!name.startsWith(prefix) || !/^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) {
-			throw new Error(`Invalid Git revision pointer at ${pointer}`);
+			throw new GitRevisionPointerError(`Invalid Git revision pointer at ${pointer}`);
 		}
 		return join(dirname(logicalDir), name);
 	}
@@ -2622,6 +2624,7 @@ export class DefaultPackageManager implements PackageManager {
 		accumulator: ResourceAccumulator,
 		filter: PackageFilter | undefined,
 		metadata: PathMetadata,
+		filterRoot = packageRoot,
 	): boolean {
 		const manifest = readPiManifest(join(packageRoot, "package.json"));
 		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
@@ -2636,9 +2639,9 @@ export class DefaultPackageManager implements PackageManager {
 				const patterns = filter[resourceType];
 				const target = this.getTargetMap(accumulator, resourceType);
 				if (filter.autoload === false) {
-					this.applyPackageDeltaFilter(packageRoot, patterns ?? [], resourceType, target, metadata);
+					this.applyPackageDeltaFilter(packageRoot, patterns ?? [], resourceType, target, metadata, filterRoot);
 				} else if (patterns !== undefined) {
-					this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata);
+					this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata, filterRoot);
 				} else {
 					this.collectDefaultResources(packageRoot, resourceType, target, metadata);
 				}
@@ -2703,6 +2706,7 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
+		filterRoot: string,
 	): void {
 		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType);
 
@@ -2715,10 +2719,11 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		// Apply user patterns
-		const enabledByUser = applyPatterns(allFiles, userPatterns, packageRoot);
+		const paths = allFiles.map((file) => this.packageFilterPath(file, packageRoot, filterRoot));
+		const enabledByUser = applyPatterns(paths, userPatterns, filterRoot);
 
-		for (const f of allFiles) {
-			const enabled = enabledByUser.has(f);
+		for (const [index, f] of allFiles.entries()) {
+			const enabled = enabledByUser.has(paths[index]!);
 			this.addResource(target, f, metadata, enabled);
 		}
 	}
@@ -2729,16 +2734,25 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
+		filterRoot: string,
 	): void {
 		if (userPatterns.length === 0) {
 			return;
 		}
 
 		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType);
-		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot);
-		for (const [filePath, enabled] of enabledByUser) {
-			this.addResource(target, filePath, metadata, enabled);
+		const paths = allFiles.map((file) => this.packageFilterPath(file, packageRoot, filterRoot));
+		const enabledByUser = applyAutoloadDisabledPatterns(paths, userPatterns, filterRoot);
+		for (const [index, filePath] of allFiles.entries()) {
+			const enabled = enabledByUser.get(paths[index]!);
+			if (enabled !== undefined) this.addResource(target, filePath, metadata, enabled);
 		}
+	}
+
+	private packageFilterPath(file: string, physicalRoot: string, logicalRoot: string): string {
+		return physicalRoot !== logicalRoot && isPathInside(physicalRoot, file)
+			? join(logicalRoot, relative(physicalRoot, file))
+			: file;
 	}
 
 	/**

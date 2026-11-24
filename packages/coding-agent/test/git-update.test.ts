@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { allowNetwork } from "./test-network-env.ts";
@@ -100,6 +100,7 @@ describe("DefaultPackageManager git update", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -222,23 +223,34 @@ describe("DefaultPackageManager git update", () => {
 		expect(getFileContent(installedDir, "extension.ts")).toBe("// v1");
 	});
 
-	it("preserves an absolute package exclusion after selecting a new revision", async () => {
-		setupRemoteAndInstall();
-		mkdirSync(join(remoteDir, "extensions"));
-		createCommit(remoteDir, "extensions/excluded.ts", "export default function() {}", "Add excluded extension");
-		createCommit(remoteDir, "extensions/enabled.ts", "export default function() {}", "Add enabled extension");
-		settingsManager.setPackages([
-			{ source: gitSource, extensions: ["*", `-${join(installedDir, "extensions", "excluded.ts")}`] },
-		]);
+	it.each(["absolute", "tilde", "anchored glob"])(
+		"preserves a %s exclusion after selecting a new revision",
+		async (kind) => {
+			setupRemoteAndInstall();
+			mkdirSync(join(remoteDir, "extensions"));
+			createCommit(remoteDir, "extensions/excluded.ts", "export default function() {}", "Add excluded extension");
+			createCommit(remoteDir, "extensions/enabled.ts", "export default function() {}", "Add enabled extension");
+			const exclusion =
+				kind === "tilde"
+					? `-~/${relative(tempDir, join(installedDir, "extensions", "excluded.ts")).replaceAll("\\", "/")}`
+					: `-${join(installedDir, "extensions", "excluded.ts")}`;
+			if (kind === "tilde") vi.stubEnv(process.platform === "win32" ? "USERPROFILE" : "HOME", tempDir);
+			const patterns = kind === "anchored glob" ? [`!${join(installedDir, "*.ts")}`] : ["*", exclusion];
+			settingsManager.setPackages([{ source: gitSource, extensions: patterns }]);
 
-		await packageManager.update();
+			await packageManager.update();
 
-		const active = selected();
-		expect(active).not.toBe(installedDir);
-		const { extensions } = await packageManager.resolve();
-		expect(extensions.find((entry) => entry.path === join(active, "extensions", "excluded.ts"))?.enabled).toBe(false);
-		expect(extensions.find((entry) => entry.path === join(active, "extensions", "enabled.ts"))?.enabled).toBe(true);
-	});
+			const active = selected();
+			expect(active).not.toBe(installedDir);
+			const { extensions } = await packageManager.resolve();
+			expect(extensions.find((entry) => entry.path === join(active, "extensions", "excluded.ts"))?.enabled).toBe(
+				kind === "anchored glob",
+			);
+			expect(extensions.find((entry) => entry.path === join(active, "extensions", "enabled.ts"))?.enabled).toBe(
+				true,
+			);
+		},
+	);
 
 	it("reports an invalid revision pointer without preventing other packages from loading", async () => {
 		setupRemoteAndInstall();
@@ -259,6 +271,15 @@ describe("DefaultPackageManager git update", () => {
 		]);
 		expect(resources.extensions.some((entry) => entry.metadata.source === gitSource)).toBe(false);
 		expect(resources.extensions.some((entry) => entry.path === other && entry.enabled)).toBe(true);
+		const listed = packageManager.listConfiguredPackages();
+		expect(listed.find((entry) => entry.source === gitSource)?.installedPath).toBeUndefined();
+		expect(listed.find((entry) => entry.source === "git:github.com/test/other")?.installedPath).toBe(
+			dirname(dirname(other)),
+		);
+		await expect(packageManager.removeAndPersist(gitSource)).resolves.toBe(true);
+		expect(existsSync(active)).toBe(false);
+		expect(existsSync(installedDir)).toBe(false);
+		expect(existsSync(other)).toBe(true);
 	});
 
 	it("keeps the selected checkout when publishing another revision fails", async () => {
@@ -314,7 +335,7 @@ describe("DefaultPackageManager git update", () => {
 
 	describe("legacy interrupted updates", () => {
 		// https://github.com/earendil-works/pi/issues/11597
-		it("rebuilds a checkout marked incomplete by an older Pi version", async () => {
+		it.each([false, true])("rebuilds a legacy incomplete checkout (marker cleanup blocked: %s)", async (blocked) => {
 			setupRemoteAndInstall();
 			const newCommit = createCommit(
 				remoteDir,
@@ -325,6 +346,12 @@ describe("DefaultPackageManager git update", () => {
 
 			git(["pull", "--ff-only"], installedDir);
 			const installs: Array<string | undefined> = [];
+			const markerPath = join(dirname(installedDir), ".extension.pi-update-incomplete");
+			writeFileSync(markerPath, "");
+			const warnings: string[] = [];
+			packageManager.setProgressCallback((event) => {
+				if (event.message?.includes("Could not remove temporary Git package files")) warnings.push(event.message);
+			});
 			const managerWithInternals = packageManager as unknown as {
 				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
 			};
@@ -332,6 +359,10 @@ describe("DefaultPackageManager git update", () => {
 				const commandLine = `${command} ${args.join(" ")}`;
 				if (command === "npm") {
 					installs.push(options?.cwd);
+					if (blocked) {
+						rmSync(markerPath);
+						mkdirSync(markerPath);
+					}
 					return;
 				}
 				const result = spawnSync(command, args, { cwd: options?.cwd, encoding: "utf-8" });
@@ -339,14 +370,12 @@ describe("DefaultPackageManager git update", () => {
 					throw new Error(`Command failed: ${commandLine}\n${result.stderr}`);
 				}
 			};
-			const markerPath = join(dirname(installedDir), ".extension.pi-update-incomplete");
-			writeFileSync(markerPath, "");
-
 			await packageManager.update();
 
 			expect(getCurrentCommit(selected())).toBe(newCommit);
 			expect(installs).toEqual([expect.stringContaining(".pi-revision-")]);
-			expect(existsSync(markerPath)).toBe(false);
+			expect(existsSync(markerPath)).toBe(blocked);
+			expect(warnings).toEqual(blocked ? [expect.stringContaining(markerPath)] : []);
 		});
 	});
 
