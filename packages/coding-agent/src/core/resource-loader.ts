@@ -557,6 +557,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
+			gitRevisions: resolvedPaths.gitRevisions,
 		});
 		const installWarnings = collectPackageInstallWarnings(
 			resolvedPaths.installFailures,
@@ -713,6 +714,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
+			gitRevisions: resolvedPaths.gitRevisions,
 		});
 		const enabledExtensions = resolvedPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
 		const cliEnabledExtensions = cliExtensionPaths.extensions.filter((r) => r.enabled).map((r) => r.path);

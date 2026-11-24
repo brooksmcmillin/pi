@@ -352,6 +352,23 @@ describe("DefaultPackageManager git update", () => {
 		]);
 	});
 
+	it("resolves an explicit CLI file from the configured checkout selection", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		git(["pull", "--ff-only"], installedDir);
+		const original = join(installedDir, "extensions", "worker.ts");
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() { return 2; }", "Update worker");
+		await packageManager.update();
+		const configured = await packageManager.resolve();
+		const cli = await packageManager.resolveExtensionSources([original], {
+			temporary: true,
+			gitRevisions: configured.gitRevisions,
+		});
+		const paths = [...configured.extensions, ...cli.extensions].filter(({ path }) => basename(path) === "worker.ts");
+		expect(paths.map(({ path }) => path)).toEqual(Array(2).fill(join(selected(), "extensions", "worker.ts")));
+	});
+
 	it("pins a checkout selection when publication occurs between local and Git collection", async () => {
 		setupRemoteAndInstall();
 		mkdirSync(join(remoteDir, "extensions"));
@@ -381,6 +398,24 @@ describe("DefaultPackageManager git update", () => {
 		expect(await workers()).toEqual([expect.objectContaining({ path: join(previous, "extensions", "worker.ts") })]);
 		expect(publish).toHaveBeenCalledTimes(1);
 		expect(await workers()).toEqual([expect.objectContaining({ path: join(next, "extensions", "worker.ts") })]);
+	});
+
+	it("preserves a historical exclusion for a nested local package", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "nested", "extensions"), { recursive: true });
+		createCommit(remoteDir, "nested/extensions/worker.ts", "export default function() {}", "Add worker");
+		await packageManager.update();
+		const prior = selected();
+		settingsManager.setPackages([
+			{ source: join(installedDir, "nested"), extensions: [`-${join(prior, "nested", "extensions", "worker.ts")}`] },
+			{ source: gitSource, autoload: false },
+		]);
+		createCommit(remoteDir, "extension.ts", "// v3", "Advance revision");
+		await packageManager.update();
+		expect(selected()).not.toBe(prior);
+		expect((await packageManager.resolve()).extensions).toContainEqual(
+			expect.objectContaining({ path: join(selected(), "nested", "extensions", "worker.ts"), enabled: false }),
+		);
 	});
 
 	it("preserves an absolute filter on a local package alias of a managed checkout", async () => {
@@ -809,6 +844,12 @@ describe("DefaultPackageManager git update", () => {
 			const paths = (await packageManager.resolve()).extensions.map(({ path }) => path);
 			expect(paths).toContain(join(root, "src", "new.ts"));
 			expect(paths).not.toContain(join(root, "src", "old.ts"));
+			const local = join(agentDir, "local-package");
+			renameSync(root, local);
+			settingsManager.setPackages([local, { source: gitSource, autoload: false }]);
+			const configured = (await packageManager.resolve()).extensions.map(({ path }) => path);
+			expect(configured).toContain(join(local, "src", "new.ts"));
+			expect(configured).not.toContain(join(local, "src", "old.ts"));
 		},
 	);
 

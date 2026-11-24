@@ -98,6 +98,8 @@ export interface ResolvedResource {
 }
 
 export interface ResolvedPaths {
+	/** Checkout selection shared with explicit extension sources in the same load. */
+	gitRevisions?: ReadonlyMap<string, string>;
 	extensions: ResolvedResource[];
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
@@ -154,7 +156,7 @@ export interface PackageManager {
 	listConfiguredPackages(): ConfiguredPackage[];
 	resolveExtensionSources(
 		sources: string[],
-		options?: { local?: boolean; temporary?: boolean },
+		options?: { local?: boolean; temporary?: boolean; gitRevisions?: ReadonlyMap<string, string> },
 	): Promise<ResolvedPaths>;
 	addSourceToSettings(source: string, options?: { local?: boolean }): boolean;
 	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean;
@@ -982,24 +984,26 @@ function matchesPackagePath(
 	if (matcher(join(logicalRoot, suffix), rules, logicalRoot)) return true;
 
 	// A saved absolute filter can name an earlier revision of this same package.
-	const revisionPrefix = basename(baseDir).slice(0, -6);
-	const parent = dirname(baseDir);
 	const revisionPath = /^(.+)\/(\.pi-revision-[a-f0-9]{64}-[a-zA-Z0-9]{6})(?:\/|$)/;
+	const [, activeParent, activeRevision] = revisionPath.exec(toPosixPath(baseDir)) ?? [];
+	if (!activeParent || !activeRevision) return false;
+	const revisionPrefix = activeRevision.slice(0, -6);
+	const packageSuffix = relative(join(activeParent, activeRevision), baseDir);
 	return rules.some((rule) => {
 		const normalized = toPosixPath(normalizePath(rule));
 		if (!isAbsolute(normalized)) return false;
 		const [, savedParent, revision] = revisionPath.exec(normalized) ?? [];
 		if (!savedParent || !revision?.startsWith(revisionPrefix)) return false;
-		if (savedParent !== toPosixPath(parent)) {
+		if (savedParent !== activeParent) {
 			try {
 				const saved = statSync(savedParent);
-				const current = statSync(parent);
+				const current = statSync(activeParent);
 				if (saved.dev !== current.dev || saved.ino !== current.ino) return false;
 			} catch {
 				return false;
 			}
 		}
-		const historicalRoot = join(savedParent, revision);
+		const historicalRoot = join(savedParent, revision, packageSuffix);
 		return matcher(join(historicalRoot, suffix), [rule], historicalRoot);
 	});
 }
@@ -1242,14 +1246,15 @@ export class DefaultPackageManager implements PackageManager {
 			);
 		}
 
-		return { ...this.toResolvedPaths(accumulator), installFailures };
+		return { ...this.toResolvedPaths(accumulator), installFailures, gitRevisions: accumulator.gitRevisions };
 	}
 
 	async resolveExtensionSources(
 		sources: string[],
-		options?: { local?: boolean; temporary?: boolean },
+		options?: { local?: boolean; temporary?: boolean; gitRevisions?: ReadonlyMap<string, string> },
 	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
+		accumulator.gitRevisions = new Map(options?.gitRevisions);
 		const scope: SourceScope = options?.temporary ? "temporary" : options?.local ? "project" : "user";
 		// `-e builtin:<name>` loads a built-in extension; the resource loader reports unknown names.
 		for (const source of sources.filter((source) => source.startsWith(BUILTIN_PATH_PREFIX))) {
@@ -2868,7 +2873,9 @@ export class DefaultPackageManager implements PackageManager {
 		if (filterRoot !== packageRoot) {
 			metadata.gitRevision = { active: packageRoot, logical: filterRoot };
 		}
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
+		const manifest = readPiManifest(
+			this.redirectGitResource(join(packageRoot, "package.json"), accumulator.gitRevisions),
+		);
 		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
 		if (changelogPath) {
 			metadata.changelogPath = changelogPath;
@@ -2881,11 +2888,19 @@ export class DefaultPackageManager implements PackageManager {
 				const patterns = filter[resourceType];
 				const target = this.getTargetMap(accumulator, resourceType);
 				if (filter.autoload === false) {
-					this.applyPackageDeltaFilter(packageRoot, patterns ?? [], resourceType, target, metadata, filterRoot);
+					this.applyPackageDeltaFilter(
+						packageRoot,
+						patterns ?? [],
+						resourceType,
+						target,
+						metadata,
+						filterRoot,
+						manifest,
+					);
 				} else if (patterns !== undefined) {
-					this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata, filterRoot);
+					this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata, filterRoot, manifest);
 				} else {
-					this.collectDefaultResources(packageRoot, resourceType, target, metadata);
+					this.collectDefaultResources(packageRoot, resourceType, target, metadata, manifest);
 				}
 			}
 			return true;
@@ -2925,8 +2940,8 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
+		manifest: PiManifest | null,
 	): void {
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
 		const entries = manifest?.[resourceType];
 		if (entries) {
 			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
@@ -2949,8 +2964,9 @@ export class DefaultPackageManager implements PackageManager {
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
 		filterRoot: string,
+		manifest: PiManifest | null,
 	): void {
-		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType);
+		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType, manifest);
 
 		if (userPatterns.length === 0) {
 			// Empty array explicitly disables all resources of this type
@@ -2976,12 +2992,13 @@ export class DefaultPackageManager implements PackageManager {
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
 		filterRoot: string,
+		manifest: PiManifest | null,
 	): void {
 		if (userPatterns.length === 0) {
 			return;
 		}
 
-		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType);
+		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType, manifest);
 		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot, filterRoot);
 		for (const [filePath, enabled] of enabledByUser) this.addResource(target, filePath, metadata, enabled);
 	}
@@ -2994,8 +3011,8 @@ export class DefaultPackageManager implements PackageManager {
 	private collectManifestFiles(
 		packageRoot: string,
 		resourceType: ResourceType,
+		manifest: PiManifest | null,
 	): { allFiles: string[]; enabledByManifest: Set<string> } {
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
 		const entries = manifest?.[resourceType];
 		if (entries && entries.length > 0) {
 			const allFiles = this.collectFilesFromManifestEntries(entries, packageRoot, resourceType);
