@@ -1494,9 +1494,11 @@ describe("DefaultPackageManager git update", () => {
 		{ excluded: true, configured: true },
 		{ excluded: true, configured: "parent" },
 		{ excluded: true, configured: "parent", linkedAgentDir: true },
+		{ excluded: true, configured: "parent", directFirst: true },
+		{ excluded: true, configured: "parent", directFirst: true, excludeAlias: true },
 	])(
-		"keeps the prompt alias name while loading selected content ($excluded/$configured/$linkedAgentDir)",
-		async ({ excluded, configured, linkedAgentDir }) => {
+		"keeps the prompt alias name while loading selected content ($excluded/$configured/$linkedAgentDir/$directFirst/$excludeAlias)",
+		async ({ excluded, configured, linkedAgentDir, directFirst, excludeAlias }) => {
 			if (linkedAgentDir) {
 				const realAgentDir = join(tempDir, "real-agent");
 				mkdirSync(realAgentDir);
@@ -1518,23 +1520,33 @@ describe("DefaultPackageManager git update", () => {
 				mkdirSync(dirname(alias), { recursive: true });
 				symlinkSync(join(installedDir, "prompts", "review.md"), alias);
 			}
-			if (configured) settingsManager.setPromptTemplatePaths([alias]);
+			if (configured) {
+				const declarations = directFirst ? [join(installedDir, "prompts", "review.md"), alias] : [alias];
+				if (excludeAlias) declarations.push(`-${alias}`);
+				settingsManager.setPromptTemplatePaths(declarations);
+			}
 			if (excluded) settingsManager.setPackages([{ source: gitSource, prompts: [] }]);
 			const before = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await before.reload();
-			expect(before.getPrompts().prompts).toEqual([expect.objectContaining({ name, content: "Old review" })]);
+			expect(before.getPrompts().prompts).toEqual(
+				excludeAlias ? [] : [expect.objectContaining({ name, content: "Old review" })],
+			);
 			createCommit(remoteDir, "prompts/review.md", "Selected review", "Update review prompt");
 			await packageManager.update();
 			await settingsManager.flush();
 			const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
 			await loader.reload();
-			expect(loader.getPrompts().prompts).toEqual([
-				expect.objectContaining({
-					name,
-					content: "Selected review",
-					filePath: join(selected(), "prompts", "review.md"),
-				}),
-			]);
+			expect(loader.getPrompts().prompts).toEqual(
+				excludeAlias
+					? []
+					: [
+							expect.objectContaining({
+								name,
+								content: "Selected review",
+								filePath: join(selected(), "prompts", "review.md"),
+							}),
+						],
+			);
 		},
 	);
 

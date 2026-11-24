@@ -3340,9 +3340,20 @@ export class DefaultPackageManager implements PackageManager {
 		// the same revision mapping as declarations, even if they name a different revision.
 		const rules = this.redirectGitExactRules(patterns, baseDir, gitRevisions, aliases);
 		for (const f of allFiles) {
-			const declaration = chooseResourceAlias(aliases.get(f), (alias) =>
-				applyPatterns([f], rules, baseDir, baseDir, alias ? new Map([[f, alias]]) : undefined).has(f),
-			);
+			const spellings = aliases.get(f);
+			const matches = (alias?: Set<string>) =>
+				applyPatterns([f], rules, baseDir, baseDir, alias ? new Map([[f, alias]]) : undefined).has(f);
+			let declaration = chooseResourceAlias(spellings, matches);
+			const existing = target.get(f);
+			const revision = this.withGitRevision(metadata, f, gitRevisions).gitRevision;
+			// A direct spelling cannot override a disabled package row, but a later
+			// independent spelling can, provided its own settings rules enable it.
+			if (revision && existing?.metadata.origin === "package" && !existing.enabled && declaration.enabled) {
+				const independent = [...(spellings ?? [])].find(
+					(alias) => alias !== f && this.isIndependentGitAlias(alias, revision) && matches(new Set([alias])),
+				);
+				if (independent) declaration = { aliases: new Set([independent]), enabled: true };
+			}
 			this.addResource(
 				target,
 				f,
