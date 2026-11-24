@@ -30,7 +30,6 @@ import {
 	type PackageInstallFailure,
 	type PathMetadata,
 	type ResolvedResource,
-	redirectGitRevisionPath,
 	type TemporaryGitSelection,
 } from "./package-manager.ts";
 import type { PromptTemplate } from "./prompt-templates.ts";
@@ -654,14 +653,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.extensionsResult = this.extensionsOverride ? this.extensionsOverride(extensionsResult) : extensionsResult;
 		this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
-		const selectExplicitPath = (source: string) => {
-			const path = this.resolveResourcePath(source);
-			for (const [logical, active] of resolvedPaths.gitRevisions ?? []) {
-				const selected = redirectGitRevisionPath(path, logical, active);
-				if (selected !== undefined) return selected;
-			}
-			return path;
-		};
+		const selectExplicitPath = (source: string) =>
+			DefaultPackageManager.selectGitResourcePath(this.resolveResourcePath(source), resolvedPaths.gitRevisions);
 		const selector = (explicit: string[], discovered: string[]) => {
 			const explicitRoots = new Set(explicit.map((path) => this.resolveResourcePath(path)));
 			for (const path of discovered) explicitRoots.delete(this.resolveResourcePath(path));

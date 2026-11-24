@@ -936,6 +936,7 @@ export function redirectGitRevisionPath(
 	logical: string,
 	active: string,
 	directOnly = false,
+	onBoundary?: (prefixLength: number) => void,
 ): string | undefined {
 	function select(candidate: string, root: string): string | undefined {
 		// Windows path.relative folds case even on case-sensitive directories. Only
@@ -957,14 +958,20 @@ export function redirectGitRevisionPath(
 		const direct = select(candidate, logical);
 		if (direct) return direct;
 		const root = canonicalizePath(logical);
-		let selected: string | undefined;
+		let selected = select(canonicalizePath(candidate), root);
+		let boundary = candidate.length;
 		for (let ancestor = dirname(candidate); ; ancestor = dirname(ancestor)) {
 			const canonical = canonicalizePath(ancestor);
 			// An outer checkout alias takes precedence over symlinks inside the old checkout.
-			selected = select(join(canonical, candidate.slice(ancestor.length)), root) ?? selected;
+			const match = select(join(canonical, candidate.slice(ancestor.length)), root);
+			if (match !== undefined) {
+				selected = match;
+				boundary = ancestor.length;
+			}
 			if (dirname(ancestor) === ancestor) break;
 		}
-		return selected ?? select(canonicalizePath(candidate), root);
+		if (selected && candidate === path) onBoundary?.(boundary);
+		return selected;
 	}
 
 	const seen = new Set<string>();
@@ -2982,7 +2989,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (filterRoot !== packageRoot) {
 			metadata.gitRevision = { active: packageRoot, logical: filterRoot };
 		}
-		const selectPath = (path: string) => this.redirectPackagePath(path, accumulator.gitRevisions);
+		const selectPath = (path: string) => DefaultPackageManager.selectGitResourcePath(path, accumulator.gitRevisions);
 		const manifest = readPiManifest(selectPath(join(packageRoot, "package.json")));
 		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
 		if (changelogPath) {
@@ -3359,7 +3366,8 @@ export class DefaultPackageManager implements PackageManager {
 		return path;
 	}
 
-	private redirectPackagePath(path: string, revisions: ReadonlyMap<string, string>): string {
+	static selectGitResourcePath(path: string, revisions?: ReadonlyMap<string, string>): string {
+		if (!revisions?.size) return path;
 		let selected = path;
 		const seen = new Set([path]);
 		// A selected checkout can itself contain a link into another managed checkout.
@@ -3373,12 +3381,17 @@ export class DefaultPackageManager implements PackageManager {
 					break;
 				}
 			}
-			for (const [logical, active] of revisions) {
-				if (next !== undefined) break;
-				const candidate = redirectGitRevisionPath(selected, logical, active);
-				if (candidate !== undefined && candidate !== selected) {
-					next = candidate;
-					break;
+			if (next === undefined) {
+				let bestBoundary = Number.POSITIVE_INFINITY;
+				for (const [logical, active] of revisions) {
+					let boundary = Number.MAX_SAFE_INTEGER;
+					const candidate = redirectGitRevisionPath(selected, logical, active, false, (length) => {
+						boundary = length;
+					});
+					if (candidate !== undefined && candidate !== selected && boundary < bestBoundary) {
+						next = candidate;
+						bestBoundary = boundary;
+					}
 				}
 			}
 			if (next === undefined || seen.has(next)) break;

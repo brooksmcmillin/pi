@@ -1234,6 +1234,21 @@ describe("DefaultPackageManager git update", () => {
 			expect.objectContaining({ path: join(selected(secondSource), "added.md") }),
 		]);
 
+		const explicitLoader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+			noPromptTemplates: true,
+			additionalPromptTemplatePaths: [join(installedDir, "assets")],
+		});
+		await explicitLoader.reload();
+		expect(
+			explicitLoader
+				.getPrompts()
+				.prompts.map((prompt) => prompt.name)
+				.sort(),
+		).toEqual(["added", "excluded"]);
+
 		symlinkSync(installedDir, join(local, "resources"), "dir");
 		writeFileSync(
 			join(local, "package.json"),
@@ -1246,8 +1261,7 @@ describe("DefaultPackageManager git update", () => {
 		// The next revision replaces A's link with a real directory. A retained
 		// checkout must not redirect this declaration into B in either order.
 		git(["pull", "--ff-only"], installedDir);
-		const retainedPrefix = relative(local, join(installedDir, "assets"));
-		writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { prompts: [`${retainedPrefix}/*.md`] } }));
+		writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { prompts: ["resources/assets/*.md"] } }));
 		git(["rm", "assets"], remoteDir);
 		mkdirSync(join(remoteDir, "assets"));
 		createCommit(remoteDir, "assets/replacement.md", "New assets", "Replace assets link");
@@ -1281,6 +1295,43 @@ describe("DefaultPackageManager git update", () => {
 		await packageManager.update();
 		expect((await packageManager.resolve()).prompts).toEqual([
 			expect.objectContaining({ path: join(selected(), "added.md"), enabled: true }),
+		]);
+	});
+
+	it("persists a load override for an external manifest path across Git updates", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "review.md", "Review prompt", "Add prompt");
+		const local = join(agentDir, "local-package");
+		mkdirSync(local);
+		const declaration = relative(local, join(installedDir, "review.md")).replaceAll("\\", "/");
+		writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { prompts: [declaration] } }));
+		settingsManager.setPackages([
+			{ source: gitSource, autoload: false },
+			{ source: local, autoload: false, prompts: [`-${declaration}`] },
+		]);
+		await packageManager.update();
+		const resolved = await packageManager.resolve();
+		expect(resolved.prompts).toEqual([expect.objectContaining({ enabled: false })]);
+		const item = resolved.prompts[0]!;
+		const noop = () => {};
+		const selector = new ConfigSelectorComponent(
+			{ global: resolved, project: resolved },
+			settingsManager,
+			tempDir,
+			agentDir,
+			noop,
+			noop,
+			noop,
+		);
+		const list = selector.getResourceList() as unknown as {
+			toggleResource(resource: typeof item & { resourceType: "prompts" }): boolean;
+		};
+		expect(list.toggleResource({ ...item, resourceType: "prompts" })).toBe(true);
+		createCommit(remoteDir, "review.md", "Updated review", "Advance selection");
+		await packageManager.update();
+		expect(selected()).not.toBe(dirname(item.path));
+		expect((await packageManager.resolve()).prompts).toEqual([
+			expect.objectContaining({ path: join(selected(), "review.md"), enabled: true }),
 		]);
 	});
 

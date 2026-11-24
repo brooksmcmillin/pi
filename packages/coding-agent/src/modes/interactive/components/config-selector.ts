@@ -915,7 +915,10 @@ class ResourceList implements Component, Focusable {
 
 	private getPackageResourcePattern(item: ResourceItem): string {
 		const baseDir = item.metadata.baseDir ?? dirname(item.path);
-		const path = item.metadata.packageAliases?.find((alias) => isPathWithin(baseDir, alias)) ?? item.path;
+		const path =
+			item.metadata.packageAliases?.find((alias) => isPathWithin(baseDir, alias)) ??
+			item.metadata.packageAliases?.[0] ??
+			item.path;
 		return relative(baseDir, path);
 	}
 }
