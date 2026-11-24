@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
+import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -251,7 +252,8 @@ describe("DefaultPackageManager git update", () => {
 					? `-~/${relative(tempDir, join(installedDir, "extensions", "excluded.ts")).replaceAll("\\", "/")}`
 					: `-${join(installedDir, "extensions", "excluded.ts")}`;
 			if (kind === "tilde") vi.stubEnv(process.platform === "win32" ? "USERPROFILE" : "HOME", tempDir);
-			const patterns = kind === "anchored glob" ? [`!${join(installedDir, "*.ts")}`] : ["*", exclusion];
+			const patterns =
+				kind === "anchored glob" ? [`!${join(installedDir, "extensions", "excl*.ts")}`] : ["*", exclusion];
 			settingsManager.setPackages([{ source: gitSource, extensions: patterns }]);
 
 			await packageManager.update();
@@ -260,7 +262,7 @@ describe("DefaultPackageManager git update", () => {
 			expect(active).not.toBe(installedDir);
 			const { extensions } = await packageManager.resolve();
 			expect(extensions.find((entry) => entry.path === join(active, "extensions", "excluded.ts"))?.enabled).toBe(
-				kind === "anchored glob",
+				false,
 			);
 			expect(extensions.find((entry) => entry.path === join(active, "extensions", "enabled.ts"))?.enabled).toBe(
 				true,
@@ -268,22 +270,33 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
-	it("reports an invalid revision pointer without preventing other packages from loading", async () => {
+	it.each([false, true])("isolates invalid revision state (directory: %s)", async (directory) => {
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "extension.ts", "// v2", "Update");
 		await packageManager.update();
 		const active = selected();
 		const key = basename(active).match(/^\.pi-revision-([a-f0-9]{64})-/)?.[1];
 		if (!key) throw new Error("Expected a selected revision");
-		writeFileSync(join(agentDir, "git", ".git-update-state", `${key}.current`), "invalid");
+		const pointer = join(agentDir, "git", ".git-update-state", `${key}.current`);
+		if (directory) {
+			rmSync(pointer);
+			mkdirSync(pointer);
+		} else {
+			writeFileSync(pointer, "invalid");
+		}
 		const other = join(agentDir, "git", "github.com", "test", "other", "extensions", "healthy.ts");
-		mkdirSync(dirname(other), { recursive: true });
-		writeFileSync(other, "export default function() {}");
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/healthy.ts", "export default function() {}", "Add healthy extension");
+		git(["clone", remoteDir, dirname(dirname(other))], tempDir);
 		settingsManager.setPackages([gitSource, "git:github.com/test/other"]);
 
 		const resources = await packageManager.resolve();
 		expect(resources.installFailures).toEqual([
-			{ source: gitSource, scope: "user", message: expect.stringContaining("Invalid Git revision pointer") },
+			{
+				source: gitSource,
+				scope: "user",
+				message: expect.stringContaining(directory ? "Expected a regular file" : "Invalid Git revision pointer"),
+			},
 		]);
 		expect(resources.extensions.some((entry) => entry.metadata.source === gitSource)).toBe(false);
 		expect(resources.extensions.some((entry) => entry.path === other && entry.enabled)).toBe(true);
@@ -292,10 +305,45 @@ describe("DefaultPackageManager git update", () => {
 		expect(listed.find((entry) => entry.source === "git:github.com/test/other")?.installedPath).toBe(
 			dirname(dirname(other)),
 		);
+		createCommit(remoteDir, "extension.ts", "// v3", "Update healthy package");
+		expect(await packageManager.checkForAvailableUpdates()).toEqual([
+			expect.objectContaining({ source: "git:github.com/test/other" }),
+		]);
+		if (directory) return;
 		await expect(packageManager.removeAndPersist(gitSource)).resolves.toBe(true);
 		expect(existsSync(active)).toBe(false);
 		expect(existsSync(installedDir)).toBe(false);
 		expect(existsSync(other)).toBe(true);
+	});
+
+	it("waits for the logical checkout lock before resolving a missing selected revision", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		await packageManager.update();
+		const active = selected();
+		const key = basename(active).match(/^\.pi-revision-([a-f0-9]{64})-/)?.[1];
+		if (!key) throw new Error("Expected a selected revision");
+		const state = join(agentDir, "git", ".git-update-state", key);
+		const held = join(tempDir, "held-revision");
+		const release = lockfile.lockSync(state, { realpath: false });
+		vi.stubEnv("PI_OFFLINE", "1");
+		renameSync(active, held);
+		let settled = false;
+		const resolution = packageManager.resolve().finally(() => {
+			settled = true;
+		});
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			expect(settled).toBe(false);
+		} finally {
+			renameSync(held, active);
+			release();
+			await resolution;
+		}
+		expect(
+			(await resolution).extensions.some((entry) => entry.path === join(active, "extensions", "worker.ts")),
+		).toBe(true);
 	});
 
 	it("keeps the selected checkout when publishing another revision fails", async () => {

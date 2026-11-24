@@ -1418,10 +1418,8 @@ export class DefaultPackageManager implements PackageManager {
 					};
 				}
 
-				const installedPath = this.getGitInstallPath(parsed, entry.scope);
-				if (!existsSync(installedPath)) {
-					return undefined;
-				}
+				const installedPath = this.getInstalledPath(source, entry.scope);
+				if (!installedPath) return undefined;
 				const hasUpdate = await this.gitHasAvailableUpdate(installedPath);
 				if (!hasUpdate) {
 					return undefined;
@@ -1516,8 +1514,12 @@ export class DefaultPackageManager implements PackageManager {
 				let installedPath: string;
 				let present: boolean;
 				try {
-					installedPath = this.getGitInstallPath(parsed, resolvedScope);
-					present = await this.recoverGitCheckout(installedPath, resolvedScope);
+					const recovered = await this.recoverGitCheckout(
+						this.getGitStoragePath(parsed, resolvedScope),
+						resolvedScope,
+					);
+					present = recovered !== undefined;
+					installedPath = recovered ?? "";
 				} catch (error) {
 					installFailures.push({ source: resolvedSource, scope: resolvedScope, message: String(error) });
 					continue;
@@ -2096,8 +2098,9 @@ export class DefaultPackageManager implements PackageManager {
 
 	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const logicalDir = this.getGitStoragePath(source, scope);
-		const targetDir = this.getGitInstallPath(source, scope);
-		if (await this.recoverGitCheckout(targetDir, scope)) {
+		const recovered = await this.recoverGitCheckout(logicalDir, scope);
+		const targetDir = recovered ?? logicalDir;
+		if (recovered) {
 			if (source.ref) {
 				await this.ensureGitRef(logicalDir, targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
 				return;
@@ -2132,8 +2135,8 @@ export class DefaultPackageManager implements PackageManager {
 
 	private async updateGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const logicalDir = this.getGitStoragePath(source, scope);
-		const targetDir = this.getGitInstallPath(source, scope);
-		if (!(await this.recoverGitCheckout(targetDir, scope))) {
+		const targetDir = await this.recoverGitCheckout(logicalDir, scope);
+		if (!targetDir) {
 			await this.installGit(source, scope);
 			return;
 		}
@@ -2327,12 +2330,16 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async recoverGitCheckout(targetDir: string, scope: SourceScope): Promise<boolean> {
-		if (existsSync(targetDir)) return true;
-		const state = this.getGitUpdateStatePath(targetDir, scope);
+	private async recoverGitCheckout(logicalDir: string, scope: SourceScope): Promise<string | undefined> {
+		const state = this.getGitUpdateStatePath(logicalDir, scope);
+		const selected = this.readSelectedGitRevision(logicalDir, state);
+		if (existsSync(selected)) return selected;
 		const previous = `${state}.previous`;
 		const lockfilePath = `${state}.lock`;
-		if (!existsSync(previous) && !existsSync(lockfilePath)) return existsSync(targetDir);
+		if (!existsSync(previous) && !existsSync(lockfilePath) && selected === logicalDir) {
+			return existsSync(logicalDir) ? logicalDir : undefined;
+		}
+		this.ensureGitIgnore(dirname(state));
 		// Allow an abandoned lock to reach proper-lockfile's default 10-second stale interval.
 		const release = await lockfile
 			.lock(state, {
@@ -2342,13 +2349,16 @@ export class DefaultPackageManager implements PackageManager {
 			})
 			.catch((error: NodeJS.ErrnoException) => {
 				if (error.code !== "ELOCKED") throw error;
-				throw new Error(`Git package ${targetDir} is still locked. Retry after the other Pi operation finishes.`, {
+				throw new Error(`Git package ${logicalDir} is still locked. Retry after the other Pi operation finishes.`, {
 					cause: error,
 				});
 			});
 		try {
-			this.restoreGitBackup(targetDir, previous);
-			return existsSync(targetDir);
+			const current = this.readSelectedGitRevision(logicalDir, state);
+			if (current === logicalDir) this.restoreGitBackup(logicalDir, previous);
+			if (existsSync(current)) return current;
+			if (current !== logicalDir) throw new GitRevisionPointerError(`Selected Git checkout is missing: ${current}`);
+			return undefined;
 		} finally {
 			await release();
 		}
@@ -2564,9 +2574,11 @@ export class DefaultPackageManager implements PackageManager {
 		const pointer = `${state}.current`;
 		let name: string;
 		try {
+			if (!lstatSync(pointer).isFile()) throw new GitRevisionPointerError(`Expected a regular file at ${pointer}`);
 			name = readFileSync(pointer, "utf8");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return logicalDir;
+			if (error instanceof GitRevisionPointerError) throw error;
 			throw new GitRevisionPointerError(`Could not read Git revision pointer at ${pointer}`, { cause: error });
 		}
 		const prefix = `.pi-revision-${basename(state)}-`;
