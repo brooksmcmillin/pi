@@ -553,7 +553,8 @@ class ResourceList implements Component, Focusable {
 		});
 
 		if (enabled) {
-			updated.push(`+${pattern}`);
+			const declaration = item.metadata.gitRevision?.aliases?.[0];
+			updated.push(`+${declarations.length > 1 && declaration ? relative(baseDir, declaration) : pattern}`);
 		} else {
 			for (const target of new Set([pattern, ...this.getRowExclusionPatterns(item, scope)])) {
 				updated.push(`-${target}`);

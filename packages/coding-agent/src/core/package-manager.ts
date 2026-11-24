@@ -846,7 +846,7 @@ function isEnabledByOverrides(
 	patterns: string[],
 	baseDir: string,
 	aliases: Iterable<string> = [],
-	globReadPath?: string,
+	historicalGlobPath?: string,
 ): boolean {
 	const matches = (rules: string[], matcher: typeof matchesAnyPattern) => {
 		if (matcher(filePath, rules, baseDir)) return true;
@@ -861,7 +861,8 @@ function isEnabledByOverrides(
 	let enabled = true;
 	if (
 		excludes.length > 0 &&
-		(matches(excludes, matchesAnyPattern) || (globReadPath && matchesAnyPattern(globReadPath, excludes, baseDir)))
+		(matches(excludes, matchesAnyPattern) ||
+			(historicalGlobPath && matchesAnyPattern(historicalGlobPath, excludes, baseDir)))
 	) {
 		enabled = false;
 	}
@@ -3625,7 +3626,7 @@ export class DefaultPackageManager implements PackageManager {
 						),
 						baseDir,
 						[],
-						active,
+						selectGitDeclarationPath(spelling, revision),
 					);
 				});
 				this.addResource(
