@@ -401,6 +401,52 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
+	it.each(["root", "child"])("uses the selected manifest through an automatic %s alias", async (kind) => {
+		setupRemoteAndInstall();
+		settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
+		createCommit(remoteDir, "old.ts", "export default function() {}", "Add old entry");
+		const manifest = (entry: string) =>
+			JSON.stringify({ name: "fixture", version: "1.0.0", pi: { extensions: [entry] } });
+		createCommit(remoteDir, "package.json", manifest("./old.ts"), "Declare old entry");
+		git(["pull", "--ff-only"], installedDir);
+		const root = join(agentDir, "extensions");
+		const alias = kind === "root" ? root : join(root, "alias");
+		mkdirSync(dirname(alias), { recursive: true });
+		symlinkSync(installedDir, alias, process.platform === "win32" ? "junction" : "dir");
+		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+		settingsManager.setExtensionPaths([`-${relative(agentDir, join(alias, "new.ts"))}`]);
+		createCommit(remoteDir, "new.ts", "export default function() {}", "Add replacement");
+		createCommit(remoteDir, "package.json", manifest("./new.ts"), "Select replacement");
+		await packageManager.update();
+		const entries = (await packageManager.resolve()).extensions.filter((entry) =>
+			["old.ts", "new.ts"].includes(basename(entry.path)),
+		);
+		expect(entries).toEqual([expect.objectContaining({ path: join(selected(), "new.ts"), enabled: false })]);
+	});
+
+	it("discovers a new skill through an aliased automatic skills root", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "skills"));
+		createCommit(remoteDir, "skills/README.md", "Existing skills directory", "Add directory");
+		git(["pull", "--ff-only"], installedDir);
+		symlinkSync(
+			join(installedDir, "skills"),
+			join(agentDir, "skills"),
+			process.platform === "win32" ? "junction" : "dir",
+		);
+		settingsManager.setPackages([{ source: gitSource, autoload: false }]);
+		mkdirSync(join(remoteDir, "skills", "added"));
+		createCommit(
+			remoteDir,
+			"skills/added/SKILL.md",
+			"---\nname: added\ndescription: Fixture skill\n---\nNew skill.\n",
+			"Add skill to next revision",
+		);
+		await packageManager.update();
+		const path = join(selected(), "skills", "added", "SKILL.md");
+		expect((await packageManager.resolve()).skills).toContainEqual(expect.objectContaining({ path, enabled: true }));
+	});
+
 	it.skipIf(process.platform === "win32")("deduplicates an auto-discovered symlink to an old checkout", async () => {
 		setupRemoteAndInstall();
 		mkdirSync(join(remoteDir, "extensions"));

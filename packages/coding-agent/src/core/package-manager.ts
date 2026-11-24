@@ -635,15 +635,27 @@ function resolveExtensionEntries(dir: string): string[] | null {
 	return null;
 }
 
-function collectAutoExtensionEntries(dir: string, selectPath = (path: string) => path): string[] {
+function collectAutoExtensionEntries(
+	originalDir: string,
+	selectPath = (path: string) => path,
+	rememberAlias?: (file: string, alias: string) => void,
+): string[] {
+	const dir = selectPath(originalDir);
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
 	// First check if this directory itself has explicit extension entries (package.json or index)
-	const rootEntries = resolveExtensionEntries(dir);
-	if (rootEntries) {
-		return rootEntries;
-	}
+	const discover = (original: string, selected: string) => {
+		const files = resolveExtensionEntries(selected);
+		if (original !== selected && rememberAlias) {
+			for (const file of files ?? []) {
+				if (isPathInside(selected, file)) rememberAlias(file, join(original, relative(selected, file)));
+			}
+		}
+		return files;
+	};
+	const rootEntries = discover(originalDir, dir);
+	if (rootEntries) return rootEntries;
 
 	// Otherwise, discover extensions from directory contents
 	const ig = ignore();
@@ -675,8 +687,9 @@ function collectAutoExtensionEntries(dir: string, selectPath = (path: string) =>
 
 			if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
 				entries.push(fullPath);
+				if (originalDir !== dir) rememberAlias?.(fullPath, join(originalDir, entry.name));
 			} else if (isDir) {
-				const resolvedEntries = resolveExtensionEntries(selectPath(fullPath));
+				const resolvedEntries = discover(join(originalDir, entry.name), selectPath(fullPath));
 				if (resolvedEntries) {
 					entries.push(...resolvedEntries);
 				}
@@ -791,9 +804,17 @@ function getOverridePatterns(entries: string[]): string[] {
 	return entries.filter((pattern) => pattern.startsWith("!") || pattern.startsWith("+") || pattern.startsWith("-"));
 }
 
-function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: string, originalPath = filePath): boolean {
-	const matches = (rules: string[], matcher: typeof matchesAnyPattern) =>
-		matcher(filePath, rules, baseDir) || (originalPath !== filePath && matcher(originalPath, rules, baseDir));
+function isEnabledByOverrides(
+	filePath: string,
+	patterns: string[],
+	baseDir: string,
+	aliases: Iterable<string> = [],
+): boolean {
+	const matches = (rules: string[], matcher: typeof matchesAnyPattern) => {
+		if (matcher(filePath, rules, baseDir)) return true;
+		for (const alias of aliases) if (matcher(alias, rules, baseDir)) return true;
+		return false;
+	};
 	const overrides = getOverridePatterns(patterns);
 	const excludes = overrides.filter((pattern) => pattern.startsWith("!")).map((pattern) => pattern.slice(1));
 	const forceIncludes = overrides.filter((pattern) => pattern.startsWith("+")).map((pattern) => pattern.slice(1));
@@ -3051,6 +3072,23 @@ export class DefaultPackageManager implements PackageManager {
 			? collectAncestorAgentsSkillDirs(this.cwd).filter((dir) => !pathsEqual(dir, userAgentsSkillsDir))
 			: [];
 
+		const selectPath = (path: string) => this.redirectGitResource(path, accumulator.gitRevisions);
+		const aliases = new Map<string, Set<string>>();
+		const rememberAlias = (file: string, alias: string) => {
+			const spellings = aliases.get(file) ?? new Set<string>();
+			spellings.add(alias);
+			aliases.set(file, spellings);
+		};
+		const discoverSkills = (original: string, mode: SkillDiscoveryMode) => {
+			const selected = selectPath(original);
+			const skills = collectAutoSkillEntries(selected, mode);
+			if (selected !== original) {
+				for (const skill of skills) {
+					if (isPathInside(selected, skill)) rememberAlias(skill, join(original, relative(selected, skill)));
+				}
+			}
+			return skills;
+		};
 		const addResources = (
 			resourceType: ResourceType,
 			paths: string[],
@@ -3059,21 +3097,26 @@ export class DefaultPackageManager implements PackageManager {
 			baseDir: string,
 		) => {
 			const target = this.getTargetMap(accumulator, resourceType);
+			const discovered = new Map<string, Set<string>>();
 			for (const path of paths) {
-				const active = this.redirectGitResource(path, accumulator.gitRevisions);
+				const active = selectPath(path);
 				if (active !== path && !existsSync(active)) continue;
-				const enabled = isEnabledByOverrides(active, overrides, baseDir, path);
-				this.addResource(target, active, metadata, enabled);
+				const spellings = discovered.get(active) ?? new Set<string>();
+				if (path !== active) spellings.add(path);
+				for (const alias of aliases.get(path) ?? []) spellings.add(alias);
+				discovered.set(active, spellings);
 			}
+			for (const [active, spellings] of discovered) {
+				this.addResource(target, active, metadata, isEnabledByOverrides(active, overrides, baseDir, spellings));
+			}
+			aliases.clear();
 		};
 
 		if (projectTrusted) {
 			// Project extensions from .pi/
 			addResources(
 				"extensions",
-				collectAutoExtensionEntries(projectDirs.extensions, (path) =>
-					this.redirectGitResource(path, accumulator.gitRevisions),
-				),
+				collectAutoExtensionEntries(projectDirs.extensions, selectPath, rememberAlias),
 				projectMetadata,
 				projectOverrides.extensions,
 				projectBaseDir,
@@ -3082,7 +3125,7 @@ export class DefaultPackageManager implements PackageManager {
 			// Project skills from .pi/
 			addResources(
 				"skills",
-				collectAutoSkillEntries(projectDirs.skills, "pi"),
+				discoverSkills(projectDirs.skills, "pi"),
 				projectMetadata,
 				projectOverrides.skills,
 				projectBaseDir,
@@ -3098,7 +3141,7 @@ export class DefaultPackageManager implements PackageManager {
 			};
 			addResources(
 				"skills",
-				collectAutoSkillEntries(agentsSkillsDir, "agents"),
+				discoverSkills(agentsSkillsDir, "agents"),
 				agentsMetadata,
 				projectOverrides.skills,
 				agentsBaseDir,
@@ -3125,22 +3168,14 @@ export class DefaultPackageManager implements PackageManager {
 		// User extensions from ~/.pi/agent/
 		addResources(
 			"extensions",
-			collectAutoExtensionEntries(userDirs.extensions, (path) =>
-				this.redirectGitResource(path, accumulator.gitRevisions),
-			),
+			collectAutoExtensionEntries(userDirs.extensions, selectPath, rememberAlias),
 			userMetadata,
 			userOverrides.extensions,
 			globalBaseDir,
 		);
 
 		// User skills from ~/.pi/agent/
-		addResources(
-			"skills",
-			collectAutoSkillEntries(userDirs.skills, "pi"),
-			userMetadata,
-			userOverrides.skills,
-			globalBaseDir,
-		);
+		addResources("skills", discoverSkills(userDirs.skills, "pi"), userMetadata, userOverrides.skills, globalBaseDir);
 
 		// User skills from ~/.agents/ (with its own baseDir)
 		const userAgentsBaseDir = dirname(userAgentsSkillsDir);
@@ -3150,7 +3185,7 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		addResources(
 			"skills",
-			collectAutoSkillEntries(userAgentsSkillsDir, "agents"),
+			discoverSkills(userAgentsSkillsDir, "agents"),
 			userAgentsMetadata,
 			userOverrides.skills,
 			userAgentsBaseDir,
