@@ -1473,7 +1473,7 @@ describe("DefaultPackageManager git update", () => {
 	});
 
 	describe("temporary git sources", () => {
-		it("should refresh cached temporary git sources when resolving", async () => {
+		it.each([false, true])("refreshes cached temporary Git aliases (local first: %s)", async (localFirst) => {
 			const managerWithPaths = packageManager as unknown as PackageManagerPathInternals;
 			const cachedDir = managerWithPaths.getGitInstallPath(managerWithPaths.parseSource(gitSource), "temporary");
 
@@ -1484,20 +1484,46 @@ describe("DefaultPackageManager git update", () => {
 				JSON.stringify({ pi: { extensions: ["./pi-extensions"] } }, null, 2),
 			);
 			git(["add", "package.json"], remoteDir);
-			createCommit(remoteDir, "pi-extensions/session-breakdown.ts", "// stale", "Initial package");
+			const marker = join(tempDir, "temporary-initializations");
+			const extension = (value: string) =>
+				`import { appendFileSync } from "node:fs"; export default function() { appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
+			createCommit(remoteDir, "pi-extensions/session-breakdown.ts", extension("stale\n"), "Initial package");
 			mkdirSync(dirname(cachedDir), { recursive: true });
 			git(["clone", remoteDir, cachedDir], tempDir);
-			const newCommit = createCommit(remoteDir, "pi-extensions/session-breakdown.ts", "// fresh", "Update package");
+			const newCommit = createCommit(
+				remoteDir,
+				"pi-extensions/session-breakdown.ts",
+				extension("fresh\n"),
+				"Update package",
+			);
 			settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
 
-			const resources = await packageManager.resolveExtensionSources([gitSource], { temporary: true });
-
+			const cachedFile = join(cachedDir, "pi-extensions", "session-breakdown.ts");
+			await settingsManager.flush();
+			const loader = new DefaultResourceLoader({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+				additionalExtensionPaths: localFirst ? [cachedFile, gitSource] : [gitSource, cachedFile],
+			});
+			await loader.reload({
+				resolveProjectTrust: async ({ extensionsResult }) => {
+					const active = selected(gitSource, "temporary");
+					expect(extensionsResult.errors).toEqual([]);
+					expect(extensionsResult.extensions.map(({ path }) => path)).toEqual([
+						join(active, "pi-extensions", "session-breakdown.ts"),
+					]);
+					expect(readFileSync(marker, "utf8")).toBe("fresh\n");
+					return false;
+				},
+			});
 			const active = selected(gitSource, "temporary");
-			expect(
-				resources.extensions.some((entry) => entry.path === join(active, "pi-extensions", "session-breakdown.ts")),
-			).toBe(true);
 			expect(getCurrentCommit(active)).toBe(newCommit);
-			expect(getFileContent(active, "pi-extensions/session-breakdown.ts")).toBe("// fresh");
+			expect(loader.getExtensions().errors).toEqual([]);
+			expect(loader.getExtensions().extensions.map(({ path }) => path)).toEqual([
+				join(active, "pi-extensions", "session-breakdown.ts"),
+			]);
+			expect(readFileSync(marker, "utf8")).toBe("fresh\n");
 		});
 	});
 });

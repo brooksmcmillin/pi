@@ -1633,6 +1633,13 @@ export class DefaultPackageManager implements PackageManager {
 		missingLocalPaths?: string[],
 	): Promise<PackageInstallFailure[]> {
 		const installFailures: PackageInstallFailure[] = [];
+		const temporaryCollections: Array<() => void> = [];
+		const temporaryCheckouts = new Map<string, string>();
+		// Finish temporary Git selection before collecting resources, but retain CLI precedence.
+		const collect = (scope: SourceScope, resources: () => void) => {
+			if (scope === "temporary") temporaryCollections.push(resources);
+			else resources();
+		};
 		for (const { pkg, scope } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			const filter = typeof pkg === "object" ? pkg : undefined;
@@ -1644,7 +1651,9 @@ export class DefaultPackageManager implements PackageManager {
 
 			if (parsed.type === "local") {
 				const baseDir = this.getBaseDirForScope(resolvedScope);
-				this.resolveLocalExtensionSource(parsed, accumulator, filter, metadata, baseDir, missingLocalPaths);
+				collect(resolvedScope, () =>
+					this.resolveLocalExtensionSource(parsed, accumulator, filter, metadata, baseDir, missingLocalPaths),
+				);
 				continue;
 			}
 
@@ -1697,7 +1706,7 @@ export class DefaultPackageManager implements PackageManager {
 				}
 				metadata.baseDir = installedPath;
 				metadata.packageRoot = installedPath;
-				this.collectPackageResources(installedPath, accumulator, filter, metadata);
+				collect(resolvedScope, () => this.collectPackageResources(installedPath, accumulator, filter, metadata));
 				continue;
 			}
 
@@ -1706,11 +1715,13 @@ export class DefaultPackageManager implements PackageManager {
 				let present: boolean;
 				try {
 					const logical = this.getGitStoragePath(parsed, resolvedScope);
-					const pinned = checkoutSnapshot?.get(logical);
+					const pinned = (resolvedScope === "temporary" ? temporaryCheckouts : checkoutSnapshot)?.get(logical);
 					if (pinned !== undefined) {
 						metadata.baseDir = pinned;
 						metadata.packageRoot = pinned;
-						this.collectPackageResources(pinned, accumulator, filter, metadata, logical);
+						collect(resolvedScope, () =>
+							this.collectPackageResources(pinned, accumulator, filter, metadata, logical),
+						);
 						continue;
 					}
 					const recovered = await this.recoverGitCheckout(logical, resolvedScope);
@@ -1736,9 +1747,13 @@ export class DefaultPackageManager implements PackageManager {
 				metadata.packageRoot = installedPath;
 				const logicalPath = this.getGitStoragePath(parsed, resolvedScope);
 				if (logicalPath !== installedPath) accumulator.gitRevisions.set(logicalPath, installedPath);
-				this.collectPackageResources(installedPath, accumulator, filter, metadata, logicalPath);
+				if (resolvedScope === "temporary") temporaryCheckouts.set(logicalPath, installedPath);
+				collect(resolvedScope, () =>
+					this.collectPackageResources(installedPath, accumulator, filter, metadata, logicalPath),
+				);
 			}
 		}
+		for (const resources of temporaryCollections) resources();
 		return installFailures;
 	}
 
