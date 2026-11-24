@@ -17,7 +17,22 @@ import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { allowNetwork } from "./test-network-env.ts";
 
-const fsFixture = vi.hoisted(() => ({ aliasFrom: "", aliasTo: "", blockedRename: "" }));
+const fsFixture = vi.hoisted(() => ({
+	aliasFrom: "",
+	aliasTo: "",
+	blockedRename: "",
+	duringCopy: undefined as (() => Promise<void>) | undefined,
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const fs = await importOriginal<typeof import("node:fs/promises")>();
+	return {
+		...fs,
+		cp: (async (from, to, options) => {
+			await fsFixture.duringCopy?.();
+			await fs.cp(from, to, options);
+		}) as typeof fs.cp,
+	};
+});
 vi.mock("node:fs", async (importOriginal) => {
 	const fs = await importOriginal<typeof import("node:fs")>();
 	const map = (path: Parameters<typeof fs.existsSync>[0]) => (path === fsFixture.aliasFrom ? fsFixture.aliasTo : path);
@@ -118,6 +133,7 @@ describe("DefaultPackageManager git update", () => {
 	afterEach(() => {
 		vi.unstubAllEnvs();
 		fsFixture.blockedRename = "";
+		fsFixture.duringCopy = undefined;
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -295,6 +311,35 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
+	it.each([false, true])(
+		"deduplicates explicit extension paths after revision selection (excluded: %s)",
+		async (excluded) => {
+			setupRemoteAndInstall();
+			mkdirSync(join(remoteDir, "extensions"));
+			createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+			git(["pull", "--ff-only"], installedDir);
+			const original = join(installedDir, "extensions", "worker.ts");
+			settingsManager.setExtensionPaths([original]);
+			settingsManager.setPackages([{ source: gitSource, extensions: excluded ? ["-extensions/worker.ts"] : ["*"] }]);
+			const workers = async () =>
+				(await packageManager.resolve()).extensions.filter((entry) => basename(entry.path) === "worker.ts");
+			expect(await workers()).toEqual([expect.objectContaining({ path: original, enabled: !excluded })]);
+
+			createCommit(remoteDir, "extension.ts", "// next", "Advance revision");
+			await packageManager.update();
+			const first = join(selected(), "extensions", "worker.ts");
+			expect(first).not.toBe(original);
+			expect(await workers()).toEqual([expect.objectContaining({ path: first, enabled: !excluded })]);
+
+			settingsManager.setExtensionPaths([first]);
+			createCommit(remoteDir, "extension.ts", "// next again", "Advance revision again");
+			await packageManager.update();
+			const second = join(selected(), "extensions", "worker.ts");
+			expect(second).not.toBe(first);
+			expect(await workers()).toEqual([expect.objectContaining({ path: second, enabled: !excluded })]);
+		},
+	);
+
 	it("keeps a pinned fetch result isolated from a competing update", async () => {
 		setupRemoteAndInstall();
 		const pinnedCommit = createCommit(remoteDir, "extension.ts", "// pinned", "Pinned revision");
@@ -317,8 +362,14 @@ describe("DefaultPackageManager git update", () => {
 				await expect(competitor.update()).rejects.toMatchObject({ code: "ELOCKED" });
 			}
 		});
+		let snapshotContended = false;
+		fsFixture.duringCopy = async () => {
+			await expect(competitor.update()).rejects.toMatchObject({ code: "ELOCKED" });
+			snapshotContended = true;
+		};
 		await packageManager.update();
 		expect(competed).toBe(true);
+		expect(snapshotContended).toBe(true);
 		expect(getCurrentCommit(selected(pinnedSource))).toBe(pinnedCommit);
 	});
 

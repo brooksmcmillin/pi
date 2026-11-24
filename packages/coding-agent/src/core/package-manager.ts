@@ -2,7 +2,6 @@ import type { ChildProcess, ChildProcessByStdio } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
-	cpSync,
 	existsSync,
 	globSync,
 	lstatSync,
@@ -16,7 +15,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { rm } from "node:fs/promises";
+import { cp, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 
 function getEnv(): NodeJS.ProcessEnv {
@@ -216,6 +215,7 @@ interface UpdatedPackage extends ConfiguredUpdateSource {
 }
 
 interface ResourceAccumulator {
+	gitRevisions: Map<string, string>;
 	extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
@@ -1083,6 +1083,7 @@ export class DefaultPackageManager implements PackageManager {
 					origin: "top-level",
 				},
 				projectBaseDir,
+				accumulator.gitRevisions,
 			);
 			this.resolveLocalEntries(
 				globalEntries,
@@ -1094,6 +1095,7 @@ export class DefaultPackageManager implements PackageManager {
 					origin: "top-level",
 				},
 				globalBaseDir,
+				accumulator.gitRevisions,
 			);
 		}
 
@@ -1587,6 +1589,7 @@ export class DefaultPackageManager implements PackageManager {
 				metadata.baseDir = installedPath;
 				metadata.packageRoot = installedPath;
 				const logicalPath = this.getGitStoragePath(parsed, resolvedScope);
+				if (logicalPath !== installedPath) accumulator.gitRevisions.set(logicalPath, installedPath);
 				this.collectPackageResources(installedPath, accumulator, filter, metadata, logicalPath);
 			}
 		}
@@ -2332,16 +2335,27 @@ export class DefaultPackageManager implements PackageManager {
 		const staged = mkdtempSync(join(dirname(logicalDir), `.pi-revision-${basename(state)}-`));
 		let published = false;
 		try {
-			// Keep the checkout's refs and configuration, but never copy its installed dependencies.
-			cpSync(gitDir, join(staged, ".git"), {
-				recursive: true,
-				filter: (path) => {
-					if (lstatSync(path).isSymbolicLink()) {
-						throw new Error(`Cannot stage Git package ${targetDir}: symbolic link in Git metadata at ${path}.`);
-					}
-					return true;
-				},
-			});
+			const releaseSnapshot = this.lockGitCheckout(state);
+			try {
+				this.assertSameGitCheckout(targetDir, installed);
+				if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
+					throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
+				}
+				// Snapshot refs under the fetch lock without blocking its heartbeat.
+				await cp(gitDir, join(staged, ".git"), {
+					recursive: true,
+					filter: (path) => {
+						if (lstatSync(path).isSymbolicLink()) {
+							throw new Error(
+								`Cannot stage Git package ${targetDir}: symbolic link in Git metadata at ${path}.`,
+							);
+						}
+						return !basename(path).endsWith(".lock");
+					},
+				});
+			} finally {
+				releaseSnapshot();
+			}
 			const config = join(staged, ".git", "config");
 
 			const worktreeConfig = join(staged, ".git", "config.worktree");
@@ -2908,12 +2922,26 @@ export class DefaultPackageManager implements PackageManager {
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
 		baseDir: string,
+		gitRevisions: ReadonlyMap<string, string>,
 	): void {
 		if (entries.length === 0) return;
 
 		// Collect all files from plain entries (non-pattern entries)
 		const { plain, patterns } = splitPatterns(entries);
-		const resolvedPlain = plain.map((p) => this.resolvePathFromBase(p, baseDir));
+		const resolvedPlain = plain.map((p) => {
+			const path = this.resolvePathFromBase(p, baseDir);
+			for (const [logical, active] of gitRevisions) {
+				if (path === logical || isPathInside(logical, path)) return join(active, relative(logical, path));
+				const parent = dirname(active);
+				if (!isPathInside(parent, path)) continue;
+				const [name, ...parts] = relative(parent, path).split(sep);
+				const prefix = basename(active).slice(0, -6);
+				if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) {
+					return join(active, ...parts);
+				}
+			}
+			return path;
+		});
 		const allFiles = this.collectFilesFromPaths(resolvedPlain, resourceType);
 
 		// Determine which files are enabled based on patterns
@@ -3142,6 +3170,7 @@ export class DefaultPackageManager implements PackageManager {
 
 	private createAccumulator(): ResourceAccumulator {
 		return {
+			gitRevisions: new Map(),
 			extensions: new Map(),
 			skills: new Map(),
 			prompts: new Map(),
