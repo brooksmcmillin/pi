@@ -337,6 +337,28 @@ describe("DefaultPackageManager git update", () => {
 		},
 	);
 
+	it("redirects explicit user paths when a trusted project shadows the package", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		createCommit(remoteDir, "extensions/implicit.ts", "export default function() {}", "Add implicit extension");
+		await packageManager.update();
+		const active = selected();
+		const projectCheckout = join(tempDir, ".pi", "git", "github.com", "test", "extension");
+		mkdirSync(dirname(projectCheckout), { recursive: true });
+		git(["clone", remoteDir, projectCheckout], tempDir);
+		settingsManager.setProjectPackages([gitSource]);
+		settingsManager.setExtensionPaths([join(installedDir, "extensions", "worker.ts")]);
+		const { extensions } = await packageManager.resolve();
+		expect(extensions).toContainEqual(
+			expect.objectContaining({ path: join(active, "extensions", "worker.ts"), enabled: true }),
+		);
+		expect(extensions).toContainEqual(
+			expect.objectContaining({ path: join(projectCheckout, "extensions", "implicit.ts"), enabled: true }),
+		);
+		expect(extensions.map((entry) => entry.path)).not.toContain(join(active, "extensions", "implicit.ts"));
+	});
+
 	it.each([false, true])(
 		"deduplicates explicit extension paths after revision selection (excluded: %s)",
 		async (excluded) => {
@@ -432,10 +454,17 @@ describe("DefaultPackageManager git update", () => {
 		"child",
 		"explicit child",
 		"explicit file",
+		"explicit internal symlink",
 		"explicit nested file",
 		"retained alias exclusion",
 		"historical glob",
 	])("uses the selected manifest through a %s alias", async (kind) => {
+		if (kind === "historical glob") {
+			const checkout = relative(agentDir, installedDir);
+			agentDir = join(tempDir, "agent[1]");
+			installedDir = join(agentDir, checkout);
+			packageManager = new DefaultPackageManager({ cwd: tempDir, agentDir, settingsManager });
+		}
 		setupRemoteAndInstall();
 		settingsManager.setNpmCommand(["npm", "--offline", "--ignore-scripts"]);
 		createCommit(remoteDir, "old.ts", "export default function() {}", "Add old entry");
@@ -450,6 +479,9 @@ describe("DefaultPackageManager git update", () => {
 		const replacement = nested ? "assets/new.ts" : "new.ts";
 		if (nested) createCommit(remoteDir, "assets", "old file", "Add old assets file");
 		git(["pull", "--ff-only"], installedDir);
+		if (kind === "explicit internal symlink" && process.platform !== "win32") {
+			symlinkSync("old.ts", join(installedDir, "new.ts"));
+		}
 		const root = join(agentDir, kind.startsWith("explicit") ? "custom-extensions" : "extensions");
 		const alias = kind === "root" ? root : join(root, "alias");
 		mkdirSync(dirname(alias), { recursive: true });
@@ -469,7 +501,9 @@ describe("DefaultPackageManager git update", () => {
 			["old.ts", "new.ts"].includes(basename(entry.path)),
 		);
 		const first = join(selected(), replacement);
-		expect(existsSync(join(alias, replacement))).toBe(kind === "explicit file" && process.platform !== "win32");
+		expect(existsSync(join(alias, replacement))).toBe(
+			(kind === "explicit file" || kind === "explicit internal symlink") && process.platform !== "win32",
+		);
 		expect(entries).toEqual([expect.objectContaining({ path: first, enabled: false })]);
 		if (kind !== "retained alias exclusion") {
 			const rule =

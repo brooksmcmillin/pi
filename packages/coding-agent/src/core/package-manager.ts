@@ -938,12 +938,13 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 	const root = canonicalizePath(logical);
 	// Check directory aliases too: a missing or redirected leaf in the old
 	// checkout should not hide its path in the selected revision.
-	for (let ancestor = path; ; ancestor = dirname(ancestor)) {
+	for (let ancestor = dirname(path); ; ancestor = dirname(ancestor)) {
 		const canonical = canonicalizePath(ancestor);
 		const selected = select(join(canonical, path.slice(ancestor.length)), root);
 		if (selected) return selected;
-		if (dirname(ancestor) === ancestor) return undefined;
+		if (dirname(ancestor) === ancestor) break;
 	}
+	return select(canonicalizePath(path), root);
 }
 
 export function matchesGitPackageExactRule(
@@ -1143,7 +1144,7 @@ export class DefaultPackageManager implements PackageManager {
 		const projectSettings = this.settingsManager.getProjectSettings();
 
 		// Collect all packages with scope (project first so cwd resources win collisions)
-		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
+		const allPackages: Array<{ pkg: PackageSource; scope: "user" | "project" }> = [];
 		for (const pkg of projectSettings.packages ?? []) {
 			allPackages.push({ pkg, scope: "project" });
 		}
@@ -1154,6 +1155,17 @@ export class DefaultPackageManager implements PackageManager {
 		// Dedupe: project scope wins over global for same package identity
 		const packageSources = this.dedupePackages(allPackages);
 		const installFailures = await this.resolvePackageSources(packageSources, accumulator, onMissing);
+		const loaded = new Set(packageSources);
+		for (const entry of allPackages) {
+			if (loaded.has(entry) || (entry.scope === "project" && !this.settingsManager.isProjectTrusted())) continue;
+			const source = this.getPackageSourceString(entry.pkg);
+			const parsed = this.parseSource(source);
+			if (parsed.type !== "git") continue;
+			const selected = this.getInstalledPath(source, entry.scope);
+			if (!selected) continue;
+			const logical = this.getGitStoragePath(parsed, entry.scope);
+			if (logical !== selected) accumulator.gitRevisions.set(logical, selected);
+		}
 
 		const globalBaseDir = this.agentDir;
 		const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
@@ -3070,7 +3082,9 @@ export class DefaultPackageManager implements PackageManager {
 			if (pattern[0] !== "+" && pattern[0] !== "-" && pattern[0] !== "!") return [pattern];
 			const original = this.resolvePathFromBase(pattern.slice(1), baseDir);
 			const active = this.redirectGitResource(original, gitRevisions);
-			return active === original ? [pattern] : [pattern, `${pattern[0]}${active}`];
+			// Keep relative globs relative so literal settings-directory characters do not become glob syntax.
+			const target = pattern[0] === "!" && !isAbsolute(pattern.slice(1)) ? relative(baseDir, active) : active;
+			return active === original ? [pattern] : [pattern, `${pattern[0]}${target}`];
 		});
 	}
 
