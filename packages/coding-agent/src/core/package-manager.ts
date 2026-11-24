@@ -931,7 +931,12 @@ function applyPatterns(
 	return new Set(result);
 }
 
-export function redirectGitRevisionPath(path: string, logical: string, active: string): string | undefined {
+export function redirectGitRevisionPath(
+	path: string,
+	logical: string,
+	active: string,
+	directOnly = false,
+): string | undefined {
 	function select(candidate: string, root: string): string | undefined {
 		// Windows path.relative folds case even on case-sensitive directories. Only
 		// canonical filesystem spellings should make different path spellings match.
@@ -945,6 +950,8 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 		if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) return join(active, ...parts);
 		return undefined;
 	}
+
+	if (directOnly) return select(path, logical);
 
 	function selectPath(candidate: string): string | undefined {
 		const direct = select(candidate, logical);
@@ -3243,13 +3250,17 @@ export class DefaultPackageManager implements PackageManager {
 					continue;
 				}
 			}
-			for (const path of this.collectFilesFromPaths([selected], resourceType, selectPath, rememberAlias)) {
+			const logicalPath = (path: string) =>
+				selected !== original && (path === selected || isPathInside(selected, path))
+					? join(original, relative(selected, path))
+					: path;
+			const rememberDiscoveredAlias = (file: string, alias: string) =>
+				rememberAlias(selectPath(file), logicalPath(alias));
+			for (const path of this.collectFilesFromPaths([selected], resourceType, selectPath, rememberDiscoveredAlias)) {
 				const active = selectPath(path);
 				if (!existsSync(active)) continue;
-				if (active !== path) rememberAlias(active, path);
-				if (selected !== original && (path === selected || isPathInside(selected, path))) {
-					rememberAlias(active, join(original, relative(selected, path)));
-				}
+				const logical = logicalPath(path);
+				if (logical !== active) rememberAlias(active, logical);
 				allFiles.add(active);
 			}
 		}
@@ -3349,12 +3360,21 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private redirectPackagePath(path: string, revisions: ReadonlyMap<string, string>): string {
-		let selected = this.redirectGitResource(path, revisions);
-		const seen = new Set([path, selected]);
+		let selected = path;
+		const seen = new Set([path]);
 		// A selected checkout can itself contain a link into another managed checkout.
 		for (let hops = 0; hops < 40; hops++) {
 			let next: string | undefined;
+			// Select the containing revision before following links in a retained checkout.
 			for (const [logical, active] of revisions) {
+				const candidate = redirectGitRevisionPath(selected, logical, active, true);
+				if (candidate !== undefined && candidate !== selected) {
+					next = candidate;
+					break;
+				}
+			}
+			for (const [logical, active] of revisions) {
+				if (next !== undefined) break;
 				const candidate = redirectGitRevisionPath(selected, logical, active);
 				if (candidate !== undefined && candidate !== selected) {
 					next = candidate;

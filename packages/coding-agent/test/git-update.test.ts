@@ -1209,6 +1209,7 @@ describe("DefaultPackageManager git update", () => {
 		git(["clone", secondRemote, secondCheckout], tempDir);
 		git(["rm", "removed.md"], secondRemote);
 		createCommit(secondRemote, "added.md", "Selected prompt", "Add new prompt");
+		createCommit(secondRemote, "excluded.md", "Excluded prompt", "Add excluded prompt");
 		mkdirSync(join(remoteDir, "assets"));
 		createCommit(remoteDir, "assets/old.md", "Old assets", "Add original assets");
 		git(["pull", "--ff-only"], installedDir);
@@ -1219,7 +1220,10 @@ describe("DefaultPackageManager git update", () => {
 		const local = join(agentDir, "local-package");
 		mkdirSync(local);
 		const prefix = relative(local, join(installedDir, "assets"));
-		writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { prompts: [`${prefix}/*.md`] } }));
+		writeFileSync(
+			join(local, "package.json"),
+			JSON.stringify({ pi: { prompts: [`${prefix}/*.md`, `-${prefix}/excluded.md`] } }),
+		);
 		settingsManager.setPackages([
 			{ source: gitSource, autoload: false },
 			{ source: secondSource, autoload: false },
@@ -1229,6 +1233,34 @@ describe("DefaultPackageManager git update", () => {
 		expect((await packageManager.resolve()).prompts).toEqual([
 			expect.objectContaining({ path: join(selected(secondSource), "added.md") }),
 		]);
+
+		symlinkSync(installedDir, join(local, "resources"), "dir");
+		writeFileSync(
+			join(local, "package.json"),
+			JSON.stringify({ pi: { prompts: ["resources", "-resources/assets/excluded.md"] } }),
+		);
+		expect((await packageManager.resolve()).prompts).toEqual([
+			expect.objectContaining({ path: join(selected(secondSource), "added.md") }),
+		]);
+
+		// The next revision replaces A's link with a real directory. A retained
+		// checkout must not redirect this declaration into B in either order.
+		git(["pull", "--ff-only"], installedDir);
+		const retainedPrefix = relative(local, join(installedDir, "assets"));
+		writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { prompts: [`${retainedPrefix}/*.md`] } }));
+		git(["rm", "assets"], remoteDir);
+		mkdirSync(join(remoteDir, "assets"));
+		createCommit(remoteDir, "assets/replacement.md", "New assets", "Replace assets link");
+		await packageManager.update();
+		for (const sources of [
+			[gitSource, secondSource],
+			[secondSource, gitSource],
+		]) {
+			settingsManager.setPackages([...sources.map((source) => ({ source, autoload: false })), local]);
+			expect((await packageManager.resolve()).prompts).toEqual([
+				expect.objectContaining({ path: join(selected(), "assets", "replacement.md") }),
+			]);
+		}
 	});
 
 	it("expands manifest globs from the selected checkout and retains original filter paths", async () => {
