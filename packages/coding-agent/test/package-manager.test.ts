@@ -22,6 +22,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 
+function gitStateKey(root: string, target: string): string {
+	const identity = relative(root, target);
+	return createHash("sha256")
+		.update(process.platform === "win32" ? identity.toLowerCase() : identity)
+		.digest("hex");
+}
+
 function normalizeForMatch(value: string): string {
 	return value.replace(/\\/g, "/");
 }
@@ -1042,7 +1049,7 @@ Content`,
 				"git",
 				["--git-dir=.git", "--work-tree=.", "reset", "--hard", "new-head"],
 				{
-					cwd: expect.stringContaining(".repo.pi-update-"),
+					cwd: expect.stringContaining(".pi-revision-"),
 				},
 			);
 			expect(runCommandSpy).not.toHaveBeenCalledWith("git", ["clean", "-fdx"], { cwd: targetDir });
@@ -1050,7 +1057,7 @@ Content`,
 				"npm",
 				["install", "--omit=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"],
 				{
-					cwd: expect.stringContaining(".repo.pi-update-"),
+					cwd: expect.stringContaining(".pi-revision-"),
 				},
 			);
 		});
@@ -1085,7 +1092,7 @@ Content`,
 				"git",
 				["--git-dir=.git", "--work-tree=.", "reset", "--hard", "new-head"],
 				{
-					cwd: expect.stringContaining(".repo.pi-update-"),
+					cwd: expect.stringContaining(".pi-revision-"),
 				},
 			);
 			expect(runCommandSpy).not.toHaveBeenCalledWith("git", ["clean", "-fdx"], { cwd: targetDir });
@@ -1209,7 +1216,7 @@ Content`,
 				"npm",
 				["install", "--omit=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"],
 				{
-					cwd: expect.stringContaining(".repo.pi-update-"),
+					cwd: expect.stringContaining(".pi-revision-"),
 				},
 			);
 		});
@@ -1279,14 +1286,21 @@ Content`,
 						dependencies: { runtime: `file:../${dependency}` },
 						...(outcome === "failure" && version === "2.0.0"
 							? { scripts: { install: 'git checkout-index -f worker.js && node -e "process.exit(42)"' } }
-							: {}),
+							: outcome === "success" && version === "2.0.0"
+								? { scripts: { install: "node prepare.cjs" } }
+								: {}),
 					}),
 				);
 				writeFileSync(
 					join(remote, "worker.js"),
 					`import value from 'runtime'; console.log('${version}:' + value);`,
 				);
-				git(remote, "add", "package.json", "worker.js");
+				writeFileSync(
+					join(remote, "prepare.cjs"),
+					`const { writeFileSync } = require('node:fs'); const { pathToFileURL } = require('node:url');
+writeFileSync('launcher.mjs', 'import ' + JSON.stringify(pathToFileURL(require('node:path').resolve('worker.js')).href));`,
+				);
+				git(remote, "add", "package.json", "worker.js", "prepare.cjs");
 				git(remote, "-c", "commit.gpgsign=false", "commit", "-m", version);
 			};
 			const writeRuntime = (version: string) => {
@@ -1299,8 +1313,8 @@ Content`,
 				writeFileSync(join(path, "index.js"), `export default '${version}';`);
 			};
 			const npmArgs = ["--offline", "--ignore-scripts"];
-			const startWorker = () =>
-				execFileSync(process.execPath, [join(targetDir, "worker.js")], { encoding: "utf-8" }).trim();
+			const startWorker = (dir = targetDir) =>
+				execFileSync(process.execPath, [join(dir, "worker.js")], { encoding: "utf-8" }).trim();
 			writeVersion("1.0.0", "old");
 			git(tempDir, "clone", remote, targetDir);
 			const original = git(targetDir, "rev-parse", "HEAD");
@@ -1314,6 +1328,9 @@ Content`,
 			mkdirSync(collidingSibling);
 			writeFileSync(join(collidingSibling, "index.ts"), "// unrelated checkout");
 			const manager = packageManager as unknown as PackageManagerInternals;
+			const parsed = manager.parseSource(source);
+			if (parsed.type !== "git") throw new Error("Expected Git source");
+			const selected = () => manager.getGitInstallPath(parsed, "user");
 			await manager.runCommand("npm", ["install", "--no-audit", "--no-fund", ...npmArgs], { cwd: targetDir });
 			settingsManager.setPackages([source]);
 			const runCommand = manager.runCommand.bind(manager);
@@ -1342,7 +1359,12 @@ Content`,
 				expect(git(targetDir, "rev-parse", "HEAD")).toBe(original);
 				await runCommand(
 					command,
-					[...args, ...(outcome === "failure" ? ["--offline", "--ignore-scripts=false"] : npmArgs)],
+					[
+						...args,
+						...(outcome === "failure" || outcome === "success"
+							? ["--offline", "--ignore-scripts=false"]
+							: npmArgs),
+					],
 					options,
 				);
 				if (outcome === "competing update") {
@@ -1371,9 +1393,9 @@ Content`,
 				const external = mkdtempSync("/dev/shm/pi-update-test-");
 				try {
 					symlinkSync(external, join(agentDir, "git", ".git-update-state"), "dir");
-					await expect(packageManager.update(source)).rejects.toThrow("on the same filesystem");
+					await packageManager.update(source);
+					expect(startWorker(selected())).toBe("2.0.0:new");
 					expect(startWorker()).toBe("1.0.0:old");
-					expect(install.mock.calls.some(([command]) => command === "npm")).toBe(false);
 				} finally {
 					rmSync(external, { recursive: true, force: true });
 				}
@@ -1381,21 +1403,25 @@ Content`,
 			}
 			if (outcome === "competing update") {
 				await expect(packageManager.update(source)).rejects.toThrow("changed during update");
-				expect(startWorker()).toBe("3.0.0:new");
+				expect(startWorker(selected())).toBe("3.0.0:new");
 			} else if (outcome === "failure" || outcome === "blocked promotion") {
 				await expect(packageManager.update(source)).rejects.toThrow(
-					outcome === "failure" ? "code 42" : "close processes using it and retry",
+					outcome === "failure" ? "code 42" : "prepared revision disappeared",
 				);
 				expect(startWorker()).toBe("1.0.0:old");
 				expect(git(targetDir, "rev-parse", "HEAD")).toBe(original);
 			} else {
 				await packageManager.update(source);
-				expect(startWorker()).toBe("2.0.0:new");
+				expect(startWorker(selected())).toBe("2.0.0:new");
 				if (outcome === "success") {
-					expect(git(targetDir, "config", "--worktree", "core.worktree")).toBe(targetDir);
+					expect(git(selected(), "rev-parse", "--show-toplevel")).toBe(selected());
+					expect(
+						execFileSync(process.execPath, [join(selected(), "launcher.mjs")], { encoding: "utf8" }).trim(),
+					).toBe("2.0.0:new");
+					expect(startWorker()).toBe("1.0.0:old");
 				}
-				expect(git(targetDir, "rev-parse", "HEAD")).toBe(git(remote, "rev-parse", "HEAD"));
-				expect(git(targetDir, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
+				expect(git(selected(), "rev-parse", "HEAD")).toBe(git(remote, "rev-parse", "HEAD"));
+				expect(git(selected(), "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
 				await packageManager.update(source);
 			}
 			git(agentDir, "init", "-q");
@@ -1403,12 +1429,11 @@ Content`,
 				"git/.git-update-state/backup.previous",
 			);
 			expect(install.mock.calls.filter(([command]) => command === "npm")).toHaveLength(1);
-			expect(readdirSync(dirname(targetDir)).sort()).toEqual([
-				".repo.pi-update-incomplete.previous",
-				"new",
-				"old",
-				"repo",
-			]);
+			expect(
+				readdirSync(dirname(targetDir))
+					.filter((entry) => !entry.startsWith(".pi-revision-"))
+					.sort(),
+			).toEqual([".repo.pi-update-incomplete.previous", "new", "old", "repo"]);
 			expect(readFileSync(join(collidingSibling, "index.ts"), "utf8")).toBe("// unrelated checkout");
 		});
 
@@ -1422,9 +1447,7 @@ Content`,
 				const target = manager.getGitInstallPath(parsed, "temporary");
 				const cache = join(agentDir, "tmp", "extensions");
 				mkdirSync(dirname(target), { recursive: true });
-				const key = createHash("sha256")
-					.update(join(realpathSync(dirname(target)), "repo"))
-					.digest("hex");
+				const key = gitStateKey(cache, target);
 				const previous = join(cache, ".git-update-state", `${key}.previous`);
 				const extension = join(target, "extensions", "worker.ts");
 				mkdirSync(dirname(previous), { recursive: true });
@@ -1444,9 +1467,7 @@ Content`,
 			const source = "git:github.com/user/repo";
 			const target = join(agentDir, "git", "github.com", "user", "repo");
 			mkdirSync(dirname(target), { recursive: true });
-			const key = createHash("sha256")
-				.update(join(realpathSync(dirname(target)), "repo"))
-				.digest("hex");
+			const key = gitStateKey(join(agentDir, "git"), target);
 			const state = join(agentDir, "git", ".git-update-state", key);
 			const previous = `${state}.previous`;
 			mkdirSync(previous, { recursive: true });
@@ -1470,9 +1491,7 @@ Content`,
 				const alias = join(tempDir, "agent-alias");
 				symlinkSync(agentDir, alias, "dir");
 				mkdirSync(dirname(target), { recursive: true });
-				const key = createHash("sha256")
-					.update(join(realpathSync(dirname(target)), "repo"))
-					.digest("hex");
+				const key = gitStateKey(join(agentDir, "git"), target);
 				const state = join(agentDir, "git", ".git-update-state", key);
 				const previous = `${state}.previous`;
 				mkdirSync(join(previous, "extensions"), { recursive: true });
@@ -1502,9 +1521,7 @@ Content`,
 				const source = "git:github.com/user/repo";
 				const target = join(agentDir, "git", "github.com", "user", "repo");
 				mkdirSync(dirname(target), { recursive: true });
-				const key = createHash("sha256")
-					.update(join(realpathSync(dirname(target)), "repo"))
-					.digest("hex");
+				const key = gitStateKey(join(agentDir, "git"), target);
 				const previous = join(agentDir, "git", ".git-update-state", `${key}.previous`);
 				mkdirSync(dirname(previous), { recursive: true });
 				const extension = join(target, "extensions", "worker.ts");
@@ -1530,9 +1547,7 @@ Content`,
 				const good = "git:github.com/user/other";
 				const target = join(agentDir, "git", "github.com", "user", "repo");
 				mkdirSync(dirname(target), { recursive: true });
-				const key = createHash("sha256")
-					.update(join(realpathSync(dirname(target)), "repo"))
-					.digest("hex");
+				const key = gitStateKey(join(agentDir, "git"), target);
 				const previous = join(agentDir, "git", ".git-update-state", `${key}.previous`);
 				const goodExtension = join(dirname(target), "other", "extensions", "worker.ts");
 				mkdirSync(previous, { recursive: true });
@@ -1597,7 +1612,7 @@ Content`,
 					"--config.strict-peer-dependencies=false",
 					"--config.strict-dep-builds=false",
 				],
-				{ cwd: expect.stringContaining(".repo.pi-update-") },
+				{ cwd: expect.stringContaining(".pi-revision-") },
 			);
 		});
 

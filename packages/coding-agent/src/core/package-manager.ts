@@ -16,6 +16,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 
 function getEnv(): NodeJS.ProcessEnv {
@@ -1249,7 +1250,7 @@ export class DefaultPackageManager implements PackageManager {
 						const targetDir = this.getGitInstallPath(entry.parsed, entry.scope);
 						const from = await this.getGitHead(targetDir);
 						await this.updateGit(entry.parsed, entry.scope);
-						const to = await this.getGitHead(targetDir);
+						const to = await this.getGitHead(this.getGitInstallPath(entry.parsed, entry.scope));
 						if (from !== to) {
 							gitUpdates.push({ source: entry.source, type: "git", scope: entry.scope, from, to });
 						}
@@ -1505,9 +1506,10 @@ export class DefaultPackageManager implements PackageManager {
 			}
 
 			if (parsed.type === "git") {
-				const installedPath = this.getGitInstallPath(parsed, resolvedScope);
+				let installedPath: string;
 				let present: boolean;
 				try {
+					installedPath = this.getGitInstallPath(parsed, resolvedScope);
 					present = await this.recoverGitCheckout(installedPath, resolvedScope);
 				} catch (error) {
 					installFailures.push({ source: resolvedSource, scope: resolvedScope, message: String(error) });
@@ -1519,9 +1521,27 @@ export class DefaultPackageManager implements PackageManager {
 				} else if (resolvedScope === "temporary" && !isOfflineModeEnabled()) {
 					await this.refreshTemporaryGitSource(parsed, resolvedSource, installedPath);
 				}
+				try {
+					installedPath = this.getGitInstallPath(parsed, resolvedScope);
+				} catch (error) {
+					installFailures.push({ source: resolvedSource, scope: resolvedScope, message: String(error) });
+					continue;
+				}
 				metadata.baseDir = installedPath;
 				metadata.packageRoot = installedPath;
-				this.collectPackageResources(installedPath, accumulator, filter, metadata);
+				const logicalPath = this.getGitStoragePath(parsed, resolvedScope);
+				const revisionFilter = filter && logicalPath !== installedPath ? { ...filter } : filter;
+				if (revisionFilter && revisionFilter !== filter) {
+					const prefix = `${toPosixPath(logicalPath)}/`;
+					for (const type of RESOURCE_TYPES) {
+						revisionFilter[type] = filter?.[type]?.map((pattern) => {
+							const modifier = /^[!+-]/.test(pattern) ? pattern[0] : "";
+							const body = toPosixPath(pattern.slice(modifier.length));
+							return body.startsWith(prefix) ? `${modifier}${body.slice(prefix.length)}` : pattern;
+						});
+					}
+				}
+				this.collectPackageResources(installedPath, accumulator, revisionFilter, metadata);
 			}
 		}
 		return installFailures;
@@ -2079,14 +2099,15 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
+		const logicalDir = this.getGitStoragePath(source, scope);
 		const targetDir = this.getGitInstallPath(source, scope);
 		if (await this.recoverGitCheckout(targetDir, scope)) {
 			if (source.ref) {
-				await this.ensureGitRef(targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
+				await this.ensureGitRef(logicalDir, targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
 				return;
 			}
 			const target = await this.getLocalGitUpdateTarget(targetDir);
-			await this.ensureGitRef(targetDir, scope, target.fetchArgs, target.ref);
+			await this.ensureGitRef(logicalDir, targetDir, scope, target.fetchArgs, target.ref);
 			return;
 		}
 		const gitRoot = this.getGitInstallRoot(scope);
@@ -2114,6 +2135,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async updateGit(source: GitSource, scope: SourceScope): Promise<void> {
+		const logicalDir = this.getGitStoragePath(source, scope);
 		const targetDir = this.getGitInstallPath(source, scope);
 		if (!(await this.recoverGitCheckout(targetDir, scope))) {
 			await this.installGit(source, scope);
@@ -2121,12 +2143,12 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		if (source.ref) {
-			await this.ensureGitRef(targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
+			await this.ensureGitRef(logicalDir, targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
 			return;
 		}
 
 		const target = await this.getLocalGitUpdateTarget(targetDir);
-		await this.ensureGitRef(targetDir, scope, target.fetchArgs, target.ref);
+		await this.ensureGitRef(logicalDir, targetDir, scope, target.fetchArgs, target.ref);
 	}
 
 	private hasMissingGitDependencies(targetDir: string): boolean {
@@ -2159,10 +2181,9 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private getGitUpdateStatePath(targetDir: string, scope: SourceScope): string {
-		const packageRoot = this.getGitInstallRoot(scope);
-		const stateRoot = join(packageRoot ?? getExtensionTempFolder(this.agentDir), ".git-update-state");
-		const parent = dirname(targetDir);
-		const identity = join(existsSync(parent) ? realpathSync(parent) : parent, basename(targetDir));
+		const packageRoot = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+		const stateRoot = join(packageRoot, ".git-update-state");
+		const identity = relative(packageRoot, targetDir);
 		return join(
 			stateRoot,
 			createHash("sha256")
@@ -2183,7 +2204,13 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async ensureGitRef(targetDir: string, scope: SourceScope, fetchArgs: string[], ref: string): Promise<void> {
+	private async ensureGitRef(
+		logicalDir: string,
+		targetDir: string,
+		scope: SourceScope,
+		fetchArgs: string[],
+		ref: string,
+	): Promise<void> {
 		const installed = statSync(targetDir);
 		// Fetch only the ref we will reset to, avoiding unrelated branch/tag noise.
 		await this.runCommand("git", fetchArgs, { cwd: targetDir });
@@ -2199,14 +2226,17 @@ export class DefaultPackageManager implements PackageManager {
 		});
 		const markerPath = this.getGitUpdateMarkerPath(targetDir);
 		const interruptedLegacyUpdate = statSync(markerPath, { throwIfNoEntry: false })?.isFile();
-		const state = this.getGitUpdateStatePath(targetDir, scope);
+		const state = this.getGitUpdateStatePath(logicalDir, scope);
 		const previous = `${state}.previous`;
 		if (localHead.trim() === targetHead.trim() && !interruptedLegacyUpdate) {
 			if (existsSync(previous) || this.hasMissingGitDependencies(targetDir)) {
 				const release = this.lockGitCheckout(state);
 				try {
 					this.assertSameGitCheckout(targetDir, installed);
-					this.removeGitUpdateFiles(previous);
+					if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
+						throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
+					}
+					await this.removeGitUpdateFiles(previous);
 					if (this.hasMissingGitDependencies(targetDir)) {
 						await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
 					}
@@ -2221,17 +2251,11 @@ export class DefaultPackageManager implements PackageManager {
 		if (!lstatSync(gitDir, { throwIfNoEntry: false })?.isDirectory() || existsSync(join(gitDir, "commondir"))) {
 			throw new Error(`Cannot stage Git package ${targetDir}: its metadata must be in a standalone .git directory.`);
 		}
-		const stateDir = dirname(state);
-		this.ensureGitIgnore(stateDir);
-		const stateDevice = statSync(stateDir).dev;
-		if (stateDevice !== statSync(dirname(targetDir)).dev || installed.dev !== stateDevice) {
-			throw new Error(
-				`Cannot update Git package ${targetDir}: keep its checkout and recovery directory ${stateDir} on the same filesystem.`,
-			);
-		}
 
+		this.ensureGitIgnore(dirname(state));
 		// Relative file: dependencies must resolve from the same parent as the installed checkout.
-		const staged = mkdtempSync(join(dirname(targetDir), `.${basename(targetDir)}.pi-update-`));
+		const staged = mkdtempSync(join(dirname(logicalDir), `.pi-revision-${basename(state)}-`));
+		let published = false;
 		try {
 			// Keep the checkout's refs and configuration, but never copy its installed dependencies.
 			cpSync(gitDir, join(staged, ".git"), {
@@ -2244,16 +2268,16 @@ export class DefaultPackageManager implements PackageManager {
 				},
 			});
 			const config = join(staged, ".git", "config");
-			const originalConfig = existsSync(config) ? readFileSync(config) : undefined;
+
 			const worktreeConfig = join(staged, ".git", "config.worktree");
-			const originalWorktreeConfig = existsSync(worktreeConfig) ? readFileSync(worktreeConfig) : undefined;
-			if (originalWorktreeConfig) {
-				await this.runCommand("git", ["config", "--file", worktreeConfig, "core.worktree", staged], {
+
+			if (existsSync(worktreeConfig)) {
+				await this.runCommand("git", ["config", "--file", worktreeConfig, "core.worktree", ".."], {
 					cwd: staged,
 				});
 			}
-			if (originalConfig) {
-				await this.runCommand("git", ["--git-dir=.git", "config", "--local", "core.worktree", staged], {
+			if (existsSync(config)) {
+				await this.runCommand("git", ["--git-dir=.git", "config", "--local", "core.worktree", ".."], {
 					cwd: staged,
 				});
 			}
@@ -2263,29 +2287,23 @@ export class DefaultPackageManager implements PackageManager {
 			if (existsSync(join(staged, "package.json"))) {
 				await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: staged });
 			}
-			if (originalConfig) writeFileSync(config, originalConfig);
-			if (originalWorktreeConfig) writeFileSync(worktreeConfig, originalWorktreeConfig);
-
 			const release = this.lockGitCheckout(state);
 			try {
 				this.assertSameGitCheckout(targetDir, installed);
-				this.removeGitUpdateFiles(previous);
-				try {
-					renameSync(targetDir, previous);
-					renameSync(staged, targetDir);
-				} catch (error) {
-					this.restoreGitBackup(targetDir, previous);
-					throw new Error(`Could not replace Git package ${targetDir}; close processes using it and retry.`, {
-						cause: error,
-					});
+				if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
+					throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
 				}
-				this.removeGitUpdateFiles(previous);
+				if (!existsSync(staged)) throw new Error(`Git package ${logicalDir}: prepared revision disappeared.`);
+				const pending = `${state}.pending`;
+				writeFileSync(pending, basename(staged), "utf8");
+				renameSync(pending, `${state}.current`);
+				published = true;
 				if (interruptedLegacyUpdate) rmSync(markerPath, { force: true });
 			} finally {
 				release();
 			}
 		} finally {
-			this.removeGitUpdateFiles(staged);
+			if (!published) await this.removeGitUpdateFiles(staged);
 		}
 	}
 
@@ -2327,9 +2345,9 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private removeGitUpdateFiles(path: string): void {
+	private async removeGitUpdateFiles(path: string): Promise<void> {
 		try {
-			rmSync(path, { recursive: true, force: true });
+			await rm(path, { recursive: true, force: true });
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : String(error);
 			this.emitProgress({
@@ -2366,14 +2384,31 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async removeGit(source: GitSource, scope: SourceScope): Promise<void> {
-		const targetDir = this.getGitInstallPath(source, scope);
+		const targetDir = this.getGitStoragePath(source, scope);
 		const state = this.getGitUpdateStatePath(targetDir, scope);
 		const release = this.lockGitCheckout(state);
 		try {
-			rmSync(targetDir, { recursive: true, force: true });
+			const selected = this.readSelectedGitRevision(targetDir, state);
+			if (existsSync(dirname(targetDir))) {
+				const prefix = `.pi-revision-${basename(state)}-`;
+				for (const entry of readdirSync(dirname(targetDir))) {
+					const revision = join(dirname(targetDir), entry);
+					if (
+						revision !== selected &&
+						entry.startsWith(prefix) &&
+						/^[a-zA-Z0-9]{6}$/.test(entry.slice(prefix.length))
+					) {
+						await rm(revision, { recursive: true, force: true });
+					}
+				}
+			}
+			rmSync(`${state}.pending`, { force: true });
+			if (selected !== targetDir) await rm(targetDir, { recursive: true, force: true });
 			const markerPath = this.getGitUpdateMarkerPath(targetDir);
 			if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
-			rmSync(`${state}.previous`, { recursive: true, force: true });
+			await rm(`${state}.previous`, { recursive: true, force: true });
+			await rm(selected, { recursive: true, force: true });
+			rmSync(`${state}.current`, { force: true });
 			this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
 		} finally {
 			release();
@@ -2494,7 +2529,31 @@ export class DefaultPackageManager implements PackageManager {
 		return legacyPath && existsSync(legacyPath) ? legacyPath : managedPath;
 	}
 
+	private readSelectedGitRevision(logicalDir: string, state: string): string {
+		const pointer = `${state}.current`;
+		let name: string;
+		try {
+			name = readFileSync(pointer, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return logicalDir;
+			throw error;
+		}
+		const prefix = `.pi-revision-${basename(state)}-`;
+		if (!name.startsWith(prefix) || !/^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) {
+			throw new Error(`Invalid Git revision pointer at ${pointer}`);
+		}
+		return join(dirname(logicalDir), name);
+	}
+
 	private getGitInstallPath(source: GitSource, scope: SourceScope): string {
+		const logicalDir = this.getGitStoragePath(source, scope);
+		return this.readSelectedGitRevision(logicalDir, this.getGitUpdateStatePath(logicalDir, scope));
+	}
+
+	private getGitStoragePath(source: GitSource, scope: SourceScope): string {
+		if ([source.host, ...source.path.split("/")].some((part) => part.toLowerCase().startsWith(".pi-revision-"))) {
+			throw new Error("Git package path overlaps Pi's reserved revision namespace");
+		}
 		if (scope === "temporary") {
 			// Include the ref in the hash so each pinned ref gets its own checkout.
 			return this.getTemporaryDir(`git-${source.host}`, source.path, source.ref);

@@ -8,18 +8,9 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	realpathSync,
-	renameSync,
-	rmSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -72,7 +63,7 @@ type GitSourceForTest = {
 
 interface PackageManagerPathInternals {
 	parseSource(source: string): GitSourceForTest;
-	getGitInstallPath(source: GitSourceForTest, scope: "temporary"): string;
+	getGitInstallPath(source: GitSourceForTest, scope: "user" | "temporary"): string;
 }
 
 describe("DefaultPackageManager git update", () => {
@@ -130,6 +121,11 @@ describe("DefaultPackageManager git update", () => {
 		// Add to global packages so update() processes this source
 		settingsManager.setPackages([gitSource]);
 	}
+
+	const selected = (source = gitSource, scope: "user" | "temporary" = "user") => {
+		const manager = packageManager as unknown as PackageManagerPathInternals;
+		return manager.getGitInstallPath(manager.parseSource(source), scope);
+	};
 
 	describe("normal updates (no force-push)", () => {
 		it("should skip reset, clean, and install when already up to date", async () => {
@@ -192,8 +188,8 @@ describe("DefaultPackageManager git update", () => {
 
 			// Verify update succeeded
 			expect(updated).toEqual([`${gitSource} ${oldCommit.slice(0, 7)} -> ${newCommit.slice(0, 7)}`]);
-			expect(getCurrentCommit(installedDir)).toBe(newCommit);
-			expect(getFileContent(installedDir, "extension.ts")).toBe("// v2");
+			expect(getCurrentCommit(selected())).toBe(newCommit);
+			expect(getFileContent(selected(), "extension.ts")).toBe("// v2");
 		});
 	});
 
@@ -226,10 +222,81 @@ describe("DefaultPackageManager git update", () => {
 		expect(getFileContent(installedDir, "extension.ts")).toBe("// v1");
 	});
 
+	it("preserves an absolute package exclusion after selecting a new revision", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/excluded.ts", "export default function() {}", "Add excluded extension");
+		createCommit(remoteDir, "extensions/enabled.ts", "export default function() {}", "Add enabled extension");
+		settingsManager.setPackages([
+			{ source: gitSource, extensions: ["*", `-${join(installedDir, "extensions", "excluded.ts")}`] },
+		]);
+
+		await packageManager.update();
+
+		const active = selected();
+		expect(active).not.toBe(installedDir);
+		const { extensions } = await packageManager.resolve();
+		expect(extensions.find((entry) => entry.path === join(active, "extensions", "excluded.ts"))?.enabled).toBe(false);
+		expect(extensions.find((entry) => entry.path === join(active, "extensions", "enabled.ts"))?.enabled).toBe(true);
+	});
+
+	it("reports an invalid revision pointer without preventing other packages from loading", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "extension.ts", "// v2", "Update");
+		await packageManager.update();
+		const active = selected();
+		const key = basename(active).match(/^\.pi-revision-([a-f0-9]{64})-/)?.[1];
+		if (!key) throw new Error("Expected a selected revision");
+		writeFileSync(join(agentDir, "git", ".git-update-state", `${key}.current`), "invalid");
+		const other = join(agentDir, "git", "github.com", "test", "other", "extensions", "healthy.ts");
+		mkdirSync(dirname(other), { recursive: true });
+		writeFileSync(other, "export default function() {}");
+		settingsManager.setPackages([gitSource, "git:github.com/test/other"]);
+
+		const resources = await packageManager.resolve();
+		expect(resources.installFailures).toEqual([
+			{ source: gitSource, scope: "user", message: expect.stringContaining("Invalid Git revision pointer") },
+		]);
+		expect(resources.extensions.some((entry) => entry.metadata.source === gitSource)).toBe(false);
+		expect(resources.extensions.some((entry) => entry.path === other && entry.enabled)).toBe(true);
+	});
+
+	it("keeps the selected checkout when publishing another revision fails", async () => {
+		setupRemoteAndInstall();
+		const expected = createCommit(remoteDir, "extension.ts", "// v2", "Update");
+		await packageManager.update();
+		const active = selected();
+		const key = basename(active).match(/^\.pi-revision-([a-f0-9]{64})-/)?.[1];
+		if (!key) throw new Error("Expected a selected revision");
+		mkdirSync(join(agentDir, "git", ".git-update-state", `${key}.pending`));
+		createCommit(remoteDir, "extension.ts", "// v3", "New update");
+
+		await expect(packageManager.update()).rejects.toThrow();
+		expect(selected()).toBe(active);
+		expect(getCurrentCommit(active)).toBe(expected);
+		expect(getFileContent(active, "extension.ts")).toBe("// v2");
+
+		await expect(packageManager.remove(gitSource)).rejects.toThrow();
+		expect(selected()).toBe(active);
+		expect(getCurrentCommit(active)).toBe(expected);
+	});
+
+	it("keeps the selected revision after moving its managed root", async () => {
+		setupRemoteAndInstall();
+		const expected = createCommit(remoteDir, "extension.ts", "// v2", "Update");
+		await packageManager.update();
+		const active = selected();
+		const newRoot = join(tempDir, "moved-agent");
+		renameSync(agentDir, newRoot);
+		packageManager = new DefaultPackageManager({ cwd: tempDir, agentDir: newRoot, settingsManager });
+		expect(selected()).toBe(join(newRoot, relative(agentDir, active)));
+		expect(getCurrentCommit(selected())).toBe(expected);
+	});
+
 	it("reclaims a leftover backup without replacing the up-to-date checkout", async () => {
 		setupRemoteAndInstall();
 		const original = getCurrentCommit(installedDir);
-		const identity = join(realpathSync(dirname(installedDir)), "extension");
+		const identity = relative(join(agentDir, "git"), installedDir);
 		const key = createHash("sha256")
 			.update(process.platform === "win32" ? identity.toLowerCase() : identity)
 			.digest("hex");
@@ -277,8 +344,8 @@ describe("DefaultPackageManager git update", () => {
 
 			await packageManager.update();
 
-			expect(getCurrentCommit(installedDir)).toBe(newCommit);
-			expect(installs).toEqual([expect.stringContaining(".extension.pi-update-")]);
+			expect(getCurrentCommit(selected())).toBe(newCommit);
+			expect(installs).toEqual([expect.stringContaining(".pi-revision-")]);
 			expect(existsSync(markerPath)).toBe(false);
 		});
 	});
@@ -292,7 +359,7 @@ describe("DefaultPackageManager git update", () => {
 			createCommit(remoteDir, "extension.ts", "// v3", "v3");
 
 			await packageManager.update();
-			expect(getFileContent(installedDir, "extension.ts")).toBe("// v3");
+			expect(getFileContent(selected(), "extension.ts")).toBe("// v3");
 
 			// Maintainer force-pushes completely different history
 			git(["reset", "--hard", "HEAD~2"], remoteDir);
@@ -302,8 +369,8 @@ describe("DefaultPackageManager git update", () => {
 			// Should handle this gracefully
 			await packageManager.update();
 
-			expect(getCurrentCommit(installedDir)).toBe(finalCommit);
-			expect(getFileContent(installedDir, "extension.ts")).toBe("// rewrite-b");
+			expect(getCurrentCommit(selected())).toBe(finalCommit);
+			expect(getFileContent(selected(), "extension.ts")).toBe("// rewrite-b");
 		});
 	});
 
@@ -326,15 +393,15 @@ describe("DefaultPackageManager git update", () => {
 
 			await packageManager.update();
 
-			expect(getCurrentCommit(installedDir)).toBe(v2Commit);
-			expect(getFileContent(installedDir, "extension.ts")).toBe("// v2");
+			expect(getCurrentCommit(selected(pinnedSource))).toBe(v2Commit);
+			expect(getFileContent(selected(), "extension.ts")).toBe("// v2");
 
-			git(["checkout", "v1"], installedDir);
+			git(["checkout", "v1"], selected(pinnedSource));
 
 			await packageManager.update(pinnedSource);
 
-			expect(getCurrentCommit(installedDir)).toBe(v2Commit);
-			expect(getFileContent(installedDir, "extension.ts")).toBe("// v2");
+			expect(getCurrentCommit(selected(pinnedSource))).toBe(v2Commit);
+			expect(getFileContent(selected(), "extension.ts")).toBe("// v2");
 		});
 	});
 
@@ -342,7 +409,6 @@ describe("DefaultPackageManager git update", () => {
 		it("should refresh cached temporary git sources when resolving", async () => {
 			const managerWithPaths = packageManager as unknown as PackageManagerPathInternals;
 			const cachedDir = managerWithPaths.getGitInstallPath(managerWithPaths.parseSource(gitSource), "temporary");
-			const extensionFile = join(cachedDir, "pi-extensions", "session-breakdown.ts");
 
 			mkdirSync(join(remoteDir, "pi-extensions"), { recursive: true });
 			initGitRepo(remoteDir);
@@ -359,9 +425,12 @@ describe("DefaultPackageManager git update", () => {
 
 			const resources = await packageManager.resolveExtensionSources([gitSource], { temporary: true });
 
-			expect(resources.extensions.some((entry) => entry.path === extensionFile)).toBe(true);
-			expect(getCurrentCommit(cachedDir)).toBe(newCommit);
-			expect(getFileContent(cachedDir, "pi-extensions/session-breakdown.ts")).toBe("// fresh");
+			const active = selected(gitSource, "temporary");
+			expect(
+				resources.extensions.some((entry) => entry.path === join(active, "pi-extensions", "session-breakdown.ts")),
+			).toBe(true);
+			expect(getCurrentCommit(active)).toBe(newCommit);
+			expect(getFileContent(active, "pi-extensions/session-breakdown.ts")).toBe("// fresh");
 		});
 	});
 });
