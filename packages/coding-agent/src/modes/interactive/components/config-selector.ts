@@ -17,6 +17,7 @@ import {
 import { CONFIG_DIR_NAME } from "../../../config.ts";
 import {
 	matchesGitPackageExactRule,
+	matchesPackageAliasExactRule,
 	type PathMetadata,
 	type ResolvedPaths,
 	type ResolvedResource,
@@ -24,7 +25,7 @@ import {
 } from "../../../core/package-manager.ts";
 import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
 import { BUILTIN_PATH_PREFIX, getResourcePathKey } from "../../../core/source-info.ts";
-import { isLocalPath, resolvePath, shortenHomePath } from "../../../utils/paths.ts";
+import { isLocalPath, isPathWithin, resolvePath, shortenHomePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
@@ -769,11 +770,14 @@ class ResourceList implements Component, Focusable {
 	}
 
 	private matchesAbsoluteGitPackageOverride(item: ResourceItem, entry: string): boolean {
-		const revision = item.metadata.gitRevision;
+		if (!entry.startsWith("+") && !entry.startsWith("-")) return false;
+		const rule = entry.slice(1);
+		const { gitRevision, packageAliases, baseDir } = item.metadata;
 		return (
-			revision !== undefined &&
-			(entry.startsWith("+") || entry.startsWith("-")) &&
-			matchesGitPackageExactRule(item.path, entry.slice(1), revision)
+			(packageAliases !== undefined &&
+				baseDir !== undefined &&
+				matchesPackageAliasExactRule(packageAliases, rule, baseDir)) ||
+			(gitRevision !== undefined && matchesGitPackageExactRule(item.path, rule, gitRevision))
 		);
 	}
 
@@ -901,7 +905,8 @@ class ResourceList implements Component, Focusable {
 
 	private getPackageResourcePattern(item: ResourceItem): string {
 		const baseDir = item.metadata.baseDir ?? dirname(item.path);
-		return relative(baseDir, item.path);
+		const path = item.metadata.packageAliases?.find((alias) => isPathWithin(baseDir, alias)) ?? item.path;
+		return relative(baseDir, path);
 	}
 }
 

@@ -82,6 +82,7 @@ function getNpmVersionRange(version: string | undefined): string | undefined {
 }
 
 export interface PathMetadata {
+	packageAliases?: readonly string[];
 	source: string;
 	scope: SourceScope;
 	origin: "package" | "top-level";
@@ -959,6 +960,10 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 	} catch {
 		return undefined;
 	}
+}
+
+export function matchesPackageAliasExactRule(aliases: readonly string[], rule: string, baseDir: string): boolean {
+	return aliases.some((alias) => matchesAnyExactPattern(alias, [rule], baseDir));
 }
 
 export function matchesGitPackageExactRule(
@@ -2941,11 +2946,15 @@ export class DefaultPackageManager implements PackageManager {
 		let hasAnyDir = false;
 		for (const resourceType of RESOURCE_TYPES) {
 			const dir = join(packageRoot, resourceType);
-			if (existsSync(dir)) {
-				// Collect all files from the directory (all enabled by default)
-				const files = collectResourceFiles(dir, resourceType);
-				for (const f of files) {
-					this.addResource(this.getTargetMap(accumulator, resourceType), f, metadata, true);
+			if (existsSync(selectPath(dir))) {
+				const { allFiles, aliases } = this.collectSelectedPackagePaths([dir], resourceType, selectPath);
+				for (const f of allFiles) {
+					this.addResource(
+						this.getTargetMap(accumulator, resourceType),
+						f,
+						this.withPackageAliases(metadata, aliases.get(f)),
+						true,
+					);
 				}
 				hasAnyDir = true;
 			}
@@ -2966,14 +2975,12 @@ export class DefaultPackageManager implements PackageManager {
 			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata, selectPath);
 			return;
 		}
-		const dir = join(packageRoot, resourceType);
-		if (existsSync(dir)) {
-			// Collect all files from the directory (all enabled by default)
-			const files = collectResourceFiles(dir, resourceType);
-			for (const f of files) {
-				this.addResource(target, f, metadata, true);
-			}
-		}
+		const { allFiles, aliases } = this.collectSelectedPackagePaths(
+			[join(packageRoot, resourceType)],
+			resourceType,
+			selectPath,
+		);
+		for (const f of allFiles) this.addResource(target, f, this.withPackageAliases(metadata, aliases.get(f)), true);
 	}
 
 	private applyPackageFilter(
@@ -2991,7 +2998,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (userPatterns.length === 0) {
 			// Empty array explicitly disables all resources of this type
 			for (const f of allFiles) {
-				this.addResource(target, f, metadata, false);
+				this.addResource(target, f, this.withPackageAliases(metadata, aliases?.get(f)), false);
 			}
 			return;
 		}
@@ -3001,7 +3008,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		for (const f of allFiles) {
 			const enabled = enabledByUser.has(f);
-			this.addResource(target, f, metadata, enabled);
+			this.addResource(target, f, this.withPackageAliases(metadata, aliases?.get(f)), enabled);
 		}
 	}
 
@@ -3021,7 +3028,9 @@ export class DefaultPackageManager implements PackageManager {
 
 		const { allFiles, aliases } = this.collectManifestFiles(packageRoot, resourceType, manifest, selectPath);
 		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot, filterRoot, aliases);
-		for (const [filePath, enabled] of enabledByUser) this.addResource(target, filePath, metadata, enabled);
+		for (const [filePath, enabled] of enabledByUser) {
+			this.addResource(target, filePath, this.withPackageAliases(metadata, aliases?.get(filePath)), enabled);
+		}
 	}
 
 	/**
@@ -3051,12 +3060,12 @@ export class DefaultPackageManager implements PackageManager {
 			return { allFiles: Array.from(enabledByManifest), enabledByManifest, aliases };
 		}
 
-		const conventionDir = join(packageRoot, resourceType);
-		if (!existsSync(conventionDir)) {
-			return { allFiles: [], enabledByManifest: new Set() };
-		}
-		const allFiles = collectResourceFiles(conventionDir, resourceType);
-		return { allFiles, enabledByManifest: new Set(allFiles) };
+		const { allFiles, aliases } = this.collectSelectedPackagePaths(
+			[join(packageRoot, resourceType)],
+			resourceType,
+			selectPath,
+		);
+		return { allFiles, aliases, enabledByManifest: new Set(allFiles) };
 	}
 
 	private addManifestEntries(
@@ -3075,9 +3084,13 @@ export class DefaultPackageManager implements PackageManager {
 
 		for (const f of allFiles) {
 			if (enabledPaths.has(f)) {
-				this.addResource(target, f, metadata, true);
+				this.addResource(target, f, this.withPackageAliases(metadata, aliases.get(f)), true);
 			}
 		}
+	}
+
+	private withPackageAliases(metadata: PathMetadata, aliases?: Set<string>): PathMetadata {
+		return aliases?.size ? { ...metadata, packageAliases: [...aliases] } : metadata;
 	}
 
 	private collectFilesFromManifestEntries(
@@ -3094,6 +3107,14 @@ export class DefaultPackageManager implements PackageManager {
 
 			return expandPackageGlob(entry, root);
 		});
+		return this.collectSelectedPackagePaths(resolved, resourceType, selectPath);
+	}
+
+	private collectSelectedPackagePaths(
+		resolved: string[],
+		resourceType: ResourceType,
+		selectPath: (path: string) => string,
+	) {
 		const aliases = new Map<string, Set<string>>();
 		const allFiles = new Set<string>();
 		const rememberAlias = (file: string, alias: string) => {
@@ -3103,8 +3124,9 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		for (const original of resolved) {
 			const selected = selectPath(original);
-			for (const path of this.collectFilesFromPaths([selected], resourceType)) {
+			for (const path of this.collectFilesFromPaths([selected], resourceType, selectPath, rememberAlias)) {
 				const active = selectPath(path);
+				if (!existsSync(active)) continue;
 				if (active !== path) rememberAlias(active, path);
 				if (selected !== original && (path === selected || isPathInside(selected, path))) {
 					rememberAlias(active, join(original, relative(selected, path)));

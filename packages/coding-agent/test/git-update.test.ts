@@ -392,45 +392,60 @@ describe("DefaultPackageManager git update", () => {
 		expect(loader.getExtensions().extensions.map(({ path }) => path)).toContain(join(selected(), "added.ts"));
 	});
 
-	it("defers an explicit project checkout alias until project trust resolves", async () => {
-		setupRemoteAndInstall();
-		const marker = join(tempDir, "initialized");
-		const extension = (value: string) =>
-			`import { appendFileSync } from "node:fs"; export default function() { appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
-		createCommit(remoteDir, "worker.ts", extension("old\n"), "Add project extension");
-		const checkout = join(tempDir, ".pi", "git", "github.com", "test", "extension");
-		mkdirSync(dirname(checkout), { recursive: true });
-		git(["clone", remoteDir, checkout], tempDir);
-		settingsManager.setPackages([]);
-		settingsManager.setProjectPackages([{ source: gitSource, autoload: false }]);
-		createCommit(remoteDir, "worker.ts", extension("selected\n"), "Update project extension");
-		await packageManager.update();
-		const active = packageManager.getInstalledPath(gitSource, "project");
-		if (!active || active === checkout) throw new Error("Expected a staged project revision");
-		const alias = join(tempDir, "checkout-alias");
-		symlinkSync(checkout, alias, process.platform === "win32" ? "junction" : "dir");
-		const ordinary = join(tempDir, "ordinary.ts");
-		writeFileSync(ordinary, extension("ordinary\n"));
-		await settingsManager.flush();
-		const loader = new DefaultResourceLoader({
-			cwd: tempDir,
-			agentDir,
-			settingsManager,
-			additionalExtensionPaths: [join(alias, "worker.ts"), ordinary],
-		});
-		await loader.reload({
-			resolveProjectTrust: async ({ extensionsResult }) => {
-				expect(settingsManager.isProjectTrusted()).toBe(false);
-				expect(settingsManager.getProjectSettings().packages).toBeUndefined();
-				expect(extensionsResult.extensions.map(({ path }) => path)).toEqual([ordinary]);
-				expect(readFileSync(marker, "utf8")).toBe("ordinary\n");
-				return true;
-			},
-		});
-		expect(loader.getExtensions().errors).toEqual([]);
-		expect(loader.getExtensions().extensions.map(({ path }) => path)).toEqual([join(active, "worker.ts"), ordinary]);
-		expect(readFileSync(marker, "utf8")).toBe("ordinary\nselected\n");
-	});
+	it.each([false, true])(
+		"defers a project checkout alias until project trust resolves (nested: %s)",
+		async (nested) => {
+			setupRemoteAndInstall();
+			const marker = join(tempDir, "initialized");
+			const extension = (value: string) =>
+				`import { appendFileSync } from "node:fs"; export default function() { appendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(value)}); }`;
+			createCommit(remoteDir, "worker.ts", extension("old\n"), "Add project extension");
+			const checkout = join(tempDir, ".pi", "git", "github.com", "test", "extension");
+			mkdirSync(dirname(checkout), { recursive: true });
+			git(["clone", remoteDir, checkout], tempDir);
+			settingsManager.setPackages([]);
+			settingsManager.setProjectPackages([{ source: gitSource, autoload: false }]);
+			createCommit(remoteDir, "worker.ts", extension("selected\n"), "Update project extension");
+			await packageManager.update();
+			const active = packageManager.getInstalledPath(gitSource, "project");
+			if (!active || active === checkout) throw new Error("Expected a staged project revision");
+			const alias = join(tempDir, "checkout-alias");
+			symlinkSync(checkout, alias, process.platform === "win32" ? "junction" : "dir");
+			const ordinary = nested ? join(tempDir, "cli-package", "ordinary.ts") : join(tempDir, "ordinary.ts");
+			const cliPackage = dirname(ordinary);
+			if (nested) {
+				mkdirSync(cliPackage);
+				symlinkSync(checkout, join(cliPackage, "managed"), process.platform === "win32" ? "junction" : "dir");
+				writeFileSync(
+					join(cliPackage, "package.json"),
+					JSON.stringify({ pi: { extensions: ["managed/worker.ts", "ordinary.ts"] } }),
+				);
+			}
+			writeFileSync(ordinary, extension("ordinary\n"));
+			await settingsManager.flush();
+			const loader = new DefaultResourceLoader({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+				additionalExtensionPaths: nested ? [cliPackage] : [join(alias, "worker.ts"), ordinary],
+			});
+			await loader.reload({
+				resolveProjectTrust: async ({ extensionsResult }) => {
+					expect(settingsManager.isProjectTrusted()).toBe(false);
+					expect(settingsManager.getProjectSettings().packages).toBeUndefined();
+					expect(extensionsResult.extensions.map(({ path }) => path)).toEqual([ordinary]);
+					expect(readFileSync(marker, "utf8")).toBe("ordinary\n");
+					return true;
+				},
+			});
+			expect(loader.getExtensions().errors).toEqual([]);
+			expect(loader.getExtensions().extensions.map(({ path }) => path)).toEqual([
+				join(active, "worker.ts"),
+				ordinary,
+			]);
+			expect(readFileSync(marker, "utf8")).toBe("ordinary\nselected\n");
+		},
+	);
 
 	it("pins a checkout selection when publication occurs between local and Git collection", async () => {
 		setupRemoteAndInstall();
@@ -951,6 +966,56 @@ describe("DefaultPackageManager git update", () => {
 				join(active, "new.ts"),
 				join(active, "worker.ts"),
 			]);
+			const worker = configured.extensions.find(({ path }) => path === join(active, "worker.ts"));
+			if (!worker) throw new Error("Expected selected worker");
+			const noop = () => {};
+			const selector = new ConfigSelectorComponent(
+				{ global: configured, project: configured },
+				settingsManager,
+				tempDir,
+				agentDir,
+				noop,
+				noop,
+				noop,
+			);
+			const list = selector.getResourceList() as unknown as {
+				toggleResource(item: typeof worker & { resourceType: "extensions" }): boolean;
+			};
+			expect(list.toggleResource({ ...worker, resourceType: "extensions" })).toBe(true);
+			expect(settingsManager.getGlobalSettings().packages).toContainEqual({
+				source: local,
+				extensions: [`+${join("src", "worker.ts")}`],
+			});
+			expect((await packageManager.resolve()).extensions).toContainEqual(
+				expect.objectContaining({ path: worker.path, enabled: true }),
+			);
+		},
+	);
+
+	it.skipIf(process.platform === "win32").each([false, true])(
+		"discovers selected child aliases in a package directory (manifest: %s)",
+		async (manifest) => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "removed.ts", "export default function() {}", "Add old resource");
+			git(["pull", "--ff-only"], installedDir);
+			const local = join(agentDir, "local-package");
+			const dir = join(local, "extensions");
+			mkdirSync(dir, { recursive: true });
+			if (manifest)
+				writeFileSync(join(local, "package.json"), JSON.stringify({ pi: { extensions: ["extensions"] } }));
+			for (const name of ["added.ts", "removed.ts"]) symlinkSync(join(installedDir, name), join(dir, name));
+			settingsManager.setPackages([{ source: gitSource, autoload: false }, local]);
+			git(["rm", "removed.ts"], remoteDir);
+			createCommit(remoteDir, "added.ts", "export default function() {}", "Add selected resource");
+			await packageManager.update();
+			const configured = await packageManager.resolve();
+			const cli = await packageManager.resolveExtensionSources([local], {
+				temporary: true,
+				gitRevisions: configured.gitRevisions,
+			});
+			for (const result of [configured, cli]) {
+				expect(result.extensions.map(({ path }) => path)).toEqual([join(selected(), "added.ts")]);
+			}
 		},
 	);
 

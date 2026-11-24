@@ -732,7 +732,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 			gitRevisions: resolvedPaths.gitRevisions,
 		});
 		const enabledExtensions = resolvedPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
-		const cliEnabledExtensions = cliExtensionPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
+		const cliEnabledExtensions = cliExtensionPaths.extensions
+			.filter((r) => r.enabled && !this.isProjectManagedExtensionSource(r.path))
+			.map((r) => r.path);
 		// Built-in extensions wait for the final pass: project settings can disable them, and a loaded
 		// extension cannot be unloaded.
 		const extensionPaths = (
