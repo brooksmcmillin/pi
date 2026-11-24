@@ -456,6 +456,7 @@ describe("DefaultPackageManager git update", () => {
 		"explicit file",
 		"explicit internal symlink",
 		"explicit nested file",
+		"explicit directory symlink",
 		"retained alias exclusion",
 		"historical glob",
 	])("uses the selected manifest through a %s alias", async (kind) => {
@@ -476,7 +477,17 @@ describe("DefaultPackageManager git update", () => {
 			writeFileSync(join(tempDir, "external.ts"), "export default function() {}");
 			symlinkSync(join(tempDir, "external.ts"), join(installedDir, "new.ts"));
 		}
-		const replacement = nested ? "assets/new.ts" : "new.ts";
+		const directoryAlias = kind === "explicit directory symlink";
+		const replacement = nested || directoryAlias ? "assets/new.ts" : "new.ts";
+		if (directoryAlias) {
+			mkdirSync(join(installedDir, "impl"));
+			symlinkSync(
+				join(installedDir, "impl"),
+				join(installedDir, "assets"),
+				process.platform === "win32" ? "junction" : "dir",
+			);
+			mkdirSync(join(remoteDir, "assets"));
+		}
 		if (nested) createCommit(remoteDir, "assets", "old file", "Add old assets file");
 		git(["pull", "--ff-only"], installedDir);
 		if (kind === "explicit internal symlink" && process.platform !== "win32") {
@@ -535,10 +546,24 @@ describe("DefaultPackageManager git update", () => {
 		);
 		const list = selector.getResourceList() as unknown as {
 			toggleResource(resource: typeof item & { resourceType: "extensions" }): boolean;
-			setProjectTopLevelOverride(resource: typeof item & { resourceType: "extensions" }, state: "inherit"): boolean;
 		};
 		settingsManager.setProjectExtensionPaths([first, `-${first}`]);
-		expect(list.setProjectTopLevelOverride({ ...item, resourceType: "extensions" }, "inherit")).toBe(true);
+		const project = await packageManager.resolve();
+		const projectItem = project.extensions.find((entry) => entry.path === next);
+		if (!projectItem) throw new Error("Expected project extension");
+		const projectSelector = new ConfigSelectorComponent(
+			{ global: resolved, project },
+			settingsManager,
+			tempDir,
+			agentDir,
+			noop,
+			noop,
+			noop,
+			undefined,
+			"project",
+		);
+		const projectList = projectSelector.getResourceList() as unknown as typeof list;
+		expect(projectList.toggleResource({ ...projectItem, resourceType: "extensions" })).toBe(false);
 		expect(settingsManager.getProjectSettings().extensions).toEqual([]);
 		expect((await packageManager.resolve()).extensions).toContainEqual(
 			expect.objectContaining({ path: next, enabled: false }),

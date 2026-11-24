@@ -938,13 +938,14 @@ export function redirectGitRevisionPath(path: string, logical: string, active: s
 	const root = canonicalizePath(logical);
 	// Check directory aliases too: a missing or redirected leaf in the old
 	// checkout should not hide its path in the selected revision.
+	let selected: string | undefined;
 	for (let ancestor = dirname(path); ; ancestor = dirname(ancestor)) {
 		const canonical = canonicalizePath(ancestor);
-		const selected = select(join(canonical, path.slice(ancestor.length)), root);
-		if (selected) return selected;
+		// An outer checkout alias takes precedence over symlinks inside the old checkout.
+		selected = select(join(canonical, path.slice(ancestor.length)), root) ?? selected;
 		if (dirname(ancestor) === ancestor) break;
 	}
-	return select(canonicalizePath(path), root);
+	return selected ?? select(canonicalizePath(path), root);
 }
 
 export function matchesGitPackageExactRule(
