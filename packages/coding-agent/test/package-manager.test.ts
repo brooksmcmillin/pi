@@ -2306,7 +2306,7 @@ writeFileSync('launcher.mjs', 'import ' + JSON.stringify(pathToFileURL(require('
 							"./extension-files/nested/.hidden.ts",
 							"./extension-groups/*/",
 						],
-						skills: ["./plugins/*/skills", "./plugins/linked/skills"],
+						skills: ["./plugins/[lm]ocal/skills/*", "./plugins/linked/skills"],
 					},
 				}),
 			);

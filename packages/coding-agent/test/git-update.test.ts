@@ -24,7 +24,12 @@ const fsFixture = vi.hoisted(() => ({
 	aliasTo: "",
 	blockedRename: "",
 	duringCopy: undefined as (() => Promise<void>) | undefined,
+	duringRemove: undefined as ((path: string, removed: boolean) => Promise<void>) | undefined,
 }));
+function mapAlias<T>(path: T): T | string {
+	return path === fsFixture.aliasFrom ? fsFixture.aliasTo : path;
+}
+
 vi.mock("node:fs/promises", async (importOriginal) => {
 	const fs = await importOriginal<typeof import("node:fs/promises")>();
 	return {
@@ -33,15 +38,20 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 			await fsFixture.duringCopy?.();
 			await fs.cp(from, to, options);
 		}) as typeof fs.cp,
+		rm: (async (path, options) => {
+			await fsFixture.duringRemove?.(String(path), false);
+			await fs.rm(mapAlias(path), options);
+			await fsFixture.duringRemove?.(String(path), true);
+		}) as typeof fs.rm,
 	};
 });
 vi.mock("node:fs", async (importOriginal) => {
 	const fs = await importOriginal<typeof import("node:fs")>();
-	const map = (path: Parameters<typeof fs.existsSync>[0]) => (path === fsFixture.aliasFrom ? fsFixture.aliasTo : path);
 	return {
 		...fs,
-		existsSync: (path: Parameters<typeof fs.existsSync>[0]) => fs.existsSync(map(path)),
-		statSync: ((path, options) => fs.statSync(map(path)!, options)) as typeof fs.statSync,
+		existsSync: (path: Parameters<typeof fs.existsSync>[0]) => fs.existsSync(mapAlias(path)),
+		statSync: ((path, options) => fs.statSync(mapAlias(path)!, options)) as typeof fs.statSync,
+		rmSync: ((path, options) => fs.rmSync(mapAlias(path), options)) as typeof fs.rmSync,
 		renameSync: ((from, to) => {
 			if (to === fsFixture.blockedRename) throw new Error("injected pointer rename failure");
 			fs.renameSync(from, to);
@@ -1347,6 +1357,22 @@ describe("DefaultPackageManager git update", () => {
 			expect.objectContaining({ path: join(selected(secondSource), "added.md") }),
 		]);
 
+		for (const pattern of [
+			`${prefix.slice(0, -1)}*/*.md`,
+			`${prefix.slice(0, -1)}[sx]/*.md`,
+			`${join(installedDir, "asset")}*/*.md`,
+			`${dirname(prefix)}/**/*.md`,
+			`${prefix}/{added.md,other*.md}`,
+		]) {
+			writeFileSync(
+				join(local, "package.json"),
+				JSON.stringify({ pi: { prompts: [pattern, `-${prefix}/excluded.md`] } }),
+			);
+			expect((await packageManager.resolve()).prompts).toEqual([
+				expect.objectContaining({ path: join(selected(secondSource), "added.md") }),
+			]);
+		}
+
 		const explicitLoader = new DefaultResourceLoader({
 			cwd: tempDir,
 			agentDir,
@@ -1370,6 +1396,39 @@ describe("DefaultPackageManager git update", () => {
 		expect((await packageManager.resolve()).prompts).toEqual([
 			expect.objectContaining({ path: join(selected(secondSource), "added.md") }),
 		]);
+
+		// This is not a physical symlink cycle: selecting the retained checkout makes it one.
+		const active = selected(secondSource);
+		symlinkSync(secondCheckout, join(active, "loop"), "dir");
+		mkdirSync(join(active, "example"));
+		writeFileSync(join(active, "example", "SKILL.md"), "---\nname: example\ndescription: Example\n---\n");
+		writeFileSync(
+			join(local, "package.json"),
+			JSON.stringify({
+				pi: {
+					prompts: ["resources", "-resources/assets/excluded.md", "-resources/assets/example/SKILL.md"],
+					skills: ["resources"],
+				},
+			}),
+		);
+		const bounded = await packageManager.resolve();
+		expect(bounded.prompts.map(({ path }) => path)).toEqual([join(active, "added.md")]);
+		const skills = bounded.skills.filter(({ path }) => path.startsWith(active));
+		expect(skills.map(({ path }) => path)).toEqual([join(active, "example", "SKILL.md")]);
+		for (const resource of [...bounded.prompts, ...skills]) {
+			expect(resource.metadata.packageAliases?.some((path) => path.includes(join("assets", "loop")))).toBe(false);
+		}
+		const skillLoader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+			noSkills: true,
+			additionalSkillPaths: [join(installedDir, "assets")],
+		});
+		await skillLoader.reload();
+		expect(skillLoader.getSkills().skills.map(({ name }) => name)).toEqual(["example"]);
+		rmSync(join(active, "loop"));
+		rmSync(join(active, "example"), { recursive: true });
 
 		const checkConfigured = async (sources: string[], expectedPaths: string[]) => {
 			settingsManager.setPackages(sources.map((source) => ({ source, autoload: false })));
@@ -2263,6 +2322,29 @@ describe("DefaultPackageManager git update", () => {
 		expect(getCurrentCommit(selected(pinnedSource))).toBe(pinnedCommit);
 	});
 
+	it("locks detached checkout fallback ref discovery before touching origin/HEAD", async () => {
+		setupRemoteAndInstall();
+		git(["checkout", "--detach"], installedDir);
+		const expected = createCommit(remoteDir, "extension.ts", "// v2", "Update default branch");
+		const competitor = new DefaultPackageManager({ cwd: tempDir, agentDir, settingsManager });
+		const manager = packageManager as unknown as {
+			runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
+		};
+		const run = manager.runCommand.bind(manager);
+		let competingUpdate: Promise<void> | undefined;
+		vi.spyOn(manager, "runCommand").mockImplementation(async (command, args, options) => {
+			if (command === "git" && args[0] === "remote" && args[1] === "set-head") {
+				competingUpdate = expect(competitor.update()).rejects.toMatchObject({ code: "ELOCKED" });
+				await competingUpdate;
+			}
+			await run(command, args, options);
+		});
+		await packageManager.update();
+		expect(competingUpdate).toBeDefined();
+		await competingUpdate;
+		expect(getCurrentCommit(selected())).toBe(expected);
+	});
+
 	it("keeps the surviving prompt ahead of a force-included prompt in a filtered manifest", async () => {
 		const local = join(tempDir, "local-package");
 		for (const [dir, text] of [
@@ -2456,6 +2538,15 @@ describe("DefaultPackageManager git update", () => {
 		).toBe(false);
 	});
 
+	it("updates healthy Git packages even when a configured checkout path is reserved", async () => {
+		setupRemoteAndInstall();
+		const expected = createCommit(remoteDir, "extension.ts", "// v2", "Update healthy package");
+		settingsManager.setPackages([`git:github.com/test/.pi-revision-${"a".repeat(64)}-Ab1234`, gitSource]);
+
+		await expect(packageManager.update()).rejects.toThrow("reserved revision namespace");
+		expect(getCurrentCommit(selected())).toBe(expected);
+	});
+
 	it("loads and removes a repository with a nonreserved revision prefix", async () => {
 		const source = "git:github.com/test/.pi-revision-tools";
 		const worker = join(dirname(installedDir), ".pi-revision-tools", "extensions", "worker.ts");
@@ -2588,30 +2679,77 @@ describe("DefaultPackageManager git update", () => {
 			expect(existsSync(active)).toBe(false);
 			expect(existsSync(installedDir)).toBe(false);
 		} else {
-			const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+			mkdirSync(aliasPath);
+			expect(selected(aliasSource)).toBe(aliasPath);
+			expect(selected()).toBe(active);
+			await packageManager.remove(aliasSource);
+			expect(getFileContent(active, "extension.ts")).toBe("// v2");
+
+			// Simulate a case-insensitive directory without changing the host platform.
 			fsFixture.aliasFrom = aliasPath;
 			fsFixture.aliasTo = installedDir;
 			try {
-				for (const value of ["darwin", "win32"]) {
-					Object.defineProperty(process, "platform", { ...platform, value });
-					expect(selected(aliasSource)).toBe(active);
-				}
+				expect(selected(aliasSource)).toBe(active);
+				const checkedLock: string[] = [];
+				fsFixture.duringRemove = async (path, removed) => {
+					if (path === active && !removed) {
+						expect(existsSync(installedDir)).toBe(true);
+						checkedLock.push("selected cleanup");
+					} else if (path === installedDir && removed) {
+						expect(existsSync(installedDir)).toBe(false);
+						checkedLock.push("after logical deletion");
+					} else {
+						return;
+					}
+					await expect(packageManager.remove(aliasSource)).rejects.toMatchObject({ code: "ELOCKED" });
+				};
+				await packageManager.remove(gitSource);
+				expect(checkedLock).toEqual(["selected cleanup", "after logical deletion"]);
+				expect(existsSync(active)).toBe(false);
+				expect(existsSync(installedDir)).toBe(false);
 			} finally {
-				Object.defineProperty(process, "platform", platform);
+				fsFixture.duringRemove = undefined;
 				fsFixture.aliasFrom = "";
 				fsFixture.aliasTo = "";
 			}
-			mkdirSync(aliasPath);
-			try {
-				Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-				expect(selected(aliasSource)).toBe(aliasPath);
-				expect(selected()).toBe(active);
-			} finally {
-				Object.defineProperty(process, "platform", platform);
-			}
-			await packageManager.remove(aliasSource);
-			expect(getFileContent(active, "extension.ts")).toBe("// v2");
 		}
+	});
+
+	it("updates distinct case-sensitive checkouts in one batch", async ({ skip }) => {
+		setupRemoteAndInstall();
+		const otherSource = "git:github.com/test/EXTENSION";
+		const otherDir = join(dirname(installedDir), "EXTENSION");
+		if (existsSync(otherDir)) return skip();
+		const otherRemote = join(tempDir, "other-remote");
+		mkdirSync(otherRemote);
+		initGitRepo(otherRemote);
+		createCommit(otherRemote, "extension.ts", "// other v1", "Initial commit");
+		git(["clone", otherRemote, otherDir], tempDir);
+		const head = createCommit(remoteDir, "extension.ts", "// v2", "Update");
+		const otherHead = createCommit(otherRemote, "extension.ts", "// other v2", "Update");
+		const unrelated = "git:github.com/test/unrelated";
+		git(["clone", remoteDir, join(dirname(installedDir), "unrelated")], tempDir);
+		settingsManager.setPackages([gitSource, otherSource, unrelated]);
+		const events: string[] = [];
+		packageManager.setProgressCallback(({ type, source }) => {
+			if (type === "start" || type === "complete") events.push(`${type}:${source}`);
+		});
+
+		await packageManager.update();
+
+		expect(getCurrentCommit(selected())).toBe(head);
+		expect(getCurrentCommit(selected(otherSource))).toBe(otherHead);
+		expect(events.slice(0, 2)).toEqual([`start:${gitSource}`, `start:${unrelated}`]);
+		expect(events.indexOf(`start:${otherSource}`)).toBeGreaterThan(events.indexOf(`complete:${gitSource}`));
+
+		const key = createHash("sha256")
+			.update(relative(join(agentDir, "git"), installedDir))
+			.digest("hex");
+		writeFileSync(join(agentDir, "git", ".git-update-state", `${key}.current`), "invalid\n");
+		const nextOther = createCommit(otherRemote, "extension.ts", "// other v3", "Update again");
+		settingsManager.setPackages([gitSource, otherSource]);
+		await expect(packageManager.update()).rejects.toThrow(/revision pointer/i);
+		expect(getCurrentCommit(selected(otherSource))).toBe(nextOther);
 	});
 
 	it("keeps the selected revision after moving its managed root", async () => {

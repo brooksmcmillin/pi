@@ -41,7 +41,7 @@ function getEnv(): NodeJS.ProcessEnv {
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import ignore from "ignore";
-import { minimatch } from "minimatch";
+import { braceExpand, minimatch } from "minimatch";
 import lockfile from "proper-lockfile";
 import { gt, maxSatisfying, rcompare, satisfies, valid, validRange } from "semver";
 import { CONFIG_DIR_NAME } from "../config.ts";
@@ -345,6 +345,8 @@ function isOverridePattern(s: string): boolean {
 	return s.startsWith("!") || s.startsWith("+") || s.startsWith("-");
 }
 
+const unchangedPath = (path: string) => path;
+
 function hasGlobPattern(s: string): boolean {
 	return s.includes("*") || s.includes("?");
 }
@@ -390,6 +392,7 @@ function collectFiles(
 	rootDir?: string,
 	selection?: DiscoverySelection,
 	logicalDir = dir,
+	ancestors: ReadonlySet<string> = new Set(),
 ): string[] {
 	const files: string[] = [];
 	if (!existsSync(dir)) return files;
@@ -399,6 +402,9 @@ function collectFiles(
 	addIgnoreRules(ig, dir, root, logicalDir);
 
 	try {
+		const identity = realpathSync(dir);
+		if (ancestors.has(identity)) return files;
+		const branch = new Set([...ancestors, identity]);
 		const entries = readdirSync(dir, { withFileTypes: true });
 		for (const entry of entries) {
 			if (entry.name.startsWith(".")) continue;
@@ -425,7 +431,7 @@ function collectFiles(
 
 			if (isDir) {
 				const selected = selection?.selectPath(fullPath) ?? fullPath;
-				files.push(...collectFiles(selected, filePattern, skipNodeModules, ig, root, selection, logical));
+				files.push(...collectFiles(selected, filePattern, skipNodeModules, ig, root, selection, logical, branch));
 			} else if (isFile && filePattern.test(entry.name)) {
 				files.push(fullPath);
 				if (selection?.recordDirect || logical !== fullPath) selection?.rememberAlias(fullPath, logical);
@@ -447,6 +453,7 @@ function collectSkillEntries(
 	rootDir?: string,
 	selection?: DiscoverySelection,
 	logicalDir = dir,
+	ancestors: ReadonlySet<string> = new Set(),
 ): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
@@ -460,6 +467,9 @@ function collectSkillEntries(
 	};
 
 	try {
+		const identity = realpathSync(dir);
+		if (ancestors.has(identity)) return entries;
+		const branch = new Set([...ancestors, identity]);
 		const dirEntries = readdirSync(dir, { withFileTypes: true });
 
 		for (const entry of dirEntries) {
@@ -519,7 +529,7 @@ function collectSkillEntries(
 			if (ig.ignores(`${relPath}/`)) continue;
 
 			const selected = selection?.selectPath(fullPath) ?? fullPath;
-			entries.push(...collectSkillEntries(selected, mode, ig, root, selection, logical));
+			entries.push(...collectSkillEntries(selected, mode, ig, root, selection, logical, branch));
 		}
 	} catch {
 		// Ignore errors
@@ -1620,9 +1630,23 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		const gitUpdates: UpdatedPackage[] = [];
 		if (gitCandidates.length > 0) {
-			const gitTasks = gitCandidates.map(
-				(entry) => async () =>
-					this.withProgress("update", entry.source, `Updating ${entry.source}...`, async () => {
+			const groups = new Map<string, GitUpdateTarget[]>();
+			const groupingErrors: unknown[] = [];
+			for (const entry of gitCandidates) {
+				try {
+					const logical = this.getGitStoragePath(entry.parsed, entry.scope);
+					const key = this.getGitCheckoutLockKey(logical, entry.scope);
+					const group = groups.get(key);
+					if (group) group.push(entry);
+					else groups.set(key, [entry]);
+				} catch (error) {
+					groupingErrors.push(error);
+				}
+			}
+			const gitTasks = [...groups.values()].map((group) => async () => {
+				const errors: unknown[] = [];
+				for (const entry of group) {
+					await this.withProgress("update", entry.source, `Updating ${entry.source}...`, async () => {
 						const targetDir = this.getGitInstallPath(entry.parsed, entry.scope);
 						const from = await this.getGitHead(targetDir);
 						await this.updateGit(entry.parsed, entry.scope);
@@ -1630,9 +1654,19 @@ export class DefaultPackageManager implements PackageManager {
 						if (from !== to) {
 							gitUpdates.push({ source: entry.source, type: "git", scope: entry.scope, from, to });
 						}
-					}),
+					}).catch((error: unknown) => {
+						errors.push(error);
+					});
+				}
+				return errors;
+			});
+			tasks.push(
+				this.runWithConcurrency(gitTasks, GIT_UPDATE_CONCURRENCY).then((results) => {
+					const errors = [...groupingErrors, ...results.flat()];
+					if (errors.length === 1) throw errors[0];
+					if (errors.length > 1) throw new AggregateError(errors, `${errors.length} Git package updates failed.`);
+				}),
 			);
-			tasks.push(this.runWithConcurrency(gitTasks, GIT_UPDATE_CONCURRENCY).then(() => {}));
 		}
 
 		await Promise.all(tasks);
@@ -2500,12 +2534,7 @@ export class DefaultPackageManager implements PackageManager {
 		const recovered = await this.recoverGitCheckout(logicalDir, scope);
 		const targetDir = recovered ?? logicalDir;
 		if (recovered) {
-			if (source.ref) {
-				await this.ensureGitRef(logicalDir, targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
-				return;
-			}
-			const target = await this.getLocalGitUpdateTarget(targetDir);
-			await this.ensureGitRef(logicalDir, targetDir, scope, target.fetchArgs, target.ref);
+			await this.ensureGitRef(logicalDir, targetDir, scope, source.ref);
 			return;
 		}
 		const gitRoot = this.getGitInstallRoot(scope);
@@ -2540,13 +2569,7 @@ export class DefaultPackageManager implements PackageManager {
 			return;
 		}
 
-		if (source.ref) {
-			await this.ensureGitRef(logicalDir, targetDir, scope, ["fetch", "origin", source.ref], "FETCH_HEAD");
-			return;
-		}
-
-		const target = await this.getLocalGitUpdateTarget(targetDir);
-		await this.ensureGitRef(logicalDir, targetDir, scope, target.fetchArgs, target.ref);
+		await this.ensureGitRef(logicalDir, targetDir, scope, source.ref);
 	}
 
 	private hasMissingGitDependencies(targetDir: string): boolean {
@@ -2581,37 +2604,43 @@ export class DefaultPackageManager implements PackageManager {
 	private getGitUpdateStatePath(targetDir: string, scope: SourceScope): string {
 		const packageRoot = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
 		const stateRoot = join(packageRoot, ".git-update-state");
-		let identity = relative(packageRoot, targetDir);
-		if (process.platform === "darwin" || process.platform === "win32") {
-			// Use the stored spelling only when the volume actually resolves the alias.
-			let parent = packageRoot;
-			identity = identity
-				.split(sep)
-				.map((part) => {
-					let name = part;
-					if (existsSync(join(parent, part))) {
-						const entries = readdirSync(parent);
-						if (!entries.includes(part)) {
-							const requested = statSync(join(parent, part));
-							name =
-								entries.find((entry) => {
-									if (entry.toLowerCase() !== part.toLowerCase()) return false;
-									const existing = statSync(join(parent, entry), { throwIfNoEntry: false });
-									return existing?.dev === requested.dev && existing.ino === requested.ino;
-								}) ?? part;
-						}
+		// Case sensitivity belongs to the directory, not the operating system.
+		let parent = packageRoot;
+		const identity = relative(packageRoot, targetDir)
+			.split(sep)
+			.map((part) => {
+				let name = part;
+				if (existsSync(join(parent, part))) {
+					const entries = readdirSync(parent);
+					if (!entries.includes(part)) {
+						const requested = statSync(join(parent, part), { throwIfNoEntry: false });
+						name =
+							entries.find((entry) => {
+								if (!requested || entry.toLowerCase() !== part.toLowerCase()) return false;
+								const existing = statSync(join(parent, entry), { throwIfNoEntry: false });
+								return existing?.dev === requested.dev && existing.ino === requested.ino;
+							}) ?? part;
 					}
-					parent = join(parent, name);
-					return name;
-				})
-				.join(sep);
-		}
+				}
+				parent = join(parent, name);
+				return name;
+			})
+			.join(sep);
 		return join(stateRoot, createHash("sha256").update(identity).digest("hex"));
 	}
 
-	private lockGitCheckout(state: string): () => void {
-		this.ensureGitIgnore(dirname(state));
-		return lockfile.lockSync(state, { realpath: false, lockfilePath: `${state}.lock` });
+	private getGitCheckoutLockKey(targetDir: string, scope: SourceScope): string {
+		const root = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+		// Case variants share a mutation lock even when the checkout no longer exists.
+		// Revision pointers still use the filesystem's actual checkout identity.
+		const digest = createHash("sha256").update(relative(root, targetDir).toLowerCase()).digest("hex");
+		return join(root, ".git-update-state", digest);
+	}
+
+	private lockGitCheckout(targetDir: string, scope: SourceScope): () => void {
+		const key = this.getGitCheckoutLockKey(targetDir, scope);
+		this.ensureGitIgnore(dirname(key));
+		return lockfile.lockSync(key, { realpath: false });
 	}
 
 	private assertSameGitCheckout(targetDir: string, installed: { dev: number; ino: number }): void {
@@ -2625,12 +2654,11 @@ export class DefaultPackageManager implements PackageManager {
 		logicalDir: string,
 		targetDir: string,
 		scope: SourceScope,
-		fetchArgs: string[],
-		ref: string,
+		configuredRef?: string,
 	): Promise<void> {
 		const installed = statSync(targetDir);
 		const state = this.getGitUpdateStatePath(logicalDir, scope);
-		const releaseFetch = this.lockGitCheckout(state);
+		const releaseFetch = this.lockGitCheckout(logicalDir, scope);
 		let localHead: string;
 		let targetHead: string;
 		try {
@@ -2638,6 +2666,10 @@ export class DefaultPackageManager implements PackageManager {
 			if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
 				throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
 			}
+			// Fallback target discovery can write origin/HEAD; keep it under the fetch lock.
+			const { fetchArgs, ref } = configuredRef
+				? { fetchArgs: ["fetch", "origin", configuredRef], ref: "FETCH_HEAD" }
+				: await this.getLocalGitUpdateTarget(targetDir);
 			// Pin the fetched commit before another operation can overwrite FETCH_HEAD.
 			const options = { cwd: targetDir, timeoutMs: NETWORK_TIMEOUT_MS };
 			await this.runCommand("git", fetchArgs, { cwd: targetDir });
@@ -2651,7 +2683,7 @@ export class DefaultPackageManager implements PackageManager {
 		const previous = `${state}.previous`;
 		if (localHead.trim() === targetHead.trim() && !interruptedLegacyUpdate) {
 			if (existsSync(previous) || this.hasMissingGitDependencies(targetDir)) {
-				const release = this.lockGitCheckout(state);
+				const release = this.lockGitCheckout(logicalDir, scope);
 				try {
 					this.assertSameGitCheckout(targetDir, installed);
 					if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
@@ -2678,7 +2710,7 @@ export class DefaultPackageManager implements PackageManager {
 		const staged = mkdtempSync(join(dirname(logicalDir), `.pi-revision-${basename(state)}-`));
 		let published = false;
 		try {
-			const releaseSnapshot = this.lockGitCheckout(state);
+			const releaseSnapshot = this.lockGitCheckout(logicalDir, scope);
 			try {
 				this.assertSameGitCheckout(targetDir, installed);
 				if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
@@ -2719,7 +2751,7 @@ export class DefaultPackageManager implements PackageManager {
 			if (existsSync(join(staged, "package.json"))) {
 				await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: staged });
 			}
-			const release = this.lockGitCheckout(state);
+			const release = this.lockGitCheckout(logicalDir, scope);
 			try {
 				this.assertSameGitCheckout(targetDir, installed);
 				if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
@@ -2743,17 +2775,15 @@ export class DefaultPackageManager implements PackageManager {
 		const state = this.getGitUpdateStatePath(logicalDir, scope);
 		const selected = this.readSelectedGitRevision(logicalDir, state);
 		if (existsSync(selected)) return selected;
-		const previous = `${state}.previous`;
-		const lockfilePath = `${state}.lock`;
-		if (!existsSync(previous) && !existsSync(lockfilePath) && selected === logicalDir) {
+		const key = this.getGitCheckoutLockKey(logicalDir, scope);
+		if (!existsSync(`${state}.previous`) && !existsSync(`${key}.lock`) && selected === logicalDir) {
 			return existsSync(logicalDir) ? logicalDir : undefined;
 		}
 		this.ensureGitIgnore(dirname(state));
 		// Allow an abandoned lock to reach proper-lockfile's default 10-second stale interval.
 		const release = await lockfile
-			.lock(state, {
+			.lock(key, {
 				realpath: false,
-				lockfilePath,
 				retries: { retries: 105, factor: 1, minTimeout: 100 },
 			})
 			.catch((error: NodeJS.ErrnoException) => {
@@ -2763,8 +2793,9 @@ export class DefaultPackageManager implements PackageManager {
 				});
 			});
 		try {
-			const current = this.readSelectedGitRevision(logicalDir, state);
-			if (current === logicalDir) this.restoreGitBackup(logicalDir, previous);
+			const currentState = this.getGitUpdateStatePath(logicalDir, scope);
+			const current = this.readSelectedGitRevision(logicalDir, currentState);
+			if (current === logicalDir) this.restoreGitBackup(logicalDir, `${currentState}.previous`);
 			if (existsSync(current)) return current;
 			if (current !== logicalDir) throw new GitRevisionPointerError(`Selected Git checkout is missing: ${current}`);
 			return undefined;
@@ -2824,9 +2855,9 @@ export class DefaultPackageManager implements PackageManager {
 
 	private async removeGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitStoragePath(source, scope);
-		const state = this.getGitUpdateStatePath(targetDir, scope);
-		const release = this.lockGitCheckout(state);
+		const release = this.lockGitCheckout(targetDir, scope);
 		try {
+			const state = this.getGitUpdateStatePath(targetDir, scope);
 			const pointer = `${state}.current`;
 			const pointerInfo = lstatSync(pointer, { throwIfNoEntry: false });
 			if (pointerInfo && !pointerInfo.isFile()) {
@@ -2853,12 +2884,12 @@ export class DefaultPackageManager implements PackageManager {
 				}
 			}
 			rmSync(`${state}.pending`, { force: true });
-			if (selected !== targetDir) await rm(targetDir, { recursive: true, force: true });
 			const markerPath = this.getGitUpdateMarkerPath(targetDir);
 			if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
 			await rm(`${state}.previous`, { recursive: true, force: true });
-			await rm(selected, { recursive: true, force: true });
+			if (selected !== targetDir) await rm(selected, { recursive: true, force: true });
 			rmSync(pointer, { force: true });
+			await rm(targetDir, { recursive: true, force: true });
 			this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
 		} finally {
 			release();
@@ -3085,7 +3116,9 @@ export class DefaultPackageManager implements PackageManager {
 		if (filterRoot !== packageRoot) {
 			metadata.gitRevision = { active: packageRoot, logical: filterRoot };
 		}
-		const selectPath = (path: string) => DefaultPackageManager.selectGitResourcePath(path, accumulator.gitRevisions);
+		const selectPath = accumulator.gitRevisions.size
+			? (path: string) => DefaultPackageManager.selectGitResourcePath(path, accumulator.gitRevisions)
+			: unchangedPath;
 		const manifest = readPiManifest(selectPath(join(packageRoot, "package.json")));
 		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest, selectPath);
 		if (changelogPath) {
@@ -3324,15 +3357,50 @@ export class DefaultPackageManager implements PackageManager {
 				return [resolve(root, entry)];
 			}
 
-			// Use a literal cwd for the fixed prefix, leaving only the wildcard suffix to glob.
-			const parts = toPosixPath(entry).split("/");
-			const wildcard = parts.findIndex(hasGlobPattern);
-			const prefix = resolve(root, parts.slice(0, wildcard).join("/") || (isAbsolute(entry) ? sep : "."));
-			const selected = selectPath(prefix);
-			if (selected === prefix) return expandPackageGlob(entry, root);
-			return expandPackageGlob(parts.slice(wildcard).join("/"), selected)
-				.map((file) => join(prefix, relative(selected, file)))
-				.filter((file) => isVisibleGlobPath(root, file));
+			if (selectPath === unchangedPath) return expandPackageGlob(entry, root);
+
+			const matches = new Set<string>();
+			const scans = new Map<string, string[]>();
+			const glob = (pattern: string, cwd: string) => {
+				const key = JSON.stringify([cwd, pattern]);
+				let paths = scans.get(key);
+				if (!paths) {
+					paths = expandPackageGlob(pattern, cwd);
+					scans.set(key, paths);
+				}
+				return paths;
+			};
+			const expand = (parts: string[], physical: string, logical: string, ancestors: ReadonlySet<string>) => {
+				for (const match of glob(parts.join("/"), physical)) {
+					const spelling = resolve(logical, relative(physical, match));
+					if (isVisibleGlobPath(root, spelling)) matches.add(spelling);
+				}
+				for (let i = 1; i < parts.length; i++) {
+					// A wildcard can match a managed checkout boundary, not just a file inside it.
+					for (const directory of glob(parts.slice(0, i).join("/"), physical)) {
+						const selected = selectPath(directory);
+						if (selected === directory || ancestors.has(selected)) continue;
+						if (!statSync(selected, { throwIfNoEntry: false })?.isDirectory()) continue;
+						const spelling = resolve(logical, relative(physical, directory));
+						if (!isVisibleGlobPath(root, spelling)) continue;
+						// A globstar can keep consuming directories after crossing the boundary.
+						const rest = parts.slice(parts[i - 1] === "**" ? i - 1 : i);
+						expand(rest, selected, spelling, new Set([...ancestors, selected]));
+					}
+				}
+			};
+			for (const pattern of braceExpand(toPosixPath(entry))) {
+				const parts = pattern.split("/");
+				// Leave character classes, extglobs and escaped syntax for native glob.
+				const magic = parts.findIndex((part) => /[*?[({\\]/.test(part));
+				// A literal brace alternative still needs discovery in the selected parent.
+				const wildcard = magic < 0 ? parts.length - 1 : magic;
+				// Pass the fixed prefix as a literal cwd; it may contain characters meaningful to glob.
+				const prefix = wildcard === 0 ? root : resolve(root, `${parts.slice(0, wildcard).join("/")}/`);
+				const selected = selectPath(prefix);
+				expand(parts.slice(wildcard), selected, prefix, new Set([selected]));
+			}
+			return [...matches].sort();
 		});
 		const patterns = entries.filter(isOverridePattern);
 		const discovered = this.collectSelectedPackagePaths(resolved, resourceType, selectPath);

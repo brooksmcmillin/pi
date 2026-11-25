@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "fs";
 import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
@@ -178,6 +178,7 @@ function loadSkillsFromDirInternal(
 	rootDir?: string,
 	selectPath = (path: string) => path,
 	logicalDir = dir,
+	ancestors: ReadonlySet<string> = new Set(),
 ): LoadSkillsResult {
 	const skills: Skill[] = [];
 	const diagnostics: ResourceDiagnostic[] = [];
@@ -191,6 +192,9 @@ function loadSkillsFromDirInternal(
 	addIgnoreRules(ig, dir, root, logicalDir);
 
 	try {
+		const identity = realpathSync(dir);
+		if (ancestors.has(identity)) return { skills, diagnostics };
+		const branch = new Set([...ancestors, identity]);
 		const entries = readdirSync(dir, { withFileTypes: true });
 
 		for (const entry of entries) {
@@ -263,6 +267,7 @@ function loadSkillsFromDirInternal(
 					root,
 					selectPath,
 					join(logicalDir, entry.name),
+					branch,
 				);
 				skills.push(...subResult.skills);
 				diagnostics.push(...subResult.diagnostics);
