@@ -232,4 +232,6 @@ Pi reports its state with the [Program Status Protocol (OSC 7501)](https://www.s
 | `error` | A run ended with an error that is not retried. The message is the first line of the error. |
 | `idle` | Pi started, or you cancelled the run. |
 
+Background work defers `done` without hiding a settled `error` or a prompt that needs your input.
+
 Reports never contain prompts or model output. Pi sends them only after the terminal answers the protocol's support query; tmux and screen do not forward them. Set `PI_PROGRAM_STATUS=1` to send reports without asking, or `PI_PROGRAM_STATUS=0` to turn them off.

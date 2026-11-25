@@ -111,6 +111,17 @@ describe("ProgramStatusReporter", () => {
 		expect(last().state).toBe("done");
 	});
 
+	it("reports the settled status when the replacement's first write is a clear", () => {
+		const { reporter, send, last, owner, setBackgroundWork } = setup();
+		send({ type: "agent_start" });
+		setBackgroundWork("review", true);
+		send(settled);
+		expect(last().state).toBe("working");
+		owner.isActive = false;
+		reporter.setBackgroundWork({ isActive: true }, "review", false);
+		expect(last().state).toBe("done");
+	});
+
 	it("drops the invalidated owner's work when reload fails before replacement", () => {
 		const { reporter, send, last, owner, setBackgroundWork } = setup();
 		send({ type: "agent_start" });
@@ -124,12 +135,14 @@ describe("ProgramStatusReporter", () => {
 	});
 
 	it("reports only the outcome of the run: retried errors, final errors, and aborts", () => {
-		const { send, last } = setup();
+		const { send, last, setBackgroundWork } = setup();
 		send({ type: "agent_start" }, assistantEnd("error", "overloaded"), assistantEnd("stop"), settled);
 		expect(last()).toEqual({ state: "done" });
 
 		send({ type: "agent_start" }, assistantEnd("error", "Invalid API key\n{details}"), settled);
+		setBackgroundWork("review", true);
 		expect(last()).toEqual({ state: "error", message: "Invalid API key" });
+		setBackgroundWork("review", false);
 
 		send({ type: "agent_start" }, assistantEnd("aborted"), { type: "agent_settled", aborted: true });
 		expect(last()).toEqual({ state: "idle" });

@@ -91,8 +91,9 @@ export class ProgramStatusReporter {
 		if (owner !== this.backgroundOwner) {
 			this.backgroundWork.clear();
 			this.backgroundOwner = owner;
+		} else if (active === this.backgroundWork.has(source)) {
+			return;
 		}
-		if (active === this.backgroundWork.has(source)) return;
 		if (active) this.backgroundWork.add(source);
 		else this.backgroundWork.delete(source);
 		this.report();
