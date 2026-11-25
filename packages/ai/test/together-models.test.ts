@@ -24,7 +24,9 @@ describe("Together models", () => {
 		expect(model.thinkingLevelMap).toEqual({ minimal: null, low: null, medium: null });
 		expect(model.input).toEqual(["text", "image"]);
 		expect(model.contextWindow).toBe(1048576);
-		expect(model.maxTokens).toBe(1048576);
+		// Together's quickstart requests 131,072 tokens; the catalog's upper limit can vary by revision.
+		expect(model.maxTokens).toBeGreaterThanOrEqual(131_072);
+		expect(model.maxTokens).toBeLessThanOrEqual(model.contextWindow);
 		expect(model.cost).toEqual({
 			input: 3,
 			output: 15,
