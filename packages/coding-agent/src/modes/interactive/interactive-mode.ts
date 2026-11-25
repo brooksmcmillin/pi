@@ -2390,7 +2390,7 @@ export class InteractiveMode {
 
 		// Create a context for shortcut handlers
 		const createContext = (): ExtensionContext => ({
-			ui: this.createExtensionUIContext(),
+			ui: this.createExtensionUIContext(extensionRunner),
 			mode: "tui",
 			hasUI: true,
 			cwd: this.sessionManager.getCwd(),
@@ -2779,7 +2779,7 @@ export class InteractiveMode {
 		};
 	}
 
-	private createExtensionUIContext(): ExtensionUIContext {
+	private createExtensionUIContext(owner?: ExtensionRunner): ExtensionUIContext {
 		return {
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
@@ -2794,7 +2794,7 @@ export class InteractiveMode {
 				}
 			},
 			setBackgroundWork: (key, active) =>
-				this.programStatus.setBackgroundWork(this.session.extensionRunner, key, active),
+				this.programStatus.setBackgroundWork(owner ?? this.session.extensionRunner, key, active),
 			setWorkingVisible: (visible) => this.setWorkingVisible(visible),
 			setWorkingIndicator: (options) => this.setWorkingIndicator(options),
 			setHiddenThinkingLabel: (label) => this.setHiddenThinkingLabel(label),

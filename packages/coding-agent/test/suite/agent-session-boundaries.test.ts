@@ -520,6 +520,53 @@ describe("AgentSession actionable boundaries", () => {
 		expect(handleEvent).not.toHaveBeenCalled();
 	});
 
+	it("ignores background status writes from a captured shortcut after runner replacement", async () => {
+		const reports: ProgramStatus["state"][] = [];
+		const terminal = {
+			setProgramStatus: (status: ProgramStatus) => reports.push(status.state),
+		} as unknown as Terminal;
+		const reporter = new ProgramStatusReporter(
+			() => terminal,
+			() => undefined,
+		);
+		let captured: ExtensionUIContext | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerShortcut("ctrl+g", {
+						description: "Capture status hook",
+						handler: (ctx) => {
+							captured = ctx.ui;
+							ctx.ui.setBackgroundWork?.("review", true);
+						},
+					});
+				},
+			],
+		});
+		const replacement = await createHarness();
+		harnesses.push(harness, replacement);
+		const context = Object.create(InteractiveMode.prototype);
+		Object.defineProperties(context, {
+			session: { value: harness.session, writable: true },
+			sessionManager: { value: harness.sessionManager },
+			programStatus: { value: reporter },
+			keybindings: { value: { getEffectiveConfig: () => ({}) } },
+			defaultEditor: { value: {} },
+		});
+		context.setupExtensionShortcuts(harness.session.extensionRunner);
+		expect(context.defaultEditor.onExtensionShortcut("\x07")).toBe(true);
+		expect(captured).toBeDefined();
+		expect(reports).toEqual(["working"]);
+		harness.session.extensionRunner.invalidate();
+		context.session = replacement.session;
+		const current = context.createExtensionUIContext() as ExtensionUIContext;
+		current.setBackgroundWork?.("review", true);
+		captured?.setBackgroundWork?.("review", false);
+		expect(reports).toEqual(["working"]);
+		current.setBackgroundWork?.("review", false);
+		expect(reports).toEqual(["working", "idle"]);
+	});
+
 	it("does not let an invalid explicit continuation suppress natural tool continuation", async () => {
 		const tool: AgentTool = {
 			name: "noop",
