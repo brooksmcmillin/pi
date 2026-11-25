@@ -25,6 +25,8 @@ export class ProgramStatusReporter {
 	private restingStatus: ProgramStatus = { state: "idle" };
 	/** Open dialogs by source, in the order they opened. The most recent one is reported. */
 	private readonly blocked = new Map<string, BlockedStatus>();
+	private readonly backgroundWork = new Set<string>();
+	private backgroundOwner: { readonly isActive: boolean } | undefined;
 	private lastReport: string | undefined;
 
 	constructor(getTerminal: () => Terminal, getSessionName: () => string | undefined) {
@@ -83,8 +85,23 @@ export class ProgramStatusReporter {
 		this.report();
 	}
 
+	/** Keep the terminal working while an extension owns outstanding background work. */
+	setBackgroundWork(owner: { readonly isActive: boolean }, source: string, active: boolean): void {
+		if (!owner.isActive) return;
+		if (owner !== this.backgroundOwner) {
+			this.backgroundWork.clear();
+			this.backgroundOwner = owner;
+		}
+		if (active === this.backgroundWork.has(source)) return;
+		if (active) this.backgroundWork.add(source);
+		else this.backgroundWork.delete(source);
+		this.report();
+	}
+
 	/** Forget the previous session's run, for example after switching sessions. */
 	reset(): void {
+		this.backgroundOwner = undefined;
+		this.backgroundWork.clear();
 		this.runActive = false;
 		this.compacting = false;
 		this.runResult = { state: "done" };
@@ -93,6 +110,10 @@ export class ProgramStatusReporter {
 	}
 
 	report(): void {
+		if (this.backgroundOwner && !this.backgroundOwner.isActive) {
+			this.backgroundOwner = undefined;
+			this.backgroundWork.clear();
+		}
 		const status: ProgramStatus = { ...this.currentStatus(), app: APP_NAME };
 		const key = JSON.stringify(status);
 		if (key === this.lastReport) return;
@@ -104,7 +125,8 @@ export class ProgramStatusReporter {
 		const blocked = [...this.blocked.values()].at(-1);
 		if (blocked) return { state: "blocked", ...blocked };
 		if (this.compacting) return { state: "working", message: "Compacting context" };
-		const status = this.runActive ? { state: "working" as const } : this.restingStatus;
+		const working = this.runActive || (this.backgroundWork.size > 0 && this.restingStatus.state !== "error");
+		const status = working ? { state: "working" as const } : this.restingStatus;
 		if (status.state === "working" || status.state === "done") return { ...status, message: this.getSessionName() };
 		return status;
 	}

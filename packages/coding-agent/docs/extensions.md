@@ -2894,6 +2894,8 @@ See [examples/extensions/timed-confirm.ts](../examples/extensions/timed-confirm.
 
 ### Widgets, Status, and Footer
 
+For background work, set a stable extension-specific key before yielding the parent turn. If delivery queues a follow-up, release the key on the matching result’s `message_start` or at the follow-up’s `agent_settled`, not at enqueue or in `agent_start` (which runs before the terminal reporter sees the new turn). `sendMessage(..., { triggerTurn: true })` is fire-and-forget: it returns no delivery acknowledgement and preparation can fail before those events fire. Your delivery mechanism must detect failure or abandonment and clear the key; this hook does not manage delivery or retries.
+
 ```typescript
 // Status in footer (persistent until cleared)
 ctx.ui.setStatus("my-ext", "Processing...");
@@ -2918,6 +2920,10 @@ ctx.ui.setWorkingIndicator({
 });
 ctx.ui.setWorkingIndicator({ frames: [] });  // Hide indicator
 ctx.ui.setWorkingIndicator();  // Restore default spinner
+
+// Terminal program status (not the in-Pi loader)
+ctx.ui.setBackgroundWork?.("my-ext", true);  // Keep reporting working after the turn settles
+ctx.ui.setBackgroundWork?.("my-ext", false); // Clear after work and result delivery finish
 
 // Widget above editor (default)
 ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"]);

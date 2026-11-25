@@ -226,9 +226,9 @@ Pi reports its state with the [Program Status Protocol (OSC 7501)](https://www.s
 
 | State | When |
 |---|---|
-| `working` | An agent run or compaction is in progress. The message is the session name. |
+| `working` | An agent run, compaction, or [extension-reported background work](extensions.md#widgets-status-and-footer) is in progress. |
 | `blocked` | An extension dialog or login waits for you. The message is the dialog title. |
-| `done` | A run finished. The message is the session name. |
+| `done` | A run finished and no extension-reported background work remains. The message is the session name. |
 | `error` | A run ended with an error that is not retried. The message is the first line of the error. |
 | `idle` | Pi started, or you cancelled the run. |
 
