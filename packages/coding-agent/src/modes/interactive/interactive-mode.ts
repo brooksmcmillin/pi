@@ -2286,10 +2286,13 @@ export class InteractiveMode {
 		this.programStatus.reset();
 		this.applyRuntimeSettings();
 
-		if (options.renderBeforeBind) {
-			this.renderCurrentSessionState();
-			this.subscribeToAgent();
-		}
+		let handleUIEvents = options.renderBeforeBind ?? false;
+		if (handleUIEvents) this.renderCurrentSessionState();
+		// Startup hooks may launch work before the rest of the TUI is ready for events.
+		this.unsubscribe = session.subscribe(async (event) => {
+			this.programStatus.handleEvent(event);
+			if (handleUIEvents) await this.handleEvent(event);
+		});
 
 		await this.bindCurrentSessionExtensions();
 
@@ -2297,9 +2300,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		if (!options.renderBeforeBind) {
-			this.subscribeToAgent();
-		}
+		handleUIEvents = true;
 
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
@@ -2449,7 +2450,7 @@ export class InteractiveMode {
 
 		// Create a context for shortcut handlers
 		const createContext = (): ExtensionContext => ({
-			ui: this.createExtensionUIContext(),
+			ui: this.createExtensionUIContext(extensionRunner),
 			mode: "tui",
 			hasUI: true,
 			cwd: this.sessionManager.getCwd(),
@@ -2838,7 +2839,7 @@ export class InteractiveMode {
 		};
 	}
 
-	private createExtensionUIContext(): ExtensionUIContext {
+	private createExtensionUIContext(owner?: ExtensionRunner): ExtensionUIContext {
 		return {
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
@@ -2852,6 +2853,8 @@ export class InteractiveMode {
 					this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage);
 				}
 			},
+			setBackgroundWork: (key, active) =>
+				this.programStatus.setBackgroundWork(owner ?? this.session.extensionRunner, key, active),
 			setWorkingVisible: (visible) => this.setWorkingVisible(visible),
 			setWorkingIndicator: (options) => this.setWorkingIndicator(options),
 			setHiddenThinkingLabel: (label) => this.setHiddenThinkingLabel(label),
@@ -3602,19 +3605,12 @@ export class InteractiveMode {
 		};
 	}
 
-	private subscribeToAgent(): void {
-		this.unsubscribe = this.session.subscribe(async (event) => {
-			await this.handleEvent(event);
-		});
-	}
-
 	private async handleEvent(event: AgentSessionEvent): Promise<void> {
 		if (!this.isInitialized) {
 			await this.init();
 		}
 
 		this.footer.invalidate();
-		this.programStatus.handleEvent(event);
 
 		switch (event.type) {
 			case "agent_start":
@@ -6781,6 +6777,8 @@ export class InteractiveMode {
 				dismissReloadBox(previousEditor as Component);
 			}
 			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			this.programStatus.report();
 		}
 	}
 

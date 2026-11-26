@@ -37,14 +37,7 @@ jobs:
             npm run build
             exit
           fi
-          # Use the same immutable catalog as Nix so live provider changes can't break CI.
-          revision=$(node -p 'require("./nix/model-catalog.json").revision')
-          [[ "$revision" =~ ^sha256-[a-f0-9]{64}$ ]]
-          catalog="$RUNNER_TEMP/pi-model-catalog.json"
-          curl --fail --silent --show-error --location --retry 3 \
-            "https://pi.dev/api/models/revisions/$revision?types=chat,image,classifier" -o "$catalog"
-          printf '%s  %s\n' "${revision#sha256-}" "$catalog" | sha256sum -c -
-          node packages/ai/scripts/hydrate-model-catalog.ts "$catalog"
+          node scripts/update-model-catalog-pin.mjs --hydrate
           npm run build:offline
 
       # Previews are published for main, release tags and PRs from branches of this repo only (see preview-packages.yml).
