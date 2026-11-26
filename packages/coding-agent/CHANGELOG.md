@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a `pi-fork` launcher and persistent fork identity in the terminal title and default footer, without changing configuration or session storage paths.
 - Added default-disabled `session.guardedOwner` / `ctx.guardedOwner` capabilities for host-attested cooperative submission, with session/generation binding, prompt-scoped cancellation and independent settlement acknowledgements.
 
 ### Changed
@@ -130,7 +131,6 @@
 - `pi.registerMarkdownTransformer()` takes an optional `{ messageTypes }` that selects the Markdown surfaces a transformer runs on. Besides user, assistant, and thinking Markdown, transformers can now opt into `custom` (custom messages and skill blocks), `summary` (branch and compaction summaries), and `changelog` (What's New, `/changelog`, the Extension Updates notice, and the Update Available note). Without options a transformer runs on user, assistant, and thinking Markdown as before. The built-in Mermaid renderer now also draws diagrams in expanded branch and compaction summaries
 - `pi auth login <provider>` logs in to a provider from the shell without starting a session, for example `pi auth login radius`. It signs in with an account in the browser and exits; `--api-key` saves an API key instead, and `--no-browser` uses device code or copy-code sign-in instead. Logging in to Radius also configures the Radius MCP server. `pi auth logout <provider>` removes the stored credentials, like `/logout`
 - `ctx.ui.custom()` overlays now honor the `blocked` option: pi reports blocked program status (OSC 7501) from when the overlay is shown until it calls `done()`, also while it is hidden with `setHidden()`. Closing one overlay keeps other open questions blocked ([#11816](https://github.com/earendil-works/pi/issues/11816))
-- Added a `pi-fork` launcher and persistent fork identity in the terminal title and default footer, without changing configuration or session storage paths.
 - Added the `qwen-token-plan-individual-cn` provider for Qwen Token Plan Individual on the China endpoint, using `QWEN_TOKEN_PLAN_CN_API_KEY` ([#7989](https://github.com/earendil-works/pi/pull/7989) by [@bigoldcat123](https://github.com/bigoldcat123))
 - Added Microsoft-Decision-1 classifier support through GitHub Copilot, including codemode `models.classify()` ([#11679](https://github.com/earendil-works/pi/pull/11679) by [@Marvae](https://github.com/Marvae))
 - Added `compat.promptCacheKeyMode` (`"auto"`, `"enabled"`, or `"disabled"`) to enable prompt cache keys for compatible proxies or omit them for endpoints that reject them. Set it in `models.json` when using pi ([#9442](https://github.com/earendil-works/pi/pull/9442) by [@dannote](https://github.com/dannote))

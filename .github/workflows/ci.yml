@@ -67,11 +67,11 @@ jobs:
       - name: Check
         run: npm run check
 
-      # The checkout has no tags; the released changelog sections are compared with the newest release tag.
-      - name: Fetch the newest release tag
+      # Fork tags may lag the imported release; compare with the release this checkout contains.
+      - name: Fetch the matching upstream release tag
         run: |
-          tag=$(git ls-remote --tags --sort=-v:refname origin 'v*.*.*' | grep -v '\^{}' | head -1 | sed 's#.*refs/tags/##')
-          git fetch --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          tag="v$(node -p 'require("./packages/coding-agent/package.json").version')"
+          git fetch --depth=1 https://github.com/earendil-works/pi.git "refs/tags/$tag:refs/tags/$tag"
 
       - name: Check released changelog sections
         run: npm run check:released-changelogs

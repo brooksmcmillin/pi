@@ -8,9 +8,6 @@ if (mode === "parent") {
 	});
 	child.once("message", () => process.exit(0));
 } else {
-	appendFileSync(marker, "ready\n");
-	process.stdout.write("ready\n");
-	process.send?.("ready");
 	const timer = setInterval(() => {
 		appendFileSync(marker, "tick\n");
 		process.stdout.write("tick\n");
@@ -23,4 +20,8 @@ if (mode === "parent") {
 		appendFileSync(marker, "stopped\n");
 		process.exit(0);
 	});
+	// The parent may cancel immediately after readiness, before this event-loop turn ends.
+	appendFileSync(marker, "ready\n");
+	process.stdout.write("ready\n");
+	process.send?.("ready");
 }

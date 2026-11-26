@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed Fireworks tests referencing a removed catalog model, preserving budget-thinking, unsigned-thinking replay, and mid-conversation system-message capability coverage.
+
 ## [1.6.0] - 2026-11-20
 
 ### Added
@@ -71,7 +77,6 @@
 
 ### Fixed
 
-- Fixed Fireworks tests referencing a removed catalog model, preserving budget-thinking, unsigned-thinking replay, and mid-conversation system-message capability coverage.
 - Azure OpenAI models now keep OpenAI's long-context price tier, so requests above 272K input tokens are costed at Azure's long-context rates ([#11948](https://github.com/earendil-works/pi/issues/11948))
 - Fixed tool arguments for `Type.BigInt()` and `Type.Undefined()` parameters being rejected: they convert as TypeBox converted them (`"42"` and `42` to `42n`, `null` to `undefined`), now that pi-schema supports both types. `Type.Void()` still rejects every JSON argument.
 - Fixed OpenCode Go Claude Haiku 5.5 failing with a 400 (`Invalid signature in thinking block ... bound to a different conversation`) after the tool list, system prompt, or earlier history changed, which left the session failing on every retry. OpenCode Go and Zen Claude 5.5 models, Opus 5, and Fable 5.1 now use per-message effort and send `thinking.block_binding: drop_block`, like the Anthropic provider ([#10954](https://github.com/earendil-works/pi/issues/10954))
