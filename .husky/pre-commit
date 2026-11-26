@@ -1,7 +1,8 @@
 #!/bin/sh
 
 # Get list of staged files before running check
-STAGED_FILES=$(git diff --cached --no-renames --name-only) || exit 1
+STAGED_FILES=$(git diff --cached --name-only) || exit 1
+SETTLEMENT_PATHS=$(git diff --cached --no-renames --name-only) || exit 1
 
 node scripts/check-lockfile-commit.mjs
 if [ $? -ne 0 ]; then
@@ -53,7 +54,7 @@ if [ $RUN_BROWSER_SMOKE -eq 1 ]; then
   fi
 fi
 
-for file in $STAGED_FILES; do
+for file in $SETTLEMENT_PATHS; do
   case "$file" in
     .husky/pre-commit|packages/coding-agent/src/core/managed-search-process.ts|packages/coding-agent/src/core/owner-activity.ts|packages/coding-agent/test/managed-search-process-live.test.ts|packages/coding-agent/test/fixtures/settlement-process.cjs)
       echo "Running subprocess settlement tests..."

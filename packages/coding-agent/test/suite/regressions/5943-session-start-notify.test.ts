@@ -1,8 +1,9 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { Container, type ProgramStatus, type Terminal, Text } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../../../src/core/agent-session.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
+import { ProgramStatusReporter } from "../../../src/modes/interactive/program-status-reporter.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
 import { createHarness, createTestUiContext } from "../harness.ts";
 
@@ -431,6 +432,41 @@ describe("regression #5943: session_start transient UI", () => {
 		expect(context.hideThinkingBlock).toBe(true);
 		expect(events).toEqual(["reload", "rebuild:true", "start:true"]);
 	});
+
+	it.each([false, true])(
+		"refreshes terminal status after reload rejects (owner invalidated: %s)",
+		async (invalidated) => {
+			initTheme("dark", false);
+			const reports: ProgramStatus[] = [];
+			const terminal = { setProgramStatus: (status: ProgramStatus) => reports.push(status) } as unknown as Terminal;
+			const reporter = new ProgramStatusReporter(
+				() => terminal,
+				() => undefined,
+			);
+			const owner = { isActive: true };
+			reporter.handleEvent({ type: "agent_start" });
+			reporter.setBackgroundWork(owner, "example:review", true);
+			reporter.handleEvent({ type: "agent_settled", aborted: false });
+			expect(reports.at(-1)?.state).toBe("working");
+
+			const showError = vi.fn();
+			const context = createReloadCommandContext({
+				programStatus: reporter,
+				session: {
+					reload: async () => {
+						owner.isActive = !invalidated;
+						throw new Error("reload failed");
+					},
+				},
+				showError,
+			});
+
+			await interactiveModePrototype.handleReloadCommand.call(context);
+
+			expect(showError).toHaveBeenCalledWith(expect.stringContaining("reload failed"));
+			expect(reports.at(-1)?.state).toBe(invalidated ? "done" : "working");
+		},
+	);
 
 	it("keeps the reload blocker focused until async reload completes", async () => {
 		initTheme("dark", false);
