@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,42 +11,63 @@ import { OwnerActivity } from "../src/core/owner-activity.ts";
 const fixture = fileURLToPath(new URL("./fixtures/settlement-process.cjs", import.meta.url));
 
 describe("disposable subprocess settlement", () => {
-	it("joins a live marker writer after its tool promise returned, then acknowledges cancellation", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-settlement-"));
-		const marker = join(dir, "marker");
+	it("announces readiness only after the fixture can handle cancellation", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-settlement-ready-"));
 		const release = join(dir, "release");
-		const owner = new OwnerActivity();
-		let processHandle: ReturnType<typeof spawnSearchProcess> | undefined;
 		try {
-			const result = owner.submit(
-				owner.snapshot,
-				() => true,
-				true,
-				async () => {
-					processHandle = spawnSearchProcess(process.execPath, [fixture, "leaf", marker, release]);
-					await once(processHandle.child.stdout, "data");
-				},
-			);
-			if (result.status !== "running" || !processHandle) throw new Error("not started");
-			await once(processHandle.child.stdout, "data");
-			expect(readFileSync(marker, "utf8")).toContain("ready");
-			expect(owner.busy).toBe(true);
-			processHandle.stop();
-			await result.completion;
-			expect(await result.settlement).toBe("settled");
-			expect(readFileSync(marker, "utf8")).toContain("stopped");
-			expect(processHandle.child.exitCode).toBe(0);
-			expect(owner.busy).toBe(false);
-		} finally {
 			writeFileSync(release, "release");
-			if (processHandle && processHandle.child.exitCode === null && processHandle.child.signalCode === null) {
-				const closed = once(processHandle.child, "close");
-				processHandle.child.kill("SIGKILL");
-				await closed;
-			}
+			const child = spawnSync(process.execPath, [fixture, "leaf", join(dir, "marker"), release], {
+				encoding: "utf8",
+				timeout: 2_000,
+			});
+			expect(child.error).toBeUndefined();
+			expect(child.status, child.stderr).toBe(0);
+			expect(child.stdout).toContain("ready\n");
+		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	// Windows terminates the child without delivering SIGTERM to its handler.
+	it.skipIf(process.platform === "win32")(
+		"joins a live marker writer after its tool promise returned, then acknowledges cancellation",
+		async () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-settlement-"));
+			const marker = join(dir, "marker");
+			const release = join(dir, "release");
+			const owner = new OwnerActivity();
+			let processHandle: ReturnType<typeof spawnSearchProcess> | undefined;
+			try {
+				const result = owner.submit(
+					owner.snapshot,
+					() => true,
+					true,
+					async () => {
+						processHandle = spawnSearchProcess(process.execPath, [fixture, "leaf", marker, release]);
+						await once(processHandle.child.stdout, "data");
+					},
+				);
+				if (result.status !== "running" || !processHandle) throw new Error("not started");
+				await once(processHandle.child.stdout, "data");
+				expect(readFileSync(marker, "utf8")).toContain("ready");
+				expect(owner.busy).toBe(true);
+				processHandle.stop();
+				await result.completion;
+				expect(await result.settlement).toBe("settled");
+				expect(readFileSync(marker, "utf8")).toContain("stopped");
+				expect(processHandle.child.exitCode).toBe(0);
+				expect(owner.busy).toBe(false);
+			} finally {
+				writeFileSync(release, "release");
+				if (processHandle && processHandle.child.exitCode === null && processHandle.child.signalCode === null) {
+					const closed = once(processHandle.child, "close");
+					processHandle.child.kill("SIGKILL");
+					await closed;
+				}
+				rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
 
 	// This is a deliberately unsupported non-leaf fixture, not a supported search backend.
 	it.skipIf(process.platform === "win32")(
