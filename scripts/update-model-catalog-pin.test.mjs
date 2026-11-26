@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, mock, test } from "node:test";
-import { updateModelCatalogPin } from "./update-model-catalog-pin.mjs";
+import { hydratePinnedModelCatalog, updateModelCatalogPin } from "./update-model-catalog-pin.mjs";
 
 const model = {
 	type: "chat",
@@ -90,6 +90,29 @@ function mockPiDev({ live = liveRevision, failure } = {}) {
 	});
 	return requests;
 }
+
+test("hydrates only the pinned catalog without changing the pin", async () => {
+	const requests = mockPiDev();
+	assert.equal(await hydratePinnedModelCatalog(root), currentRevision);
+	assert.deepEqual(requests, [`https://pi.dev/api/models/revisions/${currentRevision}?${typed}`]);
+	assert.equal(readPin(), pinFile(currentRevision));
+	const dataPath = join(root, "packages/ai/src/providers/data/test-provider.json");
+	assert.deepEqual(JSON.parse(readFileSync(dataPath, "utf8")), {
+		"openai-completions": { "chat:model-a": model },
+	});
+});
+
+test("rejects a changed snapshot without overwriting hydrated data", async () => {
+	mockPiDev();
+	await hydratePinnedModelCatalog(root);
+	const dataPath = join(root, "packages/ai/src/providers/data/test-provider.json");
+	const original = readFileSync(dataPath, "utf8");
+	mock.restoreAll();
+	mockPiDev({ failure: "revision-hash" });
+	await assert.rejects(hydratePinnedModelCatalog(root), /does not match its content/);
+	assert.equal(readFileSync(dataPath, "utf8"), original);
+	assert.equal(readPin(), pinFile(currentRevision));
+});
 
 test("pins the newest typed catalog after verifying its immutable URL", async () => {
 	const requests = mockPiDev();

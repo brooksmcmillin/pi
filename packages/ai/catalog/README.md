@@ -45,3 +45,7 @@ export default defineProvider({
 ## Checking changes
 
 `npm run diff:model-catalog -- [provider ...]` from the repository root generates the catalog at `HEAD` and in the worktree and prints the JSON differences.
+
+The `CI` workflow builds and tests against the published revision in `nix/model-catalog.json` so live model additions and removals cannot change a rerun. To reproduce that build, run `node scripts/update-model-catalog-pin.mjs --hydrate` and then `npm run build:offline`. Live generation remains available through `npm run generate:models`.
+
+Test catalog mapping changes with synthetic source data. If application code needs a new model ID, first land the catalog change without the application dependency so the Publish Model Catalog workflow can publish it. Then run `npm run update:model-catalog-pin` and include the updated pin with the application change after verifying it contains the required model. The automatic Nix pin refresh may keep the old revision when the provider, model type, and API groups are unchanged.
