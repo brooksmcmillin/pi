@@ -184,6 +184,8 @@ export interface ExtensionUIContext {
 
 	/** Set the working/loading message shown during streaming. Call with no argument to restore default. */
 	setWorkingMessage(message?: string): void;
+	/** Report outstanding background work to the terminal, keyed by extension. Clear it when delivery is complete. */
+	setBackgroundWork?(key: string, active: boolean): void;
 
 	/** Show or hide the built-in interactive working loader row during streaming. */
 	setWorkingVisible(visible: boolean): void;

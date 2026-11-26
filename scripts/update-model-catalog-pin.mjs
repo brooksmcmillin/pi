@@ -126,12 +126,25 @@ export async function updateModelCatalogPin(root, { ifStale = false } = {}) {
 	return { revision, updated: revision !== current, bytes };
 }
 
+/** Hydrate model data from the committed revision without discovering or updating a live pin. */
+export async function hydratePinnedModelCatalog(root) {
+	const pinPath = join(root, "nix/model-catalog.json");
+	const { revision } = JSON.parse(readFileSync(pinPath, "utf8"));
+	if (typeof revision !== "string" || !REVISION_RE.test(revision)) throw new Error(`Invalid pin in ${pinPath}`);
+	hydrateModelCatalogBytes(root, await fetchRevision(revision));
+	return revision;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
 	const args = process.argv.slice(2);
-	if (args.length > 1 || (args.length === 1 && args[0] !== "--if-stale")) {
-		throw new Error("Usage: node scripts/update-model-catalog-pin.mjs [--if-stale]");
+	if (args.length > 1 || (args.length === 1 && !["--if-stale", "--hydrate"].includes(args[0]))) {
+		throw new Error("Usage: node scripts/update-model-catalog-pin.mjs [--if-stale | --hydrate]");
 	}
 	const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-	const { revision, updated } = await updateModelCatalogPin(root, { ifStale: args[0] === "--if-stale" });
-	console.log(`${updated ? "Pinned" : "Kept"} model catalog ${revision}`);
+	if (args[0] === "--hydrate") {
+		console.log(`Hydrated model catalog ${await hydratePinnedModelCatalog(root)}`);
+	} else {
+		const { revision, updated } = await updateModelCatalogPin(root, { ifStale: args[0] === "--if-stale" });
+		console.log(`${updated ? "Pinned" : "Kept"} model catalog ${revision}`);
+	}
 }

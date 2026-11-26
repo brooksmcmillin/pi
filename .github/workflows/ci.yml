@@ -29,8 +29,11 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Build
-        run: npm run build
+      # Type checks and tests reference model IDs that can disappear from live catalogs.
+      - name: Build with pinned model catalog
+        run: |
+          node scripts/update-model-catalog-pin.mjs --hydrate
+          npm run build:offline
 
       # Previews are published for main, release tags and PRs from branches of this repo only (see preview-packages.yml).
       - name: Pack preview packages
@@ -84,8 +87,10 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Build
-        run: npm run build
+      - name: Build with pinned model catalog
+        run: |
+          node scripts/update-model-catalog-pin.mjs --hydrate
+          npm run build:offline
 
       - name: Build the pi-env daemon
         if: matrix.name == 'other'

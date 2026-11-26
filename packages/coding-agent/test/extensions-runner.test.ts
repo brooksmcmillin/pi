@@ -588,6 +588,31 @@ describe("ExtensionRunner", () => {
 			expect(ctx.hasUI).toBe(true);
 		});
 
+		it("ignores a captured background-work callback after its runner is replaced", async () => {
+			const ui = { setBackgroundWork: vi.fn() } as unknown as ExtensionUIContext;
+			const createRunner = async () => {
+				const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir,
+					sessionManager,
+					modelRegistry,
+				);
+				runner.bindCore(extensionActions, extensionContextActions);
+				runner.setUIContext(ui, "tui");
+				return runner;
+			};
+			const oldRunner = await createRunner();
+			const oldCallback = oldRunner.createContext().ui.setBackgroundWork;
+			oldRunner.invalidate();
+			expect(oldRunner.isActive).toBe(false);
+			const newRunner = await createRunner();
+			newRunner.createContext().ui.setBackgroundWork?.("review", true);
+			oldCallback?.("review", false);
+			expect(ui.setBackgroundWork).toHaveBeenCalledExactlyOnceWith("review", true);
+		});
+
 		it("exposes tui mode with hasUI true when a TUI UI context is provided", async () => {
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);

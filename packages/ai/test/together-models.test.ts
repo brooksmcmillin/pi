@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { getModel } from "../src/compat.ts";
+import { buildCatalog } from "../catalog/build.ts";
+import together from "../catalog/providers/together.ts";
+import type { ModelsDevV2Model } from "../catalog/sources/models-dev.ts";
 import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.ts";
 
 const originalTogetherApiKey = process.env.TOGETHER_API_KEY;
@@ -12,9 +14,43 @@ afterEach(() => {
 	}
 });
 
+function buildTogetherModels() {
+	const models = ["moonshotai/Kimi-K3", "openai/gpt-oss-120b", "deepseek-ai/DeepSeek-V4-Pro-0813"].map(
+		(id): ModelsDevV2Model => ({
+			id,
+			name: id,
+			type: "chat",
+			api: {},
+			modalities: { input: ["text", "image"], output: ["text"] },
+			capabilities: {
+				tools: { supported: true },
+				reasoning: {
+					supported: true,
+					...(id === "openai/gpt-oss-120b" ? { effort: ["low", "medium", "high"] } : {}),
+				},
+			},
+			limit: { context: 1048576, output: 131072 },
+			cost: { text: { input: { price: 3, cache: { read: 0.3 } }, output: { price: 15 } } },
+		}),
+	);
+	const catalog = buildCatalog(
+		[together],
+		{
+			modelsDev: { togetherai: { models: Object.fromEntries(models.map((model) => [model.id, model])) } },
+			modelsDevDecisions: {},
+			openRouter: { chat: [], images: [], classifiers: [] },
+			aiGateway: { chat: [], classifiers: [] },
+			nvidiaModelIds: new Map(),
+			radius: [],
+		},
+		true,
+	);
+	return Object.fromEntries(catalog.together.chat.map((model) => [model.id, model]));
+}
+
 describe("Together models", () => {
-	it("registers the default Kimi K3 model via OpenAI-compatible Chat Completions API", () => {
-		const model = getModel("together", "moonshotai/Kimi-K3");
+	it("registers Kimi K3 via OpenAI-compatible Chat Completions API", () => {
+		const model = buildTogetherModels()["moonshotai/Kimi-K3"];
 
 		expect(model).toBeDefined();
 		expect(model.api).toBe("openai-completions");
@@ -24,7 +60,7 @@ describe("Together models", () => {
 		expect(model.thinkingLevelMap).toEqual({ minimal: null, low: null, medium: null });
 		expect(model.input).toEqual(["text", "image"]);
 		expect(model.contextWindow).toBe(1048576);
-		expect(model.maxTokens).toBe(1048576);
+		expect(model.maxTokens).toBe(131072);
 		expect(model.cost).toEqual({
 			input: 3,
 			output: 15,
@@ -43,7 +79,8 @@ describe("Together models", () => {
 	});
 
 	it("models Together reasoning controls from the Together API surface", () => {
-		const gptOss = getModel("together", "openai/gpt-oss-120b");
+		const models = buildTogetherModels();
+		const gptOss = models["openai/gpt-oss-120b"];
 		expect(gptOss.thinkingLevelMap).toEqual({
 			off: null,
 			minimal: null,
@@ -58,7 +95,7 @@ describe("Together models", () => {
 			thinkingFormat: "openai",
 		});
 
-		const deepSeekV4 = getModel("together", "deepseek-ai/DeepSeek-V4-Pro-0813");
+		const deepSeekV4 = models["deepseek-ai/DeepSeek-V4-Pro-0813"];
 		expect(deepSeekV4.thinkingLevelMap).toEqual({
 			minimal: null,
 			low: null,
