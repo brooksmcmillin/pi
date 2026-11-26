@@ -8,6 +8,10 @@ if (mode === "parent") {
 	});
 	child.once("message", () => process.exit(0));
 } else {
+	process.on("SIGTERM", () => {
+		appendFileSync(marker, "stopped\n");
+		process.exit(0);
+	});
 	appendFileSync(marker, "ready\n");
 	process.stdout.write("ready\n");
 	process.send?.("ready");
@@ -19,8 +23,4 @@ if (mode === "parent") {
 			process.exit(0);
 		}
 	}, 10);
-	process.on("SIGTERM", () => {
-		appendFileSync(marker, "stopped\n");
-		process.exit(0);
-	});
 }
