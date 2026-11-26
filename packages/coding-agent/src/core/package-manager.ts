@@ -1339,10 +1339,9 @@ export class DefaultPackageManager implements PackageManager {
 				const pinned = entry.scope === "user" ? bootstrapCheckouts?.get(logical) : undefined;
 				const selected =
 					pinned ?? this.readSelectedGitRevision(logical, this.getGitUpdateStatePath(logical, entry.scope));
-				if (existsSync(selected)) {
-					checkoutSnapshot.set(logical, selected);
-					if (logical !== selected) accumulator.gitRevisions.set(logical, selected);
-				}
+				// A valid pointer still excludes the retained checkout if its selection is missing.
+				if (logical !== selected) accumulator.gitRevisions.set(logical, selected);
+				if (existsSync(selected)) checkoutSnapshot.set(logical, selected);
 			} catch {
 				// Normal package resolution reports failures for packages that are actually loaded.
 			}
@@ -1941,7 +1940,15 @@ export class DefaultPackageManager implements PackageManager {
 						continue;
 					}
 					if (resolvedScope === "temporary" && temporarySelection?.preparing === false) continue;
+					if (resolvedScope === "temporary") {
+						const selected = this.readSelectedGitRevision(
+							logical,
+							this.getGitUpdateStatePath(logical, resolvedScope),
+						);
+						if (selected !== logical) accumulator.gitRevisions.set(logical, selected);
+					}
 					const recovered = await this.recoverGitCheckout(logical, resolvedScope);
+					if (resolvedScope === "temporary" && !recovered) accumulator.gitRevisions.delete(logical);
 					present = recovered !== undefined;
 					installedPath = recovered ?? "";
 				} catch (error) {
@@ -1964,6 +1971,7 @@ export class DefaultPackageManager implements PackageManager {
 				metadata.packageRoot = installedPath;
 				const logicalPath = this.getGitStoragePath(parsed, resolvedScope);
 				if (logicalPath !== installedPath) accumulator.gitRevisions.set(logicalPath, installedPath);
+				else accumulator.gitRevisions.delete(logicalPath);
 				if (resolvedScope === "temporary") temporaryCheckouts.set(logicalPath, installedPath);
 				else checkoutSnapshot?.set(logicalPath, installedPath);
 				collect(resolvedScope, () =>
@@ -2541,10 +2549,21 @@ export class DefaultPackageManager implements PackageManager {
 		if (gitRoot) {
 			this.ensureGitIgnore(gitRoot);
 		}
+		const release = this.lockGitCheckout(targetDir, scope);
+		try {
+			const pendingRemoval = this.reconcileGitRemoval(targetDir, scope);
+			if (pendingRemoval) throw new Error(`Finish removing Git package ${pendingRemoval} before retrying install.`);
+			if (existsSync(targetDir)) throw new Error(`Git package ${targetDir} appeared during install; retry install.`);
+			await this.cloneGitCheckout(source, targetDir, gitRoot);
+		} finally {
+			release();
+		}
+	}
+
+	private async cloneGitCheckout(source: GitSource, targetDir: string, gitRoot: string | undefined): Promise<void> {
 		mkdirSync(dirname(targetDir), { recursive: true });
 		const markerPath = this.getGitUpdateMarkerPath(targetDir);
 		if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
-
 		try {
 			await this.runCommand("git", ["clone", source.repo, targetDir]);
 			if (source.ref) {
@@ -2602,11 +2621,18 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private getGitUpdateStatePath(targetDir: string, scope: SourceScope): string {
-		const packageRoot = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
-		const stateRoot = join(packageRoot, ".git-update-state");
+		const root = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+		return this.getGitUpdateStatePathForIdentity(root, this.getGitCheckoutIdentity(root, targetDir));
+	}
+
+	private getGitUpdateStatePathForIdentity(root: string, identity: string): string {
+		return join(root, ".git-update-state", createHash("sha256").update(identity).digest("hex"));
+	}
+
+	private getGitCheckoutIdentity(root: string, targetDir: string): string {
 		// Case sensitivity belongs to the directory, not the operating system.
-		let parent = packageRoot;
-		const identity = relative(packageRoot, targetDir)
+		let parent = root;
+		return relative(root, targetDir)
 			.split(sep)
 			.map((part) => {
 				let name = part;
@@ -2626,7 +2652,6 @@ export class DefaultPackageManager implements PackageManager {
 				return name;
 			})
 			.join(sep);
-		return join(stateRoot, createHash("sha256").update(identity).digest("hex"));
 	}
 
 	private getGitCheckoutLockKey(targetDir: string, scope: SourceScope): string {
@@ -2776,7 +2801,12 @@ export class DefaultPackageManager implements PackageManager {
 		const selected = this.readSelectedGitRevision(logicalDir, state);
 		if (existsSync(selected)) return selected;
 		const key = this.getGitCheckoutLockKey(logicalDir, scope);
-		if (!existsSync(`${state}.previous`) && !existsSync(`${key}.lock`) && selected === logicalDir) {
+		if (
+			!existsSync(`${state}.previous`) &&
+			!existsSync(`${key}.lock`) &&
+			!existsSync(`${key}.removing`) &&
+			selected === logicalDir
+		) {
 			return existsSync(logicalDir) ? logicalDir : undefined;
 		}
 		this.ensureGitIgnore(dirname(state));
@@ -2793,6 +2823,8 @@ export class DefaultPackageManager implements PackageManager {
 				});
 			});
 		try {
+			const pendingRemoval = this.reconcileGitRemoval(logicalDir, scope);
+			if (pendingRemoval) throw new Error(`Finish removing Git package ${pendingRemoval} before retrying.`);
 			const currentState = this.getGitUpdateStatePath(logicalDir, scope);
 			const current = this.readSelectedGitRevision(logicalDir, currentState);
 			if (current === logicalDir) this.restoreGitBackup(logicalDir, `${currentState}.previous`);
@@ -2853,11 +2885,37 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
+	// Caller holds the case-folded mutation lock. Only finish records whose logical checkout is gone.
+	private reconcileGitRemoval(targetDir: string, scope: SourceScope): string | undefined {
+		const root = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+		const cleanup = `${this.getGitCheckoutLockKey(targetDir, scope)}.removing`;
+		const pending = lstatSync(cleanup, { throwIfNoEntry: false });
+		if (!pending) return undefined;
+		if (!pending.isFile()) throw new GitRevisionPointerError(`Expected a regular file at ${cleanup}`);
+		const prior = readFileSync(cleanup, "utf8");
+		const previousTarget = join(root, prior);
+		if (prior.toLowerCase() !== relative(root, targetDir).toLowerCase() || relative(root, previousTarget) !== prior) {
+			throw new GitRevisionPointerError(`Invalid Git removal record at ${cleanup}`);
+		}
+		if (existsSync(previousTarget)) return previousTarget;
+		const previousState = this.getGitUpdateStatePathForIdentity(root, prior);
+		rmSync(`${previousState}.current`, { force: true });
+		rmSync(cleanup);
+		return undefined;
+	}
+
 	private async removeGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitStoragePath(source, scope);
 		const release = this.lockGitCheckout(targetDir, scope);
 		try {
-			const state = this.getGitUpdateStatePath(targetDir, scope);
+			const root = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+			const identity = this.getGitCheckoutIdentity(root, targetDir);
+			const state = this.getGitUpdateStatePathForIdentity(root, identity);
+			const cleanup = `${this.getGitCheckoutLockKey(targetDir, scope)}.removing`;
+			const pendingRemoval = this.reconcileGitRemoval(targetDir, scope);
+			if (pendingRemoval && relative(root, pendingRemoval) !== identity) {
+				throw new Error(`Finish removing Git package ${pendingRemoval} before removing ${targetDir}.`);
+			}
 			const pointer = `${state}.current`;
 			const pointerInfo = lstatSync(pointer, { throwIfNoEntry: false });
 			if (pointerInfo && !pointerInfo.isFile()) {
@@ -2887,9 +2945,18 @@ export class DefaultPackageManager implements PackageManager {
 			const markerPath = this.getGitUpdateMarkerPath(targetDir);
 			if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
 			await rm(`${state}.previous`, { recursive: true, force: true });
+			// Keep the logical spelling available if selected cleanup fails, and keep the pointer
+			// until logical deletion finishes so readers cannot fall back to the old checkout.
 			if (selected !== targetDir) await rm(selected, { recursive: true, force: true });
-			rmSync(pointer, { force: true });
+			if (pointerInfo) {
+				const draft = `${cleanup}.tmp`;
+				rmSync(draft, { force: true });
+				writeFileSync(draft, identity, { flag: "wx" });
+				renameSync(draft, cleanup);
+			}
 			await rm(targetDir, { recursive: true, force: true });
+			rmSync(pointer, { force: true });
+			rmSync(cleanup, { force: true });
 			this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
 		} finally {
 			release();

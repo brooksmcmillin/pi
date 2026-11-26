@@ -2666,6 +2666,32 @@ describe("DefaultPackageManager git update", () => {
 		expect(getCurrentCommit(active)).toBe(expected);
 	});
 
+	it("does not resolve the superseded checkout during Git package removal", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "// v1", "Add worker");
+		git(["pull", "--ff-only"], installedDir);
+		createCommit(remoteDir, "extensions/worker.ts", "// v2", "Update");
+		await packageManager.update();
+		const active = selected();
+		settingsManager.setPackages([join(installedDir, "extensions", "worker.ts"), gitSource]);
+		let resolution: ReturnType<typeof packageManager.resolve> | undefined;
+		fsFixture.duringRemove = async (path, removed) => {
+			if (path !== installedDir || removed) return;
+			expect(existsSync(installedDir)).toBe(true);
+			resolution = packageManager.resolve(async () => "skip");
+		};
+		try {
+			await packageManager.remove(gitSource);
+		} finally {
+			fsFixture.duringRemove = undefined;
+		}
+		expect(resolution).toBeDefined();
+		const resolved = await resolution;
+		expect(resolved?.extensions.map(({ path }) => path)).not.toContain(join(installedDir, "extensions", "worker.ts"));
+		expect(existsSync(active)).toBe(false);
+	});
+
 	it("distinguishes case-sensitive checkout names and shares selection for filesystem case aliases", async () => {
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "extension.ts", "// v2", "Update");
@@ -2714,6 +2740,64 @@ describe("DefaultPackageManager git update", () => {
 			}
 		}
 	});
+
+	it.each(["selected cleanup", "logical deletion", "reinstall"])(
+		"retries Git removal interrupted at %s via a case alias",
+		async (phase) => {
+			setupRemoteAndInstall();
+			createCommit(remoteDir, "extension.ts", "// v2", "Update");
+			await packageManager.update();
+			const active = selected();
+			const key = createHash("sha256")
+				.update(relative(join(agentDir, "git"), installedDir))
+				.digest("hex");
+			const pointer = join(agentDir, "git", ".git-update-state", `${key}.current`);
+			const aliasPath = join(dirname(installedDir), "EXTENSION");
+			if (!existsSync(aliasPath)) {
+				fsFixture.aliasFrom = aliasPath;
+				fsFixture.aliasTo = installedDir;
+			}
+			try {
+				fsFixture.duringRemove = async (path, removed) => {
+					if (phase === "selected cleanup" ? path === active && !removed : path === installedDir && removed) {
+						throw new Error("injected removal failure");
+					}
+				};
+				await expect(packageManager.remove(gitSource)).rejects.toThrow("injected removal failure");
+				expect(existsSync(pointer)).toBe(true);
+				fsFixture.duringRemove = undefined;
+				const distinct = join(dirname(installedDir), "Extension");
+				if (phase === "logical deletion" && fsFixture.aliasFrom) mkdirSync(distinct);
+				const alias = "git:github.com/test/EXTENSION";
+				if (phase === "reinstall") {
+					const manager = packageManager as unknown as {
+						runCommand(command: string, args: string[]): Promise<void>;
+					};
+					vi.spyOn(manager, "runCommand").mockImplementation(async (_command, args) => {
+						expect(args[0]).toBe("clone");
+						expect(existsSync(pointer)).toBe(false);
+						git(["clone", remoteDir, aliasPath], tempDir);
+					});
+					await packageManager.install(alias);
+					fsFixture.aliasFrom = "";
+					fsFixture.aliasTo = "";
+					expect(existsSync(aliasPath)).toBe(true);
+				}
+				await packageManager.remove(alias);
+				expect(existsSync(aliasPath)).toBe(false);
+				if (phase === "logical deletion" && fsFixture.aliasFrom) expect(existsSync(distinct)).toBe(true);
+				expect(existsSync(active)).toBe(false);
+				expect(existsSync(pointer)).toBe(false);
+				expect(existsSync(installedDir)).toBe(false);
+				git(["clone", remoteDir, installedDir], tempDir);
+				expect(selected()).toBe(installedDir);
+			} finally {
+				fsFixture.duringRemove = undefined;
+				fsFixture.aliasFrom = "";
+				fsFixture.aliasTo = "";
+			}
+		},
+	);
 
 	it("updates distinct case-sensitive checkouts in one batch", async ({ skip }) => {
 		setupRemoteAndInstall();
@@ -2882,7 +2966,111 @@ describe("DefaultPackageManager git update", () => {
 		});
 	});
 
+	it("resolves configured resources and aliases after recovery selects the logical checkout", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		git(["pull", "--ff-only"], installedDir);
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() { /* updated */ }", "Update");
+		await packageManager.update();
+		const active = selected();
+		expect(active).not.toBe(installedDir);
+		rmSync(active, { recursive: true });
+		const manager = packageManager as unknown as {
+			recoverGitCheckout(path: string, scope: string): Promise<string | undefined>;
+			getGitUpdateStatePath(path: string, scope: string): string;
+		};
+		const recover = manager.recoverGitCheckout.bind(manager);
+		vi.spyOn(manager, "recoverGitCheckout").mockImplementationOnce((path, scope) => {
+			rmSync(`${manager.getGitUpdateStatePath(path, scope)}.current`);
+			return recover(path, scope);
+		});
+		const resolved = await packageManager.resolve();
+		const worker = join(installedDir, "extensions", "worker.ts");
+		expect(resolved.extensions.map(({ path }) => path)).toContain(worker);
+		expect(resolved.gitRevisions?.has(installedDir)).not.toBe(true);
+		const alias = await packageManager.resolveExtensionSources([worker], { gitRevisions: resolved.gitRevisions });
+		expect(alias.extensions.map(({ path }) => path)).toContain(worker);
+	});
+
 	describe("temporary git sources", () => {
+		it("clears a missing revision redirect when temporary recovery selects the logical checkout", async () => {
+			const logical = selected(gitSource, "temporary");
+			mkdirSync(remoteDir, { recursive: true });
+			initGitRepo(remoteDir);
+			createCommit(remoteDir, "worker.ts", "export default function() {}", "Initial");
+			mkdirSync(dirname(logical), { recursive: true });
+			git(["clone", remoteDir, logical], tempDir);
+			createCommit(remoteDir, "worker.ts", "export default function() { /* updated */ }", "Update");
+			await packageManager.prepareTemporaryGitSources([gitSource]);
+			const active = selected(gitSource, "temporary");
+			expect(active).not.toBe(logical);
+			rmSync(active, { recursive: true });
+			const manager = packageManager as unknown as {
+				recoverGitCheckout(path: string, scope: string): Promise<string | undefined>;
+				getGitUpdateStatePath(path: string, scope: string): string;
+			};
+			const recover = manager.recoverGitCheckout.bind(manager);
+			vi.spyOn(manager, "recoverGitCheckout").mockImplementationOnce((path, scope) => {
+				rmSync(`${manager.getGitUpdateStatePath(path, scope)}.current`);
+				return recover(path, scope);
+			});
+			vi.stubEnv("PI_OFFLINE", "1");
+			const prepared = await packageManager.prepareTemporaryGitSources([gitSource]);
+			expect(prepared.checkouts.get(logical)).toBe(logical);
+			expect(prepared.gitRevisions.has(logical)).toBe(false);
+			const alias = join(logical, "worker.ts");
+			const resolved = await packageManager.resolveExtensionSources([alias, gitSource], {
+				temporary: true,
+				temporaryGit: prepared,
+				gitRevisions: prepared.gitRevisions,
+			});
+			expect(resolved.extensions.map(({ path }) => path)).toContain(alias);
+		});
+
+		it.each(["local first", "configured"])(
+			"suppresses aliases to a missing temporary selection (%s)",
+			async (kind) => {
+				const cachedDir = selected(gitSource, "temporary");
+				mkdirSync(remoteDir, { recursive: true });
+				initGitRepo(remoteDir);
+				const marker = join(tempDir, "stale-loaded");
+				createCommit(
+					remoteDir,
+					"worker.ts",
+					`import { writeFileSync } from 'node:fs'; export default function() { writeFileSync(${JSON.stringify(marker)}, 'loaded'); }`,
+					"Initial",
+				);
+				mkdirSync(dirname(cachedDir), { recursive: true });
+				git(["clone", remoteDir, cachedDir], tempDir);
+				createCommit(remoteDir, "worker.ts", "export default function() {}", "Update");
+				const prepared = await packageManager.prepareTemporaryGitSources([gitSource]);
+				const active = prepared.checkouts.get(cachedDir);
+				if (!active || active === cachedDir) throw new Error("Expected a selected revision");
+				rmSync(active, { recursive: true });
+				const alias = join(cachedDir, "worker.ts");
+				if (kind === "configured") settingsManager.setExtensionPaths([alias]);
+				const loader = new DefaultResourceLoader({
+					cwd: tempDir,
+					agentDir,
+					settingsManager,
+					additionalExtensionPaths: kind === "configured" ? [gitSource] : [alias, gitSource],
+				});
+				let trustChecked = false;
+				await loader.reload({
+					resolveProjectTrust: async ({ extensionsResult }) => {
+						trustChecked = true;
+						expect(extensionsResult.extensions).toEqual([]);
+						expect(existsSync(marker)).toBe(false);
+						return false;
+					},
+				});
+				expect(trustChecked).toBe(true);
+				expect(loader.getExtensions().extensions).toEqual([]);
+				expect(existsSync(marker)).toBe(false);
+			},
+		);
+
 		it.each(["git first", "local first", "configured"])(
 			"pins refreshed temporary Git aliases across trust (%s)",
 			async (kind) => {
