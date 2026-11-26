@@ -95,7 +95,9 @@ describe("detail in the browser", { skip: !browserTests }, () => {
 		).id;
 		await browser.metrics(1280, 900);
 		await browser.open(`http://127.0.0.1:${fixture.server.port}/s/${session}`);
-		await browser.wait(`!${ROWS}.split(',').some((kind) => kind === 'thought' || kind === 'text')`);
+		await browser.wait(
+			`document.querySelector('.rows [data-testid=activity]') && !${ROWS}.split(',').some((kind) => kind === 'thought' || kind === 'text')`,
+		);
 		const row = (title: string) =>
 			`[...document.querySelectorAll('.drawer .session-title')].find((e) => e.textContent === ${JSON.stringify(title)})`;
 		// Away to another chat and back: from the moment its rows show, no thought or text row (detail 3's) ever does.
