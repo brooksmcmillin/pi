@@ -2633,6 +2633,36 @@ describe("DefaultPackageManager git update", () => {
 		expect(existsSync(other)).toBe(true);
 	});
 
+	it("skips explicit CLI resources from an invalid configured checkout across trust", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "extension.ts", "// v2", "Update");
+		await packageManager.update();
+		const manager = packageManager as unknown as { getGitUpdateStatePath(path: string, scope: string): string };
+		writeFileSync(`${manager.getGitUpdateStatePath(installedDir, "user")}.current`, "invalid");
+		const alias = join(installedDir, "extension.ts");
+		const healthy = join(tempDir, "healthy.ts");
+		writeFileSync(healthy, "export default function() {}");
+		const loader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			settingsManager,
+			additionalExtensionPaths: [alias, healthy],
+		});
+		let trustChecked = false;
+		await loader.reload({
+			resolveProjectTrust: async ({ extensionsResult }) => {
+				trustChecked = true;
+				expect(extensionsResult.extensions.map(({ path }) => path)).toEqual([healthy]);
+				return true;
+			},
+		});
+		expect(trustChecked).toBe(true);
+		expect(loader.getExtensions().extensions.map(({ path }) => path)).toEqual([healthy]);
+		expect(
+			loader.getExtensions().warnings?.filter(({ warning }) => warning.includes("Invalid Git revision pointer")),
+		).toHaveLength(1);
+	});
+
 	it("rejects a regular file at the selected checkout path", async () => {
 		setupRemoteAndInstall();
 		createCommit(remoteDir, "extension.ts", "// v2", "Update");
@@ -2682,7 +2712,9 @@ describe("DefaultPackageManager git update", () => {
 			const externalAlias = join(agentDir, "checkout-alias");
 			symlinkSync(installedDir, externalAlias, "dir");
 			const fileAlias = join(agentDir, "explicit-alias.ts");
-			symlinkSync(join(installedDir, "explicit.ts"), fileAlias, "file");
+			const intermediate = join(agentDir, "intermediate.ts");
+			symlinkSync(join(installedDir, "explicit.ts"), intermediate, "file");
+			symlinkSync(intermediate, fileAlias, "file");
 			const autoDir = join(agentDir, "extensions");
 			mkdirSync(autoDir, { recursive: true });
 			const rediscoverable = join(autoDir, "retained.ts");
@@ -2709,6 +2741,11 @@ describe("DefaultPackageManager git update", () => {
 			expect(result.extensions.map(({ path }) => path)).toContain(selectedExplicit);
 			expect(result.extensions.map(({ path }) => path)).not.toContain(retained);
 			expect(result.extensions.map(({ path }) => path)).not.toContain(rediscoverable);
+			if (kind === "file") {
+				rmSync(retained);
+				const dangling = await packageManager.resolve();
+				expect(dangling.extensions.map(({ path }) => path)).toContain(selectedExplicit);
+			}
 			expect(result.extensions.map(({ path }) => path)).not.toContain(join(dirname(healthy), "retained.ts"));
 			expect(result.installFailures).toEqual([
 				expect.objectContaining({
@@ -3177,9 +3214,14 @@ describe("DefaultPackageManager git update", () => {
 			expect(resolved.extensions.map(({ path }) => path)).toContain(alias);
 		});
 
-		it.each(["local first", "configured"])(
-			"suppresses aliases to a missing temporary selection (%s)",
-			async (kind) => {
+		it.each([
+			["local first", false],
+			["configured", false],
+			["local first", true],
+			["configured", true],
+		] as const)(
+			"suppresses aliases to an unavailable temporary selection (%s; malformed: %s)",
+			async (kind, malformed) => {
 				const cachedDir = selected(gitSource, "temporary");
 				mkdirSync(remoteDir, { recursive: true });
 				initGitRepo(remoteDir);
@@ -3197,13 +3239,24 @@ describe("DefaultPackageManager git update", () => {
 				const active = prepared.checkouts.get(cachedDir);
 				if (!active || active === cachedDir) throw new Error("Expected a selected revision");
 				rmSync(active, { recursive: true });
+				if (malformed) {
+					const manager = packageManager as unknown as {
+						getGitUpdateStatePath(path: string, scope: string): string;
+					};
+					writeFileSync(`${manager.getGitUpdateStatePath(cachedDir, "temporary")}.current`, "invalid");
+				}
 				const alias = join(cachedDir, "worker.ts");
 				if (kind === "configured") settingsManager.setExtensionPaths([alias]);
+				const retainedPrompt = join(cachedDir, "retained.md");
+				const healthyPrompt = join(tempDir, "healthy.md");
+				writeFileSync(retainedPrompt, "retained");
+				writeFileSync(healthyPrompt, "healthy");
 				const loader = new DefaultResourceLoader({
 					cwd: tempDir,
 					agentDir,
 					settingsManager,
 					additionalExtensionPaths: kind === "configured" ? [gitSource] : [alias, gitSource],
+					additionalPromptTemplatePaths: [retainedPrompt, healthyPrompt],
 				});
 				let trustChecked = false;
 				await loader.reload({
@@ -3216,6 +3269,7 @@ describe("DefaultPackageManager git update", () => {
 				});
 				expect(trustChecked).toBe(true);
 				expect(loader.getExtensions().extensions).toEqual([]);
+				expect(loader.getPrompts().prompts.map(({ name }) => name)).toEqual(["healthy"]);
 				expect(existsSync(marker)).toBe(false);
 			},
 		);

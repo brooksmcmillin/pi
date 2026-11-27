@@ -119,15 +119,19 @@ export interface ResolvedResource {
 	metadata: PathMetadata;
 }
 
+type UnavailableGitCheckouts = ReadonlyMap<string, { matchTarget: string; failure: PackageInstallFailure }>;
+
 export interface TemporaryGitSelection {
 	checkouts: ReadonlyMap<string, string>;
 	gitRevisions: ReadonlyMap<string, string>;
+	unavailableCheckouts?: UnavailableGitCheckouts;
 	installFailures: PackageInstallFailure[];
 }
 
 export interface ResolvedPaths {
 	/** Checkout selection shared with explicit extension sources in the same load. */
 	gitRevisions?: ReadonlyMap<string, string>;
+	unavailableCheckouts?: UnavailableGitCheckouts;
 	configuredGitCheckouts?: ReadonlyMap<string, string>;
 	missingLocalPaths?: string[];
 	extensions: ResolvedResource[];
@@ -1039,11 +1043,25 @@ export function redirectGitRevisionPath(
 		// A path already in the selected checkout can still be a link into a retained copy.
 		const root = canonicalizePath(logical);
 		const canonicalCandidate = canonicalizePath(candidate);
-		// Preserve the first checkout named by a file symlink before following links inside it.
-		const linkTarget = canonicalCandidate === candidate ? undefined : readLinkTarget(candidate);
-		const linked = linkTarget && select(linkTarget, root);
-		let selected = linked || select(canonicalCandidate, root);
-		let boundary = candidate.length - (linked ? 1 : 0);
+		let selected = select(canonicalCandidate, root);
+		let boundary = candidate.length;
+		// Rank earlier file-link hops ahead of the final canonical path, but after directory aliases.
+		if (canonicalCandidate !== candidate || !existsSync(candidate)) {
+			let link = candidate;
+			const visited = new Set([link]);
+			for (let hop = 0; hop < 40; hop++) {
+				const target = readLinkTarget(link);
+				if (!target || visited.has(target)) break;
+				const match = select(target, root);
+				if (match && match !== candidate) {
+					selected = match;
+					boundary -= 1 / (hop + 2);
+					break;
+				}
+				visited.add(target);
+				link = target;
+			}
+		}
 		for (let ancestor = dirname(candidate); ; ancestor = dirname(ancestor)) {
 			const canonical = canonicalizePath(ancestor);
 			// An outer checkout alias takes precedence over symlinks inside the old checkout.
@@ -1362,6 +1380,7 @@ export class DefaultPackageManager implements PackageManager {
 	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
 		accumulator.gitRevisions = new Map(temporaryGit?.gitRevisions);
+		accumulator.unavailableCheckouts = new Map(temporaryGit?.unavailableCheckouts);
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 
@@ -1446,7 +1465,10 @@ export class DefaultPackageManager implements PackageManager {
 
 		this.addAutoDiscoveredResources(accumulator, globalSettings, projectSettings, globalBaseDir, projectBaseDir);
 		for (const failure of accumulator.blockedCheckoutFailures) {
-			if (!installFailures.some(({ source, scope }) => source === failure.source && scope === failure.scope)) {
+			if (
+				failure.scope !== "temporary" &&
+				!installFailures.some(({ source, scope }) => source === failure.source && scope === failure.scope)
+			) {
 				installFailures.push(failure);
 			}
 		}
@@ -1472,6 +1494,7 @@ export class DefaultPackageManager implements PackageManager {
 			...this.toResolvedPaths(accumulator),
 			installFailures,
 			gitRevisions: accumulator.gitRevisions,
+			unavailableCheckouts: accumulator.unavailableCheckouts,
 			configuredGitCheckouts: checkoutSnapshot,
 		};
 	}
@@ -1488,7 +1511,12 @@ export class DefaultPackageManager implements PackageManager {
 			undefined,
 			{ checkouts, preparing: true },
 		);
-		return { checkouts, gitRevisions: accumulator.gitRevisions, installFailures };
+		return {
+			checkouts,
+			gitRevisions: accumulator.gitRevisions,
+			unavailableCheckouts: accumulator.unavailableCheckouts,
+			installFailures,
+		};
 	}
 
 	async resolveExtensionSources(
@@ -1498,10 +1526,14 @@ export class DefaultPackageManager implements PackageManager {
 			temporary?: boolean;
 			gitRevisions?: ReadonlyMap<string, string>;
 			temporaryGit?: TemporaryGitSelection;
+			unavailableCheckouts?: UnavailableGitCheckouts;
 		},
 	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
-		accumulator.gitRevisions = new Map(options?.gitRevisions);
+		accumulator.gitRevisions = new Map(options?.gitRevisions ?? options?.temporaryGit?.gitRevisions);
+		accumulator.unavailableCheckouts = new Map(
+			options?.unavailableCheckouts ?? options?.temporaryGit?.unavailableCheckouts,
+		);
 		const scope: SourceScope = options?.temporary ? "temporary" : options?.local ? "project" : "user";
 		// `-e builtin:<name>` loads a built-in extension; the resource loader reports unknown names.
 		for (const source of sources.filter((source) => source.startsWith(BUILTIN_PATH_PREFIX))) {
@@ -1993,7 +2025,7 @@ export class DefaultPackageManager implements PackageManager {
 				let logical: string | undefined;
 				const reportFailure = (error: unknown) => {
 					const failure = { source: resolvedSource, scope: resolvedScope, message: String(error) };
-					if (logical !== undefined && resolvedScope !== "temporary" && error instanceof GitRevisionPointerError) {
+					if (logical !== undefined && error instanceof GitRevisionPointerError) {
 						unavailableCheckouts.set(logical, {
 							matchTarget: this.getGitRevisionMatchTarget(logical, resolvedScope),
 							failure,
@@ -3761,7 +3793,7 @@ export class DefaultPackageManager implements PackageManager {
 	static selectGitResourcePath(
 		path: string,
 		revisions?: ReadonlyMap<string, string>,
-		unavailableCheckouts?: ResourceAccumulator["unavailableCheckouts"],
+		unavailableCheckouts?: UnavailableGitCheckouts,
 		blockedCheckoutFailures?: Set<PackageInstallFailure>,
 	): string {
 		if (!revisions?.size && !unavailableCheckouts?.size) return path;

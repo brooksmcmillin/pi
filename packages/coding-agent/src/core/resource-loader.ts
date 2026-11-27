@@ -591,6 +591,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			temporary: true,
 			temporaryGit,
 			gitRevisions: resolvedPaths.gitRevisions,
+			unavailableCheckouts: resolvedPaths.unavailableCheckouts,
 		});
 		const installWarnings = collectPackageInstallWarnings(
 			resolvedPaths.installFailures,
@@ -667,7 +668,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
 		const selectExplicitPath = (source: string) =>
-			DefaultPackageManager.selectGitResourcePath(this.resolveResourcePath(source), resolvedPaths.gitRevisions);
+			DefaultPackageManager.selectGitResourcePath(
+				this.resolveResourcePath(source),
+				resolvedPaths.gitRevisions,
+				resolvedPaths.unavailableCheckouts,
+			);
 		const selector = (explicit: string[], discovered: string[]) => {
 			const explicitRoots = new Set(explicit.map((path) => this.resolveResourcePath(path)));
 			for (const path of discovered) explicitRoots.delete(this.resolveResourcePath(path));
@@ -691,7 +696,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		for (const path of explicitSkills) {
 			if (isLocalPath(path)) {
 				const resolved = selectExplicitPath(path);
-				if (!existsSync(resolved) && !this.skillDiagnostics.some((d) => d.path === resolved)) {
+				if (resolved && !existsSync(resolved) && !this.skillDiagnostics.some((d) => d.path === resolved)) {
 					this.skillDiagnostics.push({ type: "error", message: "Skill path does not exist", path: resolved });
 				}
 			}
@@ -707,7 +712,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		for (const path of explicitPrompts) {
 			if (isLocalPath(path)) {
 				const resolved = selectExplicitPath(path);
-				if (!existsSync(resolved) && !this.promptDiagnostics.some((d) => d.path === resolved)) {
+				if (resolved && !existsSync(resolved) && !this.promptDiagnostics.some((d) => d.path === resolved)) {
 					this.promptDiagnostics.push({
 						type: "error",
 						message: "Prompt template path does not exist",
@@ -726,7 +731,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.updateThemesFromPaths(themePaths, metadataByPath);
 		for (const path of explicitThemes) {
 			const resolved = selectExplicitPath(path);
-			if (!existsSync(resolved) && !this.themeDiagnostics.some((d) => d.path === resolved)) {
+			if (resolved && !existsSync(resolved) && !this.themeDiagnostics.some((d) => d.path === resolved)) {
 				this.themeDiagnostics.push({ type: "error", message: "Theme path does not exist", path: resolved });
 			}
 		}
@@ -794,6 +799,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			temporary: true,
 			temporaryGit,
 			gitRevisions: resolvedPaths.gitRevisions,
+			unavailableCheckouts: resolvedPaths.unavailableCheckouts,
 		});
 		const bootstrapPaths = (resources: ResolvedResource[]) =>
 			resources.filter((r) => r.enabled && !this.isProjectManagedExtensionSource(r.path)).map((r) => r.path);
@@ -1179,7 +1185,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const append = (paths: string[], select?: (path: string) => string) => {
 			for (const p of paths) {
 				const resolved = this.resolveResourcePath(p);
-				const pathKey = getResourcePathKey(select?.(resolved) ?? resolved);
+				const selected = select?.(resolved) ?? resolved;
+				if (!selected) continue;
+				const pathKey = getResourcePathKey(selected);
 				if (seen.has(pathKey)) continue;
 				seen.add(pathKey);
 				merged.push(resolved);
