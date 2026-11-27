@@ -19,7 +19,9 @@ function setup(sessionName?: string) {
 		const { app: _app, ...status } = reports.at(-1)!;
 		return Object.fromEntries(Object.entries(status).filter(([, value]) => value !== undefined));
 	};
-	return { reporter, reports, session, send, last };
+	const owner = { isActive: true };
+	const setBackgroundWork = (key: string, active: boolean) => reporter.setBackgroundWork(owner, key, active);
+	return { reporter, reports, session, send, last, owner, setBackgroundWork };
 }
 
 function assistantEnd(stopReason: AssistantMessage["stopReason"], errorMessage?: string): AgentSessionEvent {
@@ -64,13 +66,83 @@ describe("ProgramStatusReporter", () => {
 		expect(JSON.stringify(reports)).not.toContain("secret assistant output");
 	});
 
+	it("waits for all background work and the parent follow-up before reporting done", () => {
+		const { reporter, reports, send, last, setBackgroundWork } = setup("Review");
+		send({ type: "agent_start" });
+		setBackgroundWork("review", true);
+		setBackgroundWork("delivery", true);
+		send(assistantEnd("stop"), settled);
+		setBackgroundWork("review", false);
+		reporter.setBlocked("question", { kind: "question", message: "Proceed?" });
+		expect(last().state).toBe("blocked");
+		reporter.setBlocked("question", undefined);
+		expect(last().state).toBe("working");
+		send({ type: "agent_start" });
+		setBackgroundWork("delivery", false);
+		expect(reports.some((status) => status.state === "done")).toBe(false);
+		send(assistantEnd("stop"), settled);
+		expect(last()).toEqual({ state: "done", message: "Review" });
+	});
+
+	it("reports completion when background work drains without a follow-up", () => {
+		const { reporter, send, last, setBackgroundWork } = setup();
+		send({ type: "agent_start" });
+		setBackgroundWork("background", true);
+		send(settled);
+		expect(last().state).toBe("working");
+		setBackgroundWork("background", false);
+		expect(last().state).toBe("done");
+		setBackgroundWork("background", true);
+		reporter.reset();
+		expect(last().state).toBe("idle");
+	});
+
+	it("replaces background-work keys on reload without a transient done report", () => {
+		const { reporter, reports, send, last, owner, setBackgroundWork } = setup();
+		send({ type: "agent_start" });
+		setBackgroundWork("old-extension", true);
+		send(settled);
+		owner.isActive = false;
+		const replacement = { isActive: true };
+		reporter.setBackgroundWork(replacement, "new-extension", true);
+		reporter.report();
+		expect(reports.map((status) => status.state)).toEqual(["working"]);
+		reporter.setBackgroundWork(replacement, "new-extension", false);
+		expect(last().state).toBe("done");
+	});
+
+	it("reports the settled status when the replacement's first write is a clear", () => {
+		const { reporter, send, last, owner, setBackgroundWork } = setup();
+		send({ type: "agent_start" });
+		setBackgroundWork("review", true);
+		send(settled);
+		expect(last().state).toBe("working");
+		owner.isActive = false;
+		reporter.setBackgroundWork({ isActive: true }, "review", false);
+		expect(last().state).toBe("done");
+	});
+
+	it("drops the invalidated owner's work when reload fails before replacement", () => {
+		const { reporter, send, last, owner, setBackgroundWork } = setup();
+		send({ type: "agent_start" });
+		setBackgroundWork("review", true);
+		send(settled);
+		owner.isActive = false;
+		reporter.report();
+		expect(last().state).toBe("done");
+		setBackgroundWork("review", true);
+		expect(last().state).toBe("done");
+	});
+
 	it("reports only the outcome of the run: retried errors, final errors, and aborts", () => {
-		const { send, last } = setup();
+		const { send, last, setBackgroundWork } = setup();
 		send({ type: "agent_start" }, assistantEnd("error", "overloaded"), assistantEnd("stop"), settled);
 		expect(last()).toEqual({ state: "done" });
 
 		send({ type: "agent_start" }, assistantEnd("error", "Invalid API key\n{details}"), settled);
+		setBackgroundWork("review", true);
 		expect(last()).toEqual({ state: "error", message: "Invalid API key" });
+		setBackgroundWork("review", false);
 
 		send({ type: "agent_start" }, assistantEnd("aborted"), { type: "agent_settled", aborted: true });
 		expect(last()).toEqual({ state: "idle" });

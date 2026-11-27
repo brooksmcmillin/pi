@@ -37,14 +37,7 @@ jobs:
             npm run build
             exit
           fi
-          # Use the same immutable catalog as Nix so live provider changes can't break CI.
-          revision=$(node -p 'require("./nix/model-catalog.json").revision')
-          [[ "$revision" =~ ^sha256-[a-f0-9]{64}$ ]]
-          catalog="$RUNNER_TEMP/pi-model-catalog.json"
-          curl --fail --silent --show-error --location --retry 3 \
-            "https://pi.dev/api/models/revisions/$revision?types=chat,image,classifier" -o "$catalog"
-          printf '%s  %s\n' "${revision#sha256-}" "$catalog" | sha256sum --check
-          node packages/ai/scripts/hydrate-model-catalog.ts "$catalog"
+          node scripts/update-model-catalog-pin.mjs --hydrate
           npm run build:offline
 
       # Previews are published for main, release tags and PRs from branches of this repo only (see preview-packages.yml).
@@ -67,6 +60,15 @@ jobs:
       - name: Check
         run: npm run check
 
+      # Fork tags may lag the imported release; compare with the release this checkout contains.
+      - name: Fetch the matching upstream release tag
+        run: |
+          tag="v$(node -p 'require("./packages/coding-agent/package.json").version')"
+          git fetch --depth=1 https://github.com/earendil-works/pi.git "refs/tags/$tag:refs/tags/$tag"
+
+      - name: Check released changelog sections
+        run: npm run check:released-changelogs
+
   # Tests are split across parallel jobs so the slowest suites do not run back to back.
   test:
     name: test (${{ matrix.name }})
@@ -77,6 +79,7 @@ jobs:
         include:
           - name: coding-agent
           - name: durable
+          - name: chord
           - name: other
     steps:
       - name: Checkout
@@ -90,7 +93,7 @@ jobs:
 
       # fd and ripgrep are used by coding-agent tools tests and tui autocomplete tests.
       - name: Install system dependencies
-        if: matrix.name != 'durable'
+        if: matrix.name != 'durable' && matrix.name != 'chord'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends fd-find ripgrep
@@ -116,7 +119,7 @@ jobs:
           # Every other workspace, so new packages are tested without editing this workflow.
           args=()
           for dir in packages/*/; do
-            case "$dir" in packages/coding-agent/ | packages/durable/) continue ;; esac
+            case "$dir" in packages/coding-agent/ | packages/durable/ | packages/chord/) continue ;; esac
             args+=(--workspace "${dir%/}")
           done
           npm run test:scripts

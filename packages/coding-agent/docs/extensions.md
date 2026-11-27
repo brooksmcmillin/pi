@@ -1907,7 +1907,7 @@ const result = await pi.exec("git", ["status"], { signal, timeout: 5000 });
 // result.stdout, result.stderr, result.code, result.killed, result.truncated
 ```
 
-Options: `signal` and `timeout` terminate the command, `cwd` sets the working directory, and `maxBuffer` limits stdout and stderr combined (default 256 MiB). When output exceeds `maxBuffer`, pi terminates the command and returns the output up to the limit with `truncated: true`, `killed: true`, and a nonzero `code`. `killed` is true whenever pi terminated the command: timeout, abort, or `maxBuffer`. A command that ignores SIGTERM gets SIGKILL after 5 seconds.
+Options: `signal` and `timeout` terminate the command, `cwd` sets the working directory, and `maxBuffer` limits stdout and stderr combined (default 256 MiB). When output exceeds `maxBuffer`, pi terminates the command and returns the output up to the limit with `truncated: true`, `killed: true`, and a nonzero `code`. `killed` is true whenever pi terminated the command: timeout, abort, or `maxBuffer`. A command that ignores SIGTERM gets SIGKILL after 5 seconds. A command terminated by a signal, by pi or otherwise, reports 128 + the signal number as `code`, like a shell: 143 for SIGTERM, 137 for SIGKILL.
 
 ### pi.getActiveTools() / pi.getAllTools() / pi.setActiveTools(names)
 
@@ -1993,7 +1993,7 @@ import { createProvider, openAICompletionsApi } from "@earendil-works/pi-ai/comp
 const provider = createProvider({
   id: "local-server",
   name: "Local Server",
-  baseUrl: "http://localhost:8080/v1",
+  baseUrl: "http://localhost:9931/v1",
   auth: {
     apiKey: {
       name: "Local server setup",
@@ -2037,11 +2037,11 @@ pi.registerProvider("my-proxy", {
 
 // Register a live llama.cpp catalog without persisting discovered models
 pi.registerProvider("llama.cpp", {
-  baseUrl: "http://localhost:8080/v1",
+  baseUrl: "http://localhost:9931/v1",
   apiKey: "local",
   api: "openai-completions",
   async refreshModels({ signal }) {
-    const response = await fetch("http://localhost:8080/v1/models", { signal });
+    const response = await fetch("http://localhost:9931/v1/models", { signal });
     const { data } = (await response.json()) as { data: Array<{ id: string }> };
     return data.map(({ id }) => ({
       id,
@@ -2894,6 +2894,8 @@ See [examples/extensions/timed-confirm.ts](../examples/extensions/timed-confirm.
 
 ### Widgets, Status, and Footer
 
+For background work, set a stable extension-specific key before yielding the parent turn. If delivery queues a follow-up, release the key on the matching result’s `message_start` or at the follow-up’s `agent_settled`, not at enqueue or in `agent_start` (which runs before the terminal reporter sees the new turn). `sendMessage(..., { triggerTurn: true })` is fire-and-forget: it returns no delivery acknowledgement and preparation can fail before those events fire. Your delivery mechanism must detect failure or abandonment and clear the key; this hook does not manage delivery or retries.
+
 ```typescript
 // Status in footer (persistent until cleared)
 ctx.ui.setStatus("my-ext", "Processing...");
@@ -2918,6 +2920,10 @@ ctx.ui.setWorkingIndicator({
 });
 ctx.ui.setWorkingIndicator({ frames: [] });  // Hide indicator
 ctx.ui.setWorkingIndicator();  // Restore default spinner
+
+// Terminal program status (not the in-Pi loader)
+ctx.ui.setBackgroundWork?.("my-ext", true);  // Keep reporting working after the turn settles
+ctx.ui.setBackgroundWork?.("my-ext", false); // Clear after work and result delivery finish
 
 // Widget above editor (default)
 ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"]);

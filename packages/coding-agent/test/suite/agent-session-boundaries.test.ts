@@ -1,7 +1,11 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import type { ProgramStatus, Terminal } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionUIContext } from "../../src/core/extensions/types.ts";
+import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
+import { ProgramStatusReporter } from "../../src/modes/interactive/program-status-reporter.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -398,6 +402,15 @@ describe("AgentSession actionable boundaries", () => {
 	});
 
 	it("defers runs started by agent_settled handlers until every settled handler completes", async () => {
+		const reportedStates: ProgramStatus["state"][] = [];
+		const terminal = {
+			setProgramStatus: (status: ProgramStatus) => reportedStates.push(status.state),
+		} as unknown as Terminal;
+		const reporter = new ProgramStatusReporter(
+			() => terminal,
+			() => undefined,
+		);
+		const owner = { isActive: true };
 		let triggered = false;
 		const lifecycle: string[] = [];
 		const harness = await createHarness({
@@ -410,6 +423,7 @@ describe("AgentSession actionable boundaries", () => {
 						lifecycle.push(`settled-first:${ctx.isIdle()}`);
 						if (triggered) return;
 						triggered = true;
+						reporter.setBackgroundWork(owner, "review", true);
 						pi.sendMessage(
 							{ customType: "settled-trigger", content: "start later", display: false },
 							{ triggerTurn: true },
@@ -418,22 +432,139 @@ describe("AgentSession actionable boundaries", () => {
 					pi.on("agent_settled", (_event, ctx) => {
 						lifecycle.push(`settled-second:${ctx.isIdle()}`);
 					});
+					pi.on("message_start", ({ message }) => {
+						if (message.role !== "custom" || message.customType !== "settled-trigger") return;
+						reporter.setBackgroundWork(owner, "review", false);
+						expect(reportedStates).toEqual(["working"]);
+						lifecycle.push("delivered");
+					});
 				},
 			],
 		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+		harness.session.subscribe((event) => reporter.handleEvent(event));
 
 		await harness.session.prompt("start");
 
+		expect(reportedStates).toEqual(["working", "done"]);
 		expect(lifecycle).toEqual([
 			"start",
 			"settled-first:true",
 			"settled-second:true",
 			"start",
+			"delivered",
 			"settled-first:true",
 			"settled-second:true",
 		]);
+	});
+
+	it("tracks a result wake during interactive startup binding", async () => {
+		const reports: ProgramStatus["state"][] = [];
+		const terminal = {
+			setProgramStatus: (status: ProgramStatus) => reports.push(status.state),
+		} as unknown as Terminal;
+		const reporter = new ProgramStatusReporter(
+			() => terminal,
+			() => undefined,
+		);
+		const completed = deferred();
+		let statusBeforeWake: ProgramStatus["state"] | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", async (_event, ctx) => {
+						ctx.ui.setBackgroundWork?.("startup", true);
+						statusBeforeWake = reports.at(-1);
+						pi.sendMessage(
+							{ customType: "startup-result", content: "review result", display: false },
+							{ triggerTurn: true },
+						);
+						await completed.promise;
+					});
+					pi.on("message_start", ({ message }, ctx) => {
+						if (message.role === "custom" && message.customType === "startup-result") {
+							ctx.ui.setBackgroundWork?.("startup", false);
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("result handled")]);
+		const { session } = harness;
+		session.subscribe((event) => {
+			if (event.type === "agent_settled") completed.resolve();
+		});
+		const handleEvent = vi.fn();
+		const prototype = InteractiveMode.prototype as unknown as {
+			rebindCurrentSession(this: object): Promise<void>;
+			createExtensionUIContext(this: object): ExtensionUIContext;
+		};
+		await prototype.rebindCurrentSession.call({
+			session,
+			programStatus: reporter,
+			applyRuntimeSettings: () => {},
+			bindCurrentSessionExtensions: () =>
+				session.bindExtensions({
+					mode: "tui",
+					uiContext: prototype.createExtensionUIContext.call({ session, programStatus: reporter }),
+				}),
+			handleEvent,
+			updateAvailableProviderCount: async () => {},
+			updateEditorBorderColor: () => {},
+			updateTerminalTitle: () => {},
+		});
+		expect(statusBeforeWake).toBe("working");
+		expect(reports).toEqual(["idle", "working", "done"]);
+		expect(handleEvent).not.toHaveBeenCalled();
+	});
+
+	it("ignores background status writes from a captured shortcut after runner replacement", async () => {
+		const reports: ProgramStatus["state"][] = [];
+		const terminal = {
+			setProgramStatus: (status: ProgramStatus) => reports.push(status.state),
+		} as unknown as Terminal;
+		const reporter = new ProgramStatusReporter(
+			() => terminal,
+			() => undefined,
+		);
+		let captured: ExtensionUIContext | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerShortcut("ctrl+g", {
+						description: "Capture status hook",
+						handler: (ctx) => {
+							captured = ctx.ui;
+							ctx.ui.setBackgroundWork?.("review", true);
+						},
+					});
+				},
+			],
+		});
+		const replacement = await createHarness();
+		harnesses.push(harness, replacement);
+		const context = Object.create(InteractiveMode.prototype);
+		Object.defineProperties(context, {
+			session: { value: harness.session, writable: true },
+			sessionManager: { value: harness.sessionManager },
+			programStatus: { value: reporter },
+			keybindings: { value: { getEffectiveConfig: () => ({}) } },
+			defaultEditor: { value: {} },
+		});
+		context.setupExtensionShortcuts(harness.session.extensionRunner);
+		expect(context.defaultEditor.onExtensionShortcut("\x07")).toBe(true);
+		expect(captured).toBeDefined();
+		expect(reports).toEqual(["working"]);
+		harness.session.extensionRunner.invalidate();
+		context.session = replacement.session;
+		const current = context.createExtensionUIContext() as ExtensionUIContext;
+		current.setBackgroundWork?.("review", true);
+		captured?.setBackgroundWork?.("review", false);
+		expect(reports).toEqual(["working"]);
+		current.setBackgroundWork?.("review", false);
+		expect(reports).toEqual(["working", "idle"]);
 	});
 
 	it("does not let an invalid explicit continuation suppress natural tool continuation", async () => {

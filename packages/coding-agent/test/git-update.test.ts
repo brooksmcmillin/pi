@@ -2970,9 +2970,12 @@ describe("DefaultPackageManager git update", () => {
 		setupRemoteAndInstall();
 		mkdirSync(join(remoteDir, "extensions"));
 		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add worker");
+		createCommit(remoteDir, "alias-only.ts", "export default function() {}", "Add explicit local extension");
 		git(["pull", "--ff-only"], installedDir);
 		createCommit(remoteDir, "extensions/worker.ts", "export default function() { /* updated */ }", "Update");
 		await packageManager.update();
+		const aliasPath = join(installedDir, "alias-only.ts");
+		settingsManager.setPackages([aliasPath, { source: gitSource, extensions: ["extensions/worker.ts"] }]);
 		const active = selected();
 		expect(active).not.toBe(installedDir);
 		rmSync(active, { recursive: true });
@@ -2981,11 +2984,18 @@ describe("DefaultPackageManager git update", () => {
 			getGitUpdateStatePath(path: string, scope: string): string;
 		};
 		const recover = manager.recoverGitCheckout.bind(manager);
-		vi.spyOn(manager, "recoverGitCheckout").mockImplementationOnce((path, scope) => {
+		const recovery = vi.spyOn(manager, "recoverGitCheckout");
+		recovery.mockRejectedValueOnce(new Error("Recovery interrupted"));
+		const failed = await packageManager.resolve();
+		expect(failed.extensions.map(({ path }) => path)).not.toContain(aliasPath);
+		expect(failed.gitRevisions?.get(installedDir)).toBe(active);
+
+		recovery.mockImplementationOnce((path, scope) => {
 			rmSync(`${manager.getGitUpdateStatePath(path, scope)}.current`);
 			return recover(path, scope);
 		});
 		const resolved = await packageManager.resolve();
+		expect(resolved.extensions.find(({ path }) => path === aliasPath)?.metadata.source).toBe(aliasPath);
 		const worker = join(installedDir, "extensions", "worker.ts");
 		expect(resolved.extensions.map(({ path }) => path)).toContain(worker);
 		expect(resolved.gitRevisions?.has(installedDir)).not.toBe(true);

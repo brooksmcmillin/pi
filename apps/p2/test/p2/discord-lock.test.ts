@@ -25,7 +25,7 @@ import chatWorker from "../../plugins/chat/worker.ts";
 import { DISCORD_BATCH, DiscordIngress } from "../../plugins/discord/contract.ts";
 import { Relay, type RelayState, type SessionPort } from "../../plugins/discord/relay.ts";
 import discordWorker, { DiscordLinkDoc } from "../../plugins/discord/worker.ts";
-import { Attachments, FilesMirror } from "../../plugins/files/contract.ts";
+import { Attachments } from "../../plugins/files/contract.ts";
 import { createP2Models } from "../../plugins/models/models.ts";
 import { SessionLocks } from "../../plugins/sessions/contract.ts";
 import { serveLockMirror } from "../../plugins/sessions/lock-worker.ts";
@@ -85,7 +85,27 @@ async function fixture(
 	};
 	beforeWorker?.(durable);
 	const facets: Facet[] = [
-		workerFacet({ harness: { durable, environments: {}, relocate: async () => {} } as unknown as HarnessParts }),
+		workerFacet({
+			harness: { durable, environments: {}, relocate: async () => {} } as unknown as HarnessParts,
+			worker: {
+				init: {
+					app: directory,
+					dataDir: directory,
+					fake: true,
+					telemetry: false,
+					generation: 1,
+					values: {
+						session: {
+							id: "s1",
+							cwd: directory,
+							env: null,
+							model: { provider: "faux", modelId: "faux-1" },
+							thinkingLevel: "off",
+						},
+					},
+				},
+			},
+		}),
 		filesFacet(join(directory, "files")),
 		defineFacet(serveLockMirror),
 		discordWorker,
@@ -102,7 +122,6 @@ async function fixture(
 		facets,
 		stubs: [
 			[Attachments, { resolve: async () => [] }],
-			[FilesMirror, { push: async () => null }],
 			[StatusReport, { push: async () => null }],
 		],
 	});
@@ -406,7 +425,6 @@ for (const update of ["restrict", "unlock"] as const) {
 				name: "probe",
 				description: "probe",
 				parameters: obj({}),
-				origin: "owner",
 				locked: "ports",
 				execute: async () => {
 					executed = true;

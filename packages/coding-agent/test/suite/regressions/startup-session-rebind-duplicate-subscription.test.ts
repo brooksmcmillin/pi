@@ -2,13 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 
 type RebindContext = {
-	session: object;
+	session: { subscribe: () => () => void };
 	unsubscribe?: () => void;
 	applyRuntimeSettings: () => void;
 	programStatus: { reset(): void };
 	renderCurrentSessionState: () => void;
 	bindCurrentSessionExtensions: () => Promise<void>;
-	subscribeToAgent: () => void;
 	updateAvailableProviderCount: () => Promise<void>;
 	updateEditorBorderColor: () => void;
 	updateTerminalTitle: () => void;
@@ -21,9 +20,10 @@ type InteractiveModePrototype = {
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrototype;
 
 describe("overlapping startup and replacement session rebinds", () => {
-	it("does not subscribe from the stale startup rebind", async () => {
-		const startupSession = {};
-		const replacementSession = {};
+	it("retires the stale startup subscription without duplicating the replacement subscription", async () => {
+		const unsubscribeStartup = vi.fn();
+		const startupSession = { subscribe: vi.fn(() => unsubscribeStartup) };
+		const replacementSession = { subscribe: vi.fn(() => () => {}) };
 		let resolveStartupBind!: () => void;
 		let resolveReplacementBind!: () => void;
 
@@ -34,7 +34,6 @@ describe("overlapping startup and replacement session rebinds", () => {
 			resolveReplacementBind = resolve;
 		});
 
-		const subscribeToAgent = vi.fn();
 		const updateTerminalTitle = vi.fn();
 		let bindCount = 0;
 
@@ -47,7 +46,6 @@ describe("overlapping startup and replacement session rebinds", () => {
 				bindCount += 1;
 				return bindCount === 1 ? startupBind : replacementBind;
 			},
-			subscribeToAgent,
 			updateAvailableProviderCount: async () => {},
 			updateEditorBorderColor: () => {},
 			updateTerminalTitle,
@@ -62,18 +60,19 @@ describe("overlapping startup and replacement session rebinds", () => {
 		});
 
 		expect(bindCount).toBe(2);
-		expect(subscribeToAgent).toHaveBeenCalledTimes(1);
+		expect(unsubscribeStartup).toHaveBeenCalledTimes(1);
+		expect(replacementSession.subscribe).toHaveBeenCalledTimes(1);
 
 		resolveStartupBind();
 		await startupRebind;
 
-		expect(subscribeToAgent).toHaveBeenCalledTimes(1);
+		expect(startupSession.subscribe).toHaveBeenCalledTimes(1);
 		expect(updateTerminalTitle).not.toHaveBeenCalled();
 
 		resolveReplacementBind();
 		await replacementRebind;
 
-		expect(subscribeToAgent).toHaveBeenCalledTimes(1);
+		expect(replacementSession.subscribe).toHaveBeenCalledTimes(1);
 		expect(updateTerminalTitle).toHaveBeenCalledTimes(1);
 	});
 });

@@ -184,6 +184,8 @@ export interface ExtensionUIContext {
 
 	/** Set the working/loading message shown during streaming. Call with no argument to restore default. */
 	setWorkingMessage(message?: string): void;
+	/** Report outstanding background work to the terminal, keyed by extension. Clear it when delivery is complete. */
+	setBackgroundWork?(key: string, active: boolean): void;
 
 	/** Show or hide the built-in interactive working loader row during streaming. */
 	setWorkingVisible(visible: boolean): void;
@@ -2222,6 +2224,11 @@ export interface ExtensionRuntimeState {
 	invalidate: (message?: string) => void;
 	/** Retain an event-bus subscription until this runtime is invalidated. */
 	trackEventBusSubscription: (unsubscribe: () => void) => () => void;
+	/**
+	 * Report an error thrown by a `pi.events` handler. Dropped before the runner exists; the runner
+	 * replaces this to call its emitError() until the runner is invalidated.
+	 */
+	reportError: (error: ExtensionError) => void;
 	/**
 	 * Register or unregister a provider.
 	 *

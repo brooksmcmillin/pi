@@ -1,8 +1,9 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { Container, type ProgramStatus, type Terminal, Text } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../../../src/core/agent-session.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
+import { ProgramStatusReporter } from "../../../src/modes/interactive/program-status-reporter.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
 import { createHarness, createTestUiContext } from "../harness.ts";
 
@@ -39,18 +40,20 @@ type LoadedResourcesContext = {
 };
 
 type RebindContext = {
+	session: { subscribe: (listener: (event: AgentSessionEvent) => void) => () => void };
 	unsubscribe?: () => void;
 	applyRuntimeSettings: () => void;
-	programStatus: { reset(): void };
+	programStatus: { reset(): void; handleEvent(event: AgentSessionEvent): void };
 	renderCurrentSessionState: () => void;
 	bindCurrentSessionExtensions: () => Promise<void>;
-	subscribeToAgent: () => void;
+	handleEvent: (event: AgentSessionEvent) => void;
 	updateAvailableProviderCount: () => Promise<void>;
 	updateEditorBorderColor: () => void;
 	updateTerminalTitle: () => void;
 };
 
 type ReloadCommandContext = {
+	programStatus: { report(): void };
 	hideThinkingBlock: boolean;
 	session: {
 		isStreaming: boolean;
@@ -120,6 +123,7 @@ type ReloadCommandContextOverrides = Omit<
 function createReloadCommandContext(overrides: ReloadCommandContextOverrides = {}): ReloadCommandContext {
 	const editor = overrides.editor ?? {};
 	return {
+		programStatus: overrides.programStatus ?? { report: () => {} },
 		hideThinkingBlock: overrides.hideThinkingBlock ?? false,
 		session: {
 			isStreaming: false,
@@ -217,6 +221,35 @@ function createLoadedResourcesContext(): LoadedResourcesContext {
 	};
 }
 
+function createMessageRebindContext(
+	harness: Awaited<ReturnType<typeof createHarness>>,
+	events: string[],
+): RebindContext {
+	return {
+		session: {
+			subscribe: (listener) => {
+				events.push("subscribe");
+				return harness.session.subscribe(listener);
+			},
+		},
+		applyRuntimeSettings: () => {},
+		programStatus: { reset: () => {}, handleEvent: () => {} },
+		renderCurrentSessionState: () => events.push("render"),
+		bindCurrentSessionExtensions: async () => {
+			events.push("bind");
+			await harness.session.bindExtensions({ uiContext: createTestUiContext(), mode: "tui" });
+		},
+		handleEvent: (event) => {
+			if (event.type === "message_start" || event.type === "message_end") {
+				events.push(`${event.type}:${event.message.role}:${getMessageText(event)}`);
+			}
+		},
+		updateAvailableProviderCount: async () => {},
+		updateEditorBorderColor: () => {},
+		updateTerminalTitle: () => {},
+	};
+}
+
 describe("regression #5943: session_start transient UI", () => {
 	it("renders loaded resources before restored messages without stale entries", () => {
 		initTheme("dark", false);
@@ -252,8 +285,14 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				session: {
+					subscribe: (listener) => {
+						events.push("subscribe");
+						return harness.session.subscribe(listener);
+					},
+				},
 				applyRuntimeSettings: () => events.push("apply"),
-				programStatus: { reset: () => {} },
+				programStatus: { reset: () => {}, handleEvent: () => {} },
 				renderCurrentSessionState: () => events.push("render"),
 				bindCurrentSessionExtensions: async () => {
 					events.push("bind");
@@ -262,7 +301,7 @@ describe("regression #5943: session_start transient UI", () => {
 						mode: "tui",
 					});
 				},
-				subscribeToAgent: () => events.push("subscribe"),
+				handleEvent: () => {},
 				updateAvailableProviderCount: async () => {},
 				updateEditorBorderColor: () => {},
 				updateTerminalTitle: () => {},
@@ -293,32 +332,9 @@ describe("regression #5943: session_start transient UI", () => {
 		});
 
 		try {
-			const context: RebindContext = {
-				applyRuntimeSettings: () => {},
-				programStatus: { reset: () => {} },
-				renderCurrentSessionState: () => events.push("render"),
-				bindCurrentSessionExtensions: async () => {
-					events.push("bind");
-					await harness.session.bindExtensions({
-						uiContext: createTestUiContext(),
-						mode: "tui",
-					});
-				},
-				subscribeToAgent: () => {
-					events.push("subscribe");
-					harness.session.subscribe((event) => {
-						if (event.type !== "message_start" && event.type !== "message_end") {
-							return;
-						}
-						events.push(`${event.type}:${event.message.role}:${getMessageText(event)}`);
-					});
-				},
-				updateAvailableProviderCount: async () => {},
-				updateEditorBorderColor: () => {},
-				updateTerminalTitle: () => {},
-			};
-
-			await interactiveModePrototype.rebindCurrentSession.call(context, { renderBeforeBind: true });
+			await interactiveModePrototype.rebindCurrentSession.call(createMessageRebindContext(harness, events), {
+				renderBeforeBind: true,
+			});
 
 			expect(events).toEqual([
 				"render",
@@ -346,32 +362,9 @@ describe("regression #5943: session_start transient UI", () => {
 		harness.setResponses([fauxAssistantMessage("assistant from start")]);
 
 		try {
-			const context: RebindContext = {
-				applyRuntimeSettings: () => {},
-				programStatus: { reset: () => {} },
-				renderCurrentSessionState: () => events.push("render"),
-				bindCurrentSessionExtensions: async () => {
-					events.push("bind");
-					await harness.session.bindExtensions({
-						uiContext: createTestUiContext(),
-						mode: "tui",
-					});
-				},
-				subscribeToAgent: () => {
-					events.push("subscribe");
-					harness.session.subscribe((event) => {
-						if (event.type !== "message_start" && event.type !== "message_end") {
-							return;
-						}
-						events.push(`${event.type}:${event.message.role}:${getMessageText(event)}`);
-					});
-				},
-				updateAvailableProviderCount: async () => {},
-				updateEditorBorderColor: () => {},
-				updateTerminalTitle: () => {},
-			};
-
-			await interactiveModePrototype.rebindCurrentSession.call(context, { renderBeforeBind: true });
+			await interactiveModePrototype.rebindCurrentSession.call(createMessageRebindContext(harness, events), {
+				renderBeforeBind: true,
+			});
 			await harness.session.agent.waitForIdle();
 
 			expect(events.slice(0, 3)).toEqual(["render", "subscribe", "bind"]);
@@ -439,6 +432,41 @@ describe("regression #5943: session_start transient UI", () => {
 		expect(context.hideThinkingBlock).toBe(true);
 		expect(events).toEqual(["reload", "rebuild:true", "start:true"]);
 	});
+
+	it.each([false, true])(
+		"refreshes terminal status after reload rejects (owner invalidated: %s)",
+		async (invalidated) => {
+			initTheme("dark", false);
+			const reports: ProgramStatus[] = [];
+			const terminal = { setProgramStatus: (status: ProgramStatus) => reports.push(status) } as unknown as Terminal;
+			const reporter = new ProgramStatusReporter(
+				() => terminal,
+				() => undefined,
+			);
+			const owner = { isActive: true };
+			reporter.handleEvent({ type: "agent_start" });
+			reporter.setBackgroundWork(owner, "example:review", true);
+			reporter.handleEvent({ type: "agent_settled", aborted: false });
+			expect(reports.at(-1)?.state).toBe("working");
+
+			const showError = vi.fn();
+			const context = createReloadCommandContext({
+				programStatus: reporter,
+				session: {
+					reload: async () => {
+						owner.isActive = !invalidated;
+						throw new Error("reload failed");
+					},
+				},
+				showError,
+			});
+
+			await interactiveModePrototype.handleReloadCommand.call(context);
+
+			expect(showError).toHaveBeenCalledWith(expect.stringContaining("reload failed"));
+			expect(reports.at(-1)?.state).toBe(invalidated ? "done" : "working");
+		},
+	);
 
 	it("keeps the reload blocker focused until async reload completes", async () => {
 		initTheme("dark", false);

@@ -409,6 +409,10 @@ export class ExtensionRunner {
 	) {
 		this.extensions = extensions;
 		this.runtime = runtime;
+		// A handler still running when its session is replaced must not report into the replacement's UI.
+		this.runtime.reportError = (error) => {
+			if (!this.staleMessage) this.emitError(error);
+		};
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
@@ -579,6 +583,11 @@ export class ExtensionRunner {
 	private wrapUIPromptContext(ui: ExtensionUIContext): ExtensionUIContext {
 		return {
 			...ui,
+			setBackgroundWork:
+				ui.setBackgroundWork &&
+				((key, active) => {
+					if (this.isActive) ui.setBackgroundWork?.(key, active);
+				}),
 			select: (title, options, opts) => this.withUIPrompt("select", title, () => ui.select(title, options, opts)),
 			confirm: (title, message, opts) => this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts)),
 			input: (title, placeholder, opts) =>
@@ -735,6 +744,10 @@ export class ExtensionRunner {
 			this.staleMessage = message;
 			this.runtime.invalidate(message);
 		}
+	}
+
+	get isActive(): boolean {
+		return !this.staleMessage;
 	}
 
 	private assertActive(): void {

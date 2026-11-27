@@ -134,6 +134,7 @@ import { addMcpServerConfig } from "../../extensions/mcp/config.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
+import { flushStdout } from "../../utils/flush-stdout.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { ensurePngTranscoder } from "../../utils/image-convert.ts";
 import { getCwdRelativePath, shortenHomePath } from "../../utils/paths.ts";
@@ -468,6 +469,56 @@ interface ExtensionChangelogUpdate {
 	markdown: string;
 }
 
+interface ReasoningDropDiagnostic {
+	provider: string;
+	/** Transformation `type` of a withheld block. */
+	droppedType: string;
+	/** Singular and plural name of a withheld block. */
+	noun: [string, string];
+}
+
+/** Assistant diagnostics that list reasoning a provider withheld from the model, by diagnostic type. */
+const REASONING_DROP_DIAGNOSTICS = new Map<string, ReasoningDropDiagnostic>([
+	[
+		"anthropic_input_transformations",
+		{ provider: "Anthropic", droppedType: "thinking_dropped", noun: ["thinking block", "thinking blocks"] },
+	],
+	[
+		"openai_input_transformations",
+		{ provider: "OpenAI", droppedType: "reasoning", noun: ["reasoning item", "reasoning items"] },
+	],
+]);
+
+interface DroppedReasoning {
+	diagnostic: ReasoningDropDiagnostic;
+	count: number;
+	reasons: string[];
+}
+
+/** Count the reasoning blocks a provider reported as withheld from the request that produced `message`. */
+function getDroppedReasoning(message: AssistantMessage): DroppedReasoning | undefined {
+	for (const diagnostic of message.diagnostics ?? []) {
+		const kind = REASONING_DROP_DIAGNOSTICS.get(diagnostic.type);
+		if (!kind) continue;
+		// Session data: diagnostics details are untyped JSON.
+		const transformations = diagnostic.details?.transformations;
+		if (!Array.isArray(transformations)) continue;
+		const dropped = transformations.filter(
+			(transformation): transformation is Record<string, unknown> =>
+				typeof transformation === "object" &&
+				transformation !== null &&
+				(transformation as Record<string, unknown>).type === kind.droppedType,
+		);
+		if (dropped.length === 0) continue;
+		const reasons = new Set<string>();
+		for (const transformation of dropped) {
+			if (typeof transformation.reason === "string") reasons.add(transformation.reason);
+		}
+		return { diagnostic: kind, count: dropped.length, reasons: [...reasons] };
+	}
+	return undefined;
+}
+
 export class InteractiveMode {
 	private runtimeHost: AgentSessionRuntime;
 	private renderer: TuiMainScreen | TuiAltScreen;
@@ -648,6 +699,7 @@ export class InteractiveMode {
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
 			this.themeController.applyFromSettings();
+			this.showRuntimeDiagnostics(this.runtimeHost.takeUnreportedDiagnostics());
 		});
 		this.version = VERSION;
 		this.renderer = createInteractiveTui({
@@ -968,6 +1020,7 @@ export class InteractiveMode {
 		});
 		nextUi.setClearOnShrink(clearOnShrink);
 		nextUi.onDebug = onDebug;
+		nextUi.setSuspendSignalHandler(() => this.handleCtrlZ());
 		if (nextUi instanceof TuiMainScreen && this.mainScreenRenderState) {
 			nextUi.restoreRenderState(this.mainScreenRenderState);
 		}
@@ -1037,6 +1090,8 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
 		this.ui.setFocus(this.editor);
 
+		// An external SIGTSTP (kill -TSTP) restores the terminal like Ctrl+Z (#12272).
+		this.ui.setSuspendSignalHandler(() => this.handleCtrlZ());
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
 		this.isInitialized = true;
@@ -1238,15 +1293,7 @@ export class InteractiveMode {
 			initialMessages,
 		} = this.options;
 
-		for (const diagnostic of startupDiagnostics ?? []) {
-			if (diagnostic.type === "error") {
-				this.showError(diagnostic.message);
-			} else if (diagnostic.type === "warning") {
-				this.showWarning(diagnostic.message);
-			} else {
-				this.showStatus(diagnostic.message);
-			}
-		}
+		this.showRuntimeDiagnostics(startupDiagnostics ?? []);
 
 		if (migratedProviders && migratedProviders.length > 0) {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
@@ -2219,6 +2266,18 @@ export class InteractiveMode {
 		}
 	}
 
+	private showRuntimeDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
+		for (const diagnostic of diagnostics) {
+			if (diagnostic.type === "error") {
+				this.showError(diagnostic.message);
+			} else if (diagnostic.type === "warning") {
+				this.showWarning(diagnostic.message);
+			} else {
+				this.showStatus(diagnostic.message);
+			}
+		}
+	}
+
 	private async rebindCurrentSession(options: { renderBeforeBind?: boolean } = {}): Promise<void> {
 		const session = this.session;
 
@@ -2227,10 +2286,13 @@ export class InteractiveMode {
 		this.programStatus.reset();
 		this.applyRuntimeSettings();
 
-		if (options.renderBeforeBind) {
-			this.renderCurrentSessionState();
-			this.subscribeToAgent();
-		}
+		let handleUIEvents = options.renderBeforeBind ?? false;
+		if (handleUIEvents) this.renderCurrentSessionState();
+		// Startup hooks may launch work before the rest of the TUI is ready for events.
+		this.unsubscribe = session.subscribe(async (event) => {
+			this.programStatus.handleEvent(event);
+			if (handleUIEvents) await this.handleEvent(event);
+		});
 
 		await this.bindCurrentSessionExtensions();
 
@@ -2238,9 +2300,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		if (!options.renderBeforeBind) {
-			this.subscribeToAgent();
-		}
+		handleUIEvents = true;
 
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
@@ -2260,6 +2320,7 @@ export class InteractiveMode {
 		}
 		stopThemeWatcher();
 		this.stop("transcript");
+		await flushStdout();
 		process.exit(1);
 	}
 
@@ -2389,7 +2450,7 @@ export class InteractiveMode {
 
 		// Create a context for shortcut handlers
 		const createContext = (): ExtensionContext => ({
-			ui: this.createExtensionUIContext(),
+			ui: this.createExtensionUIContext(extensionRunner),
 			mode: "tui",
 			hasUI: true,
 			cwd: this.sessionManager.getCwd(),
@@ -2778,7 +2839,7 @@ export class InteractiveMode {
 		};
 	}
 
-	private createExtensionUIContext(): ExtensionUIContext {
+	private createExtensionUIContext(owner?: ExtensionRunner): ExtensionUIContext {
 		return {
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
@@ -2792,6 +2853,8 @@ export class InteractiveMode {
 					this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage);
 				}
 			},
+			setBackgroundWork: (key, active) =>
+				this.programStatus.setBackgroundWork(owner ?? this.session.extensionRunner, key, active),
 			setWorkingVisible: (visible) => this.setWorkingVisible(visible),
 			setWorkingIndicator: (options) => this.setWorkingIndicator(options),
 			setHiddenThinkingLabel: (label) => this.setHiddenThinkingLabel(label),
@@ -3542,19 +3605,12 @@ export class InteractiveMode {
 		};
 	}
 
-	private subscribeToAgent(): void {
-		this.unsubscribe = this.session.subscribe(async (event) => {
-			await this.handleEvent(event);
-		});
-	}
-
 	private async handleEvent(event: AgentSessionEvent): Promise<void> {
 		if (!this.isInitialized) {
 			await this.init();
 		}
 
 		this.footer.invalidate();
-		this.programStatus.handleEvent(event);
 
 		switch (event.type) {
 			case "agent_start":
@@ -4335,46 +4391,32 @@ export class InteractiveMode {
 		);
 	}
 
-	private static countDroppedThinkingBlocks(message: AssistantMessage): number {
-		let count = 0;
-		for (const diagnostic of message.diagnostics ?? []) {
-			if (diagnostic.type !== "anthropic_input_transformations") continue;
-			const transformations = diagnostic.details?.transformations;
-			if (!Array.isArray(transformations)) continue;
-			count += transformations.filter(
-				(transformation) =>
-					typeof transformation === "object" &&
-					transformation !== null &&
-					(transformation as Record<string, unknown>).type === "thinking_dropped",
-			).length;
-		}
-		return count;
-	}
-
 	private maybeShowThinkingDropNotice(message: AssistantMessage): void {
 		if (!this.settingsManager.getShowCacheMissNotices()) return;
 
-		const droppedCount = InteractiveMode.countDroppedThinkingBlocks(message);
-		if (droppedCount === 0) return;
+		const dropped = getDroppedReasoning(message);
+		if (!dropped) return;
 
-		let previousDroppedCount = 0;
-		// message_end reaches the UI before the current message is persisted,
-		// so the branch's last assistant message is the previous response.
+		// Providers report a withheld block again on every later request that replays it, so only
+		// a count above the previous response's means new losses. message_end reaches the UI before
+		// the current message is persisted, so the branch's last assistant message is the previous response.
 		const branch = this.sessionManager.getBranch();
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const entry = branch[i];
 			if (entry.type === "message" && entry.message.role === "assistant") {
-				previousDroppedCount = InteractiveMode.countDroppedThinkingBlocks(entry.message);
+				const previous = getDroppedReasoning(entry.message);
+				if (previous?.diagnostic === dropped.diagnostic && dropped.count <= previous.count) return;
 				break;
 			}
 		}
-		if (droppedCount <= previousDroppedCount) return;
 
-		const noun = droppedCount === 1 ? "thinking block" : "thinking blocks";
+		const { provider, noun: nouns } = dropped.diagnostic;
+		const noun = nouns[dropped.count === 1 ? 0 : 1];
+		const reasons = dropped.reasons.length > 0 ? `: ${dropped.reasons.join(", ")}` : "";
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(
 			new ThemedText(
-				() => theme.fg("warning", `Anthropic dropped ${droppedCount} ${noun} (details in session)`),
+				() => theme.fg("warning", `${provider} dropped ${dropped.count} ${noun}${reasons} (details in session)`),
 				1,
 				0,
 			),
@@ -4512,6 +4554,7 @@ export class InteractiveMode {
 			this.themeController.disableAutoSync();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
+			await flushStdout();
 			process.exit(0);
 		}
 
@@ -4528,9 +4571,11 @@ export class InteractiveMode {
 
 		const resumeCommand = formatResumeCommand(this.sessionManager);
 		if (resumeCommand) {
-			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+			// Own line so the command can be selected with a triple-click (#12237).
+			process.stdout.write(`${chalk.dim("To resume this session:")}\n${resumeCommand}\n`);
 		}
 
+		await flushStdout();
 		process.exit(0);
 	}
 
@@ -6732,6 +6777,8 @@ export class InteractiveMode {
 				dismissReloadBox(previousEditor as Component);
 			}
 			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			this.programStatus.report();
 		}
 	}
 
