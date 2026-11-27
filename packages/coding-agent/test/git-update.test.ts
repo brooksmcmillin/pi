@@ -630,6 +630,13 @@ describe("DefaultPackageManager git update", () => {
 		const manager = packageManager as unknown as { getGitUpdateStatePath(path: string, scope: string): string };
 		writeFileSync(`${manager.getGitUpdateStatePath(installedDir, "user")}.current`, "invalid");
 		const afterCorruption = await packageManager.resolve();
+		expect(afterCorruption.installFailures).toEqual([
+			expect.objectContaining({
+				scope: "user",
+				source: gitSource,
+				message: expect.stringContaining("Invalid Git revision pointer"),
+			}),
+		]);
 		expect(afterCorruption.extensions.map(({ path }) => path)).not.toContain(alias);
 		expect(afterCorruption.extensions.map(({ path }) => path)).toContain(
 			join(projectCheckout, "extensions", "implicit.ts"),
@@ -2625,6 +2632,92 @@ describe("DefaultPackageManager git update", () => {
 		expect(existsSync(installedDir)).toBe(false);
 		expect(existsSync(other)).toBe(true);
 	});
+
+	it("rejects a regular file at the selected checkout path", async () => {
+		setupRemoteAndInstall();
+		createCommit(remoteDir, "extension.ts", "// v2", "Update");
+		await packageManager.update();
+		const active = selected();
+		expect(active).not.toBe(installedDir);
+		rmSync(active, { recursive: true });
+		writeFileSync(active, "not a checkout");
+		settingsManager.setPackages([installedDir, gitSource]);
+
+		const result = await packageManager.resolve();
+		expect(result.extensions.some(({ metadata }) => [installedDir, gitSource].includes(metadata.source))).toBe(false);
+		expect(result.installFailures).toEqual([
+			expect.objectContaining({
+				source: gitSource,
+				message: expect.stringContaining(`Expected a directory at ${active}`),
+			}),
+		]);
+	});
+
+	it.each(["file", "directory"])(
+		"skips an unavailable checkout reached through a configured %s alias",
+		async (kind) => {
+			setupRemoteAndInstall();
+			const otherSource = "git:github.com/test/other";
+			const other = join(dirname(installedDir), "other");
+			git(["clone", remoteDir, other], tempDir);
+			createCommit(remoteDir, "extension.ts", "// v2", "Update");
+			await packageManager.update();
+			const active = selected();
+			const alias = join(installedDir, "extension.ts");
+			const selectedAlias = join(active, "extension.ts");
+			rmSync(selectedAlias);
+			symlinkSync(join(other, "extension.ts"), selectedAlias, "file");
+			const manager = packageManager as unknown as { getGitUpdateStatePath(path: string, scope: string): string };
+			writeFileSync(`${manager.getGitUpdateStatePath(other, "user")}.current`, "invalid");
+			const packageAlias = kind === "file" ? alias : installedDir;
+			const retained = join(other, "extension.ts");
+			const healthy = join(active, "extensions", "healthy.ts");
+			mkdirSync(dirname(healthy), { recursive: true });
+			writeFileSync(healthy, "export default function() {}");
+			symlinkSync(retained, join(dirname(healthy), "retained.ts"), "file");
+			// A link inside the retained checkout must not shadow a healthy selected resource.
+			const selectedExplicit = join(active, "explicit.ts");
+			writeFileSync(selectedExplicit, "export default function() {}");
+			symlinkSync(retained, join(installedDir, "explicit.ts"), "file");
+			const externalAlias = join(agentDir, "checkout-alias");
+			symlinkSync(installedDir, externalAlias, "dir");
+			const fileAlias = join(agentDir, "explicit-alias.ts");
+			symlinkSync(join(installedDir, "explicit.ts"), fileAlias, "file");
+			const autoDir = join(agentDir, "extensions");
+			mkdirSync(autoDir, { recursive: true });
+			const rediscoverable = join(autoDir, "retained.ts");
+			symlinkSync(retained, rediscoverable, "file");
+			const standalone = join(autoDir, "standalone.ts");
+			writeFileSync(standalone, "export default function() {}");
+			settingsManager.setPackages([packageAlias, { source: gitSource, extensions: [] }, otherSource]);
+			settingsManager.setExtensionPaths([
+				retained,
+				rediscoverable,
+				kind === "file" ? fileAlias : join(externalAlias, "explicit.ts"),
+			]);
+			const result = await packageManager.resolve();
+			expect(
+				result.extensions
+					.filter(({ metadata, enabled }) => metadata.source === packageAlias && enabled)
+					.map(({ path }) => path),
+			).toEqual(kind === "directory" ? [healthy] : []);
+			expect(
+				result.extensions
+					.filter(({ metadata, enabled }) => metadata.origin === "top-level" && enabled)
+					.map(({ path }) => path),
+			).toContain(standalone);
+			expect(result.extensions.map(({ path }) => path)).toContain(selectedExplicit);
+			expect(result.extensions.map(({ path }) => path)).not.toContain(retained);
+			expect(result.extensions.map(({ path }) => path)).not.toContain(rediscoverable);
+			expect(result.extensions.map(({ path }) => path)).not.toContain(join(dirname(healthy), "retained.ts"));
+			expect(result.installFailures).toEqual([
+				expect.objectContaining({
+					source: otherSource,
+					message: expect.stringContaining("Invalid Git revision pointer"),
+				}),
+			]);
+		},
+	);
 
 	it("skips a configured alias when the final checkout lookup sees an invalid pointer", async () => {
 		setupRemoteAndInstall();

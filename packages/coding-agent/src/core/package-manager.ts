@@ -261,6 +261,8 @@ interface UpdatedPackage extends ConfiguredUpdateSource {
 
 interface ResourceAccumulator {
 	gitRevisions: Map<string, string>;
+	unavailableCheckouts: Map<string, { matchTarget: string; failure: PackageInstallFailure }>;
+	blockedCheckoutFailures: Set<PackageInstallFailure>;
 	extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
@@ -720,6 +722,7 @@ function collectAutoExtensionEntries(
 
 	// First check if this directory itself has explicit extension entries (package.json or index)
 	const discover = (original: string, selected: string) => {
+		if (!selected) return null;
 		const files = resolveExtensionEntries(selected, selectPath);
 		if ((recordDirect || original !== selected) && rememberAlias) {
 			for (const file of files ?? []) {
@@ -1011,13 +1014,36 @@ export function redirectGitRevisionPath(
 
 	if (directOnly) return select(path, logical);
 
+	function readLinkTarget(component: string): string | undefined {
+		try {
+			const link = readlinkSync(component);
+			let parent = realpathSync(dirname(component));
+			let suffix = link;
+			if (process.platform !== "win32" && link.split("/").includes("..")) {
+				// Interpret parent segments after resolving directory links.
+				const parts = link.split("/");
+				const lastParent = parts.lastIndexOf("..");
+				const prefix = parts.slice(0, lastParent + 1).join("/");
+				parent = realpathSync.native(isAbsolute(link) ? prefix : `${parent}/${prefix}`);
+				suffix = parts.slice(lastParent + 1).join("/");
+			}
+			return resolve(parent, suffix);
+		} catch {
+			return undefined;
+		}
+	}
+
 	function selectPath(candidate: string): string | undefined {
 		const direct = select(candidate, logical);
 		if (direct && (direct !== candidate || logical === active)) return direct;
 		// A path already in the selected checkout can still be a link into a retained copy.
 		const root = canonicalizePath(logical);
-		let selected = select(canonicalizePath(candidate), root);
-		let boundary = candidate.length;
+		const canonicalCandidate = canonicalizePath(candidate);
+		// Preserve the first checkout named by a file symlink before following links inside it.
+		const linkTarget = canonicalCandidate === candidate ? undefined : readLinkTarget(candidate);
+		const linked = linkTarget && select(linkTarget, root);
+		let selected = linked || select(canonicalCandidate, root);
+		let boundary = candidate.length - (linked ? 1 : 0);
 		for (let ancestor = dirname(candidate); ; ancestor = dirname(ancestor)) {
 			const canonical = canonicalizePath(ancestor);
 			// An outer checkout alias takes precedence over symlinks inside the old checkout.
@@ -1043,23 +1069,10 @@ export function redirectGitRevisionPath(
 		// A dangling link may be an ancestor of the requested file.
 		let next: string | undefined;
 		for (let component = candidate; dirname(component) !== component; component = dirname(component)) {
-			try {
-				const link = readlinkSync(component);
-				let parent = realpathSync(dirname(component));
-				let suffix = link;
-				if (process.platform !== "win32" && link.split("/").includes("..")) {
-					// Let the filesystem interpret parent segments after resolving any directory links.
-					const parts = link.split("/");
-					const lastParent = parts.lastIndexOf("..");
-					const prefix = parts.slice(0, lastParent + 1).join("/");
-					parent = realpathSync.native(isAbsolute(link) ? prefix : `${parent}/${prefix}`);
-					suffix = parts.slice(lastParent + 1).join("/");
-				}
-				const target = resolve(parent, suffix);
+			const target = readLinkTarget(component);
+			if (target) {
 				next = join(target, candidate.slice(component.length));
 				break;
-			} catch {
-				// Try an earlier component when the parent or link is unavailable.
 			}
 		}
 		if (!next) return undefined;
@@ -1363,10 +1376,11 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Pin installed checkout paths before resolving local aliases, regardless of declaration order.
 		const checkoutSnapshot = new Map<string, string>();
-		const unavailableCheckouts = new Map<string, string>();
+		const { unavailableCheckouts } = accumulator;
 		for (const entry of allPackages) {
 			if (entry.scope === "project" && !this.settingsManager.isProjectTrusted()) continue;
-			const parsed = this.parseSource(this.getPackageSourceString(entry.pkg));
+			const source = this.getPackageSourceString(entry.pkg);
+			const parsed = this.parseSource(source);
 			if (parsed.type !== "git") continue;
 			let logical: string | undefined;
 			try {
@@ -1379,7 +1393,10 @@ export class DefaultPackageManager implements PackageManager {
 				if (existsSync(selected)) checkoutSnapshot.set(logical, selected);
 			} catch (error) {
 				if (logical !== undefined && error instanceof GitRevisionPointerError) {
-					unavailableCheckouts.set(logical, this.getGitRevisionMatchTarget(logical, entry.scope));
+					unavailableCheckouts.set(logical, {
+						matchTarget: this.getGitRevisionMatchTarget(logical, entry.scope),
+						failure: { source, scope: entry.scope, message: String(error) },
+					});
 				}
 				// Normal package resolution reports failures for packages that are actually loaded.
 			}
@@ -1392,9 +1409,6 @@ export class DefaultPackageManager implements PackageManager {
 			accumulator,
 			onMissing,
 			checkoutSnapshot,
-			undefined,
-			undefined,
-			unavailableCheckouts,
 		);
 
 		const globalBaseDir = this.agentDir;
@@ -1414,7 +1428,7 @@ export class DefaultPackageManager implements PackageManager {
 					origin: "top-level",
 				},
 				projectBaseDir,
-				accumulator.gitRevisions,
+				accumulator,
 			);
 			this.resolveLocalEntries(
 				globalEntries,
@@ -1426,11 +1440,16 @@ export class DefaultPackageManager implements PackageManager {
 					origin: "top-level",
 				},
 				globalBaseDir,
-				accumulator.gitRevisions,
+				accumulator,
 			);
 		}
 
 		this.addAutoDiscoveredResources(accumulator, globalSettings, projectSettings, globalBaseDir, projectBaseDir);
+		for (const failure of accumulator.blockedCheckoutFailures) {
+			if (!installFailures.some(({ source, scope }) => source === failure.source && scope === failure.scope)) {
+				installFailures.push(failure);
+			}
+		}
 
 		// Built-in extensions are enabled unless the user `extensions` setting excludes them, for example
 		// with `-builtin:mcp`. A matching `+`, `-`, or `!` entry in the project setting overrides that.
@@ -1886,8 +1905,8 @@ export class DefaultPackageManager implements PackageManager {
 		checkoutSnapshot?: Map<string, string>,
 		missingLocalPaths?: string[],
 		temporarySelection?: { checkouts: Map<string, string>; preparing: boolean },
-		unavailableCheckouts = new Map<string, string>(),
 	): Promise<PackageInstallFailure[]> {
+		const { unavailableCheckouts } = accumulator;
 		const installFailures: PackageInstallFailure[] = [];
 		const collections: Array<() => void> = [];
 		const temporaryCheckouts = temporarySelection?.checkouts ?? new Map<string, string>();
@@ -1908,9 +1927,6 @@ export class DefaultPackageManager implements PackageManager {
 				const baseDir = this.getBaseDirForScope(resolvedScope);
 				collect(resolvedScope, () => {
 					const original = this.resolvePathFromBase(parsed.path, baseDir);
-					for (const [logical, matchTarget] of unavailableCheckouts) {
-						if (redirectGitRevisionPath(original, logical, matchTarget) !== undefined) return;
-					}
 					this.resolveLocalExtensionSource(original, accumulator, filter, metadata, missingLocalPaths);
 				});
 				continue;
@@ -1976,10 +1992,14 @@ export class DefaultPackageManager implements PackageManager {
 				let present: boolean;
 				let logical: string | undefined;
 				const reportFailure = (error: unknown) => {
+					const failure = { source: resolvedSource, scope: resolvedScope, message: String(error) };
 					if (logical !== undefined && resolvedScope !== "temporary" && error instanceof GitRevisionPointerError) {
-						unavailableCheckouts.set(logical, this.getGitRevisionMatchTarget(logical, resolvedScope));
+						unavailableCheckouts.set(logical, {
+							matchTarget: this.getGitRevisionMatchTarget(logical, resolvedScope),
+							failure,
+						});
 					}
-					installFailures.push({ source: resolvedSource, scope: resolvedScope, message: String(error) });
+					installFailures.push(failure);
 				};
 				try {
 					logical = this.getGitStoragePath(parsed, resolvedScope);
@@ -2060,7 +2080,8 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 		missingLocalPaths?: string[],
 	): void {
-		const resolved = this.redirectGitResource(original, accumulator.gitRevisions);
+		const resolved = this.selectConfiguredResource(original, accumulator);
+		if (!resolved) return;
 		if (!existsSync(resolved)) {
 			missingLocalPaths?.push(original);
 			return;
@@ -3151,7 +3172,15 @@ export class DefaultPackageManager implements PackageManager {
 		if (!name.startsWith(prefix) || !/^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) {
 			throw new GitRevisionPointerError(`Invalid Git revision pointer at ${pointer}`);
 		}
-		return join(dirname(logicalDir), name);
+		const selected = join(dirname(logicalDir), name);
+		try {
+			const target = lstatSync(selected, { throwIfNoEntry: false });
+			if (target && !target.isDirectory()) throw new GitRevisionPointerError(`Expected a directory at ${selected}`);
+		} catch (error) {
+			if (error instanceof GitRevisionPointerError) throw error;
+			throw new GitRevisionPointerError(`Could not inspect selected Git checkout at ${selected}`, { cause: error });
+		}
+		return selected;
 	}
 
 	private getGitInstallPath(source: GitSource, scope: SourceScope): string {
@@ -3242,9 +3271,10 @@ export class DefaultPackageManager implements PackageManager {
 		if (filterRoot !== packageRoot) {
 			metadata.gitRevision = { active: packageRoot, logical: filterRoot };
 		}
-		const selectPath = accumulator.gitRevisions.size
-			? (path: string) => DefaultPackageManager.selectGitResourcePath(path, accumulator.gitRevisions)
-			: unchangedPath;
+		const selectPath =
+			accumulator.gitRevisions.size || accumulator.unavailableCheckouts.size
+				? (path: string) => this.selectConfiguredResource(path, accumulator)
+				: unchangedPath;
 		const manifest = readPiManifest(selectPath(join(packageRoot, "package.json")));
 		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest, selectPath);
 		if (changelogPath) {
@@ -3505,7 +3535,7 @@ export class DefaultPackageManager implements PackageManager {
 					// A wildcard can match a managed checkout boundary, not just a file inside it.
 					for (const directory of glob(parts.slice(0, i).join("/"), physical)) {
 						const selected = selectPath(directory);
-						if (selected === directory || ancestors.has(selected)) continue;
+						if (!selected || selected === directory || ancestors.has(selected)) continue;
 						if (!statSync(selected, { throwIfNoEntry: false })?.isDirectory()) continue;
 						const spelling = resolve(logical, relative(physical, directory));
 						if (!isVisibleGlobPath(root, spelling)) continue;
@@ -3524,7 +3554,7 @@ export class DefaultPackageManager implements PackageManager {
 				// Pass the fixed prefix as a literal cwd; it may contain characters meaningful to glob.
 				const prefix = wildcard === 0 ? root : resolve(root, `${parts.slice(0, wildcard).join("/")}/`);
 				const selected = selectPath(prefix);
-				expand(parts.slice(wildcard), selected, prefix, new Set([selected]));
+				if (selected) expand(parts.slice(wildcard), selected, prefix, new Set([selected]));
 			}
 			return [...matches].sort();
 		});
@@ -3569,6 +3599,7 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		for (const original of resolved) {
 			const selected = selectPath(original);
+			if (!selected) continue;
 			if (directoriesOnly) {
 				try {
 					if (!statSync(selected, { throwIfNoEntry: false })?.isDirectory()) continue;
@@ -3580,8 +3611,10 @@ export class DefaultPackageManager implements PackageManager {
 				selected !== original && (path === selected || isPathInside(selected, path))
 					? join(original, relative(selected, path))
 					: path;
-			const rememberDiscoveredAlias = (file: string, alias: string) =>
-				rememberAlias(selectPath(file), logicalPath(alias));
+			const rememberDiscoveredAlias = (file: string, alias: string) => {
+				const active = selectPath(file);
+				if (active) rememberAlias(active, logicalPath(alias));
+			};
 			for (const path of this.collectFilesFromPaths(
 				[selected],
 				resourceType,
@@ -3608,16 +3641,17 @@ export class DefaultPackageManager implements PackageManager {
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
 		baseDir: string,
-		gitRevisions: ReadonlyMap<string, string>,
+		accumulator: ResourceAccumulator,
 	): void {
 		if (entries.length === 0) return;
+		const { gitRevisions } = accumulator;
 
 		// Collect all files from plain entries (non-pattern entries)
 		const { plain, patterns } = splitPatterns(entries);
 		const { allFiles, aliases, filesBySpelling } = this.collectSelectedPackagePaths(
 			plain.map((entry) => this.resolvePathFromBase(entry, baseDir)),
 			resourceType,
-			(path) => this.redirectGitResource(path, gitRevisions),
+			(path) => this.selectConfiguredResource(path, accumulator),
 		);
 
 		// pi config saves exact paths relative to the settings directory. Resolve them through
@@ -3715,15 +3749,40 @@ export class DefaultPackageManager implements PackageManager {
 		return DefaultPackageManager.selectGitResourcePath(path, revisions);
 	}
 
-	static selectGitResourcePath(path: string, revisions?: ReadonlyMap<string, string>): string {
-		if (!revisions?.size) return path;
+	private selectConfiguredResource(path: string, accumulator: ResourceAccumulator): string {
+		return DefaultPackageManager.selectGitResourcePath(
+			path,
+			accumulator.gitRevisions,
+			accumulator.unavailableCheckouts,
+			accumulator.blockedCheckoutFailures,
+		);
+	}
+
+	static selectGitResourcePath(
+		path: string,
+		revisions?: ReadonlyMap<string, string>,
+		unavailableCheckouts?: ResourceAccumulator["unavailableCheckouts"],
+		blockedCheckoutFailures?: Set<PackageInstallFailure>,
+	): string {
+		if (!revisions?.size && !unavailableCheckouts?.size) return path;
+		const unavailable = (candidate: string, lexicalOnly: boolean) => {
+			for (const [logical, { matchTarget, failure }] of unavailableCheckouts ?? []) {
+				if (redirectGitRevisionPath(candidate, logical, matchTarget, lexicalOnly) !== undefined) {
+					blockedCheckoutFailures?.add(failure);
+					return true;
+				}
+			}
+			return false;
+		};
 		let selected = path;
 		const seen = new Set([path]);
 		// A selected checkout can itself contain a link into another managed checkout.
 		for (let hops = 0; hops < 40; hops++) {
 			let next: string | undefined;
 			// Select the containing revision before following links in a retained checkout.
-			for (const [logical, active] of revisions) {
+			// The empty path means unavailable to filesystem discovery, not a fallback checkout.
+			if (unavailable(selected, true)) return "";
+			for (const [logical, active] of revisions ?? []) {
 				const candidate = redirectGitRevisionPath(selected, logical, active, true);
 				if (candidate !== undefined && candidate !== selected) {
 					next = candidate;
@@ -3732,7 +3791,18 @@ export class DefaultPackageManager implements PackageManager {
 			}
 			if (next === undefined) {
 				let bestBoundary = Number.POSITIVE_INFINITY;
-				for (const [logical, active] of revisions) {
+				let blocked: PackageInstallFailure | undefined;
+				for (const [logical, { matchTarget, failure }] of unavailableCheckouts ?? []) {
+					let boundary = Number.MAX_SAFE_INTEGER;
+					const candidate = redirectGitRevisionPath(selected, logical, matchTarget, false, (length) => {
+						boundary = length;
+					});
+					if (candidate !== undefined && boundary < bestBoundary) {
+						bestBoundary = boundary;
+						blocked = failure;
+					}
+				}
+				for (const [logical, active] of revisions ?? []) {
 					let boundary = Number.MAX_SAFE_INTEGER;
 					const candidate = redirectGitRevisionPath(selected, logical, active, false, (length) => {
 						boundary = length;
@@ -3740,14 +3810,20 @@ export class DefaultPackageManager implements PackageManager {
 					if (candidate !== undefined && candidate !== selected && boundary < bestBoundary) {
 						next = candidate;
 						bestBoundary = boundary;
+						blocked = undefined;
 					}
 				}
+				if (blocked) {
+					blockedCheckoutFailures?.add(blocked);
+					return "";
+				}
 			}
-			if (next === undefined || seen.has(next)) break;
+			if (next === undefined) return selected;
+			if (seen.has(next)) break;
 			seen.add(next);
 			selected = next;
 		}
-		return selected;
+		return unavailable(selected, false) ? "" : selected;
 	}
 
 	private withGitRevision(
@@ -3823,7 +3899,7 @@ export class DefaultPackageManager implements PackageManager {
 			? collectAncestorAgentsSkillDirs(this.cwd).filter((dir) => !pathsEqual(dir, userAgentsSkillsDir))
 			: [];
 
-		const selectPath = (path: string) => this.redirectGitResource(path, accumulator.gitRevisions);
+		const selectPath = (path: string) => this.selectConfiguredResource(path, accumulator);
 		const aliases = new Map<string, Set<string>>();
 		const rememberAlias = (file: string, alias: string) => {
 			const spellings = aliases.get(file) ?? new Set<string>();
@@ -4096,6 +4172,8 @@ export class DefaultPackageManager implements PackageManager {
 	private createAccumulator(): ResourceAccumulator {
 		return {
 			gitRevisions: new Map(),
+			unavailableCheckouts: new Map(),
+			blockedCheckoutFailures: new Set(),
 			extensions: new Map(),
 			skills: new Map(),
 			prompts: new Map(),

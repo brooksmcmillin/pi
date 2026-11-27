@@ -20,6 +20,8 @@ If a configured package fails to install at startup, for example because npm can
 
 When a Git package changes revision or Pi rebuilds a checkout left incomplete by an older updater, Pi prepares the checkout and its dependencies beside the installed package. Pi then switches which checkout it loads without moving either checkout. This preserves absolute paths written by install scripts. If preparation or the switch fails, Pi still loads the previous checkout. Repairing missing dependencies at the same revision instead runs in the selected checkout. Older checkouts are retained for running sessions and removed when you uninstall a configured package. For temporary `-e` packages, you can clear `~/.pi/agent/tmp/extensions/` once all sessions using that cache have exited.
 
+If a configured Git package's revision pointer is invalid, Pi reports the failure and skips configured resources that resolve into that package's retained checkouts. Unrelated resources still load.
+
 Staged updates support ordinary Pi-managed clones with a standalone `.git` directory and no symlinks inside that directory. Do not share a checkout across distinct managed Git roots. Use a local package declaration for checkouts you manage yourself.
 
 Personal installs are written to `~/.pi/agent/settings.json`. Add `--local` or `-l` to write the package declaration to `.pi/settings.json`. Pi reads declarations from that file only after project trust is granted.
