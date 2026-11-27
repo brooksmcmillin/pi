@@ -1037,6 +1037,17 @@ export function redirectGitRevisionPath(
 		}
 	}
 
+	function selectAncestor(candidate: string, root: string) {
+		let result: { selected: string; boundary: number } | undefined;
+		for (let ancestor = dirname(candidate); ; ancestor = dirname(ancestor)) {
+			const canonical = canonicalizePath(ancestor);
+			// An outer checkout alias takes precedence over symlinks inside the old checkout.
+			const match = select(join(canonical, candidate.slice(ancestor.length)), root);
+			if (match !== undefined && match !== candidate) result = { selected: match, boundary: ancestor.length };
+			if (dirname(ancestor) === ancestor) return result;
+		}
+	}
+
 	function selectPath(candidate: string): string | undefined {
 		const direct = select(candidate, logical);
 		if (direct && (direct !== candidate || logical === active)) return direct;
@@ -1052,7 +1063,7 @@ export function redirectGitRevisionPath(
 			for (let hop = 0; hop < 40; hop++) {
 				const target = readLinkTarget(link);
 				if (!target || visited.has(target)) break;
-				const match = select(target, root);
+				const match = select(target, root) ?? selectAncestor(target, root)?.selected;
 				if (match && match !== candidate) {
 					selected = match;
 					boundary -= 1 / (hop + 2);
@@ -1062,16 +1073,8 @@ export function redirectGitRevisionPath(
 				link = target;
 			}
 		}
-		for (let ancestor = dirname(candidate); ; ancestor = dirname(ancestor)) {
-			const canonical = canonicalizePath(ancestor);
-			// An outer checkout alias takes precedence over symlinks inside the old checkout.
-			const match = select(join(canonical, candidate.slice(ancestor.length)), root);
-			if (match !== undefined && match !== candidate) {
-				selected = match;
-				boundary = ancestor.length;
-			}
-			if (dirname(ancestor) === ancestor) break;
-		}
+		const ancestor = selectAncestor(candidate, root);
+		if (ancestor) ({ selected, boundary } = ancestor);
 		if (selected === candidate) return undefined;
 		if (selected && candidate === path) onBoundary?.(boundary);
 		return selected;

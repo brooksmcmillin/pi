@@ -659,12 +659,17 @@ export class DefaultResourceLoader implements ResourceLoader {
 		);
 
 		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
+		const directoryFailures = new Set<PackageInstallFailure>();
 		const extensionsResult = await this.loadFinalExtensionSet(
 			extensionPaths,
 			preTrustExtensions,
-			this.getDirectoryEntrySelector(resolvedPaths),
+			this.getDirectoryEntrySelector(resolvedPaths, directoryFailures),
 		);
-		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
+		mergeExtensionWarnings(extensionsResult, [
+			...installWarnings,
+			...packageWarnings,
+			...collectPackageInstallWarnings([...directoryFailures]),
+		]);
 		for (const path of cliExtensionPaths.missingLocalPaths ?? []) {
 			extensionsResult.errors.push({ path, error: `Extension path does not exist: ${path}` });
 		}
@@ -825,14 +830,19 @@ export class DefaultResourceLoader implements ResourceLoader {
 			resolvedPaths.installFailures,
 			cliExtensionPaths.installFailures,
 		);
+		const directoryFailures = new Set<PackageInstallFailure>();
 		const extensionsResult = await loadExtensionsCached(
 			extensionPaths,
 			this.cwd,
 			this.eventBus,
 			undefined,
-			this.getDirectoryEntrySelector(resolvedPaths),
+			this.getDirectoryEntrySelector(resolvedPaths, directoryFailures),
 		);
-		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
+		mergeExtensionWarnings(extensionsResult, [
+			...installWarnings,
+			...packageWarnings,
+			...collectPackageInstallWarnings([...directoryFailures]),
+		]);
 		if (!options.includeInlineFactories) {
 			return extensionsResult;
 		}
@@ -854,12 +864,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return getResourcePathKey(this.resolveExtensionLoadPath(path));
 	}
 
-	private getDirectoryEntrySelector({ gitRevisions, unavailableCheckouts }: ResolvedPaths) {
+	private getDirectoryEntrySelector(
+		{ gitRevisions, unavailableCheckouts }: ResolvedPaths,
+		directoryFailures: Set<PackageInstallFailure>,
+	) {
 		const projectTrusted = this.settingsManager.isProjectTrusted();
 		if (projectTrusted && !gitRevisions?.size && !unavailableCheckouts?.size) return;
 		return (entry: string) => {
 			if (!projectTrusted && this.isProjectManagedExtensionSource(entry)) return "";
-			return DefaultPackageManager.selectGitResourcePath(entry, gitRevisions, unavailableCheckouts);
+			return DefaultPackageManager.selectGitResourcePath(
+				entry,
+				gitRevisions,
+				unavailableCheckouts,
+				directoryFailures,
+			);
 		};
 	}
 

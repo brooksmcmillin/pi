@@ -2681,6 +2681,34 @@ describe("DefaultPackageManager git update", () => {
 		).toHaveLength(1);
 	});
 
+	it("warns once when a directory entry reaches a shadowed invalid checkout", async () => {
+		setupRemoteAndInstall();
+		mkdirSync(join(remoteDir, "extensions"));
+		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add project extension");
+		const projectCheckout = join(tempDir, ".pi", "git", "github.com", "test", "extension");
+		mkdirSync(dirname(projectCheckout), { recursive: true });
+		git(["clone", remoteDir, projectCheckout], tempDir);
+		const directory = join(tempDir, "bare-extension");
+		mkdirSync(directory);
+		writeFileSync(join(directory, "package.json"), JSON.stringify({ main: "entry.ts" }));
+		symlinkSync(join(installedDir, "extension.ts"), join(directory, "entry.ts"), "file");
+		const manager = packageManager as unknown as { getGitUpdateStatePath(path: string, scope: string): string };
+		const pointer = `${manager.getGitUpdateStatePath(installedDir, "user")}.current`;
+		mkdirSync(dirname(pointer), { recursive: true });
+		writeFileSync(pointer, "invalid");
+		settingsManager.setPackages([directory, gitSource]);
+		settingsManager.setProjectPackages([gitSource]);
+		expect((await packageManager.resolve()).installFailures).toEqual([]);
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		await loader.reload();
+		const result = loader.getExtensions();
+		expect(result.extensions.map(({ path }) => path)).toEqual([join(projectCheckout, "extensions", "worker.ts")]);
+		expect(result.errors).toEqual([]);
+		expect(result.warnings).toEqual([
+			{ path: gitSource, warning: expect.stringContaining("Invalid Git revision pointer") },
+		]);
+	});
+
 	it.each([false, true])("checks the resolved directory extension entry (invalid pointer: %s)", async (invalid) => {
 		setupRemoteAndInstall();
 		const loaded = join(tempDir, "directory-entry-loaded");
@@ -2800,6 +2828,10 @@ describe("DefaultPackageManager git update", () => {
 				rmSync(retained);
 				const dangling = await packageManager.resolve();
 				expect(dangling.extensions.map(({ path }) => path)).toContain(selectedExplicit);
+				rmSync(intermediate);
+				symlinkSync(join(externalAlias, "explicit.ts"), intermediate, "file");
+				const mixed = await packageManager.resolve();
+				expect(mixed.extensions.map(({ path }) => path)).toContain(selectedExplicit);
 			}
 			expect(result.extensions.map(({ path }) => path)).not.toContain(join(dirname(healthy), "retained.ts"));
 			expect(result.installFailures).toEqual([
