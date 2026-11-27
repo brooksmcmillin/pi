@@ -466,10 +466,12 @@ describe("DefaultPackageManager git update", () => {
 		expect(loader.getExtensions().extensions.map(({ path }) => path)).toContain(join(selected(), "added.ts"));
 	});
 
-	it.each(["direct", "nested", "configured"])(
+	it.each(["direct", "nested", "configured", "directory", "directory-denied"])(
 		"defers a project checkout alias until project trust resolves (%s)",
 		async (kind) => {
 			const nested = kind === "nested";
+			const directoryEntry = kind === "directory" || kind === "directory-denied";
+			const trusted = kind !== "directory-denied";
 			setupRemoteAndInstall();
 			const marker = join(tempDir, "initialized");
 			const extension = (value: string) =>
@@ -497,14 +499,27 @@ describe("DefaultPackageManager git update", () => {
 				);
 			}
 			writeFileSync(ordinary, extension("ordinary\n"));
-			if (kind === "configured") settingsManager.setExtensionPaths([join(alias, "worker.ts"), ordinary]);
+			const barePackage = join(tempDir, "bare-project-alias");
+			if (directoryEntry) {
+				mkdirSync(barePackage);
+				writeFileSync(join(barePackage, "package.json"), JSON.stringify({ main: "entry.ts" }));
+				symlinkSync(join(checkout, "worker.ts"), join(barePackage, "entry.ts"), "file");
+				settingsManager.setPackages([barePackage]);
+				settingsManager.setExtensionPaths([ordinary]);
+			} else if (kind === "configured") {
+				settingsManager.setExtensionPaths([join(alias, "worker.ts"), ordinary]);
+			}
 			await settingsManager.flush();
 			const loader = new DefaultResourceLoader({
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
 				additionalExtensionPaths:
-					kind === "configured" ? [] : nested ? [cliPackage] : [join(alias, "worker.ts"), ordinary],
+					kind === "configured" || directoryEntry
+						? []
+						: nested
+							? [cliPackage]
+							: [join(alias, "worker.ts"), ordinary],
 			});
 			await loader.reload({
 				resolveProjectTrust: async ({ extensionsResult }) => {
@@ -512,15 +527,18 @@ describe("DefaultPackageManager git update", () => {
 					expect(settingsManager.getProjectSettings().packages).toBeUndefined();
 					expect(extensionsResult.extensions.map(({ path }) => path)).toEqual([ordinary]);
 					expect(readFileSync(marker, "utf8")).toBe("ordinary\n");
-					return true;
+					return trusted;
 				},
 			});
 			expect(loader.getExtensions().errors).toEqual([]);
-			expect(loader.getExtensions().extensions.map(({ path }) => path)).toEqual([
-				join(active, "worker.ts"),
-				ordinary,
-			]);
-			expect(readFileSync(marker, "utf8")).toBe("ordinary\nselected\n");
+			const paths = loader.getExtensions().extensions.map(({ path }) => path);
+			if (directoryEntry && trusted) {
+				expect(paths).toHaveLength(2);
+				expect(paths).toEqual(expect.arrayContaining([barePackage, ordinary]));
+			} else {
+				expect(paths).toEqual(trusted ? [join(active, "worker.ts"), ordinary] : [ordinary]);
+			}
+			expect(readFileSync(marker, "utf8")).toBe(trusted ? "ordinary\nselected\n" : "ordinary\n");
 		},
 	);
 
@@ -2661,6 +2679,43 @@ describe("DefaultPackageManager git update", () => {
 		expect(
 			loader.getExtensions().warnings?.filter(({ warning }) => warning.includes("Invalid Git revision pointer")),
 		).toHaveLength(1);
+	});
+
+	it.each([false, true])("checks the resolved directory extension entry (invalid pointer: %s)", async (invalid) => {
+		setupRemoteAndInstall();
+		const loaded = join(tempDir, "directory-entry-loaded");
+		createCommit(
+			remoteDir,
+			"extension.ts",
+			`import { writeFileSync } from 'node:fs'; export default function() { writeFileSync(${JSON.stringify(loaded)}, 'selected'); }`,
+			"Update",
+		);
+		await packageManager.update();
+		const directory = join(tempDir, "bare-extension");
+		mkdirSync(directory);
+		writeFileSync(join(directory, "package.json"), JSON.stringify({ main: "entry.ts" }));
+		symlinkSync(join(installedDir, "extension.ts"), join(directory, "entry.ts"), "file");
+		if (invalid) {
+			const manager = packageManager as unknown as { getGitUpdateStatePath(path: string, scope: string): string };
+			writeFileSync(`${manager.getGitUpdateStatePath(installedDir, "user")}.current`, "invalid");
+		}
+		settingsManager.setPackages([directory, { source: gitSource, extensions: [] }]);
+		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
+		const expected = invalid ? [] : [directory];
+		await loader.reload({
+			resolveProjectTrust: async ({ extensionsResult }) => {
+				expect(extensionsResult.extensions.map(({ path }) => path)).toEqual(expected);
+				return true;
+			},
+		});
+		const result = loader.getExtensions();
+		expect(result.extensions.map(({ path }) => path)).toEqual(expected);
+		expect(result.errors).toEqual([]);
+		expect(result.warnings?.filter(({ warning }) => warning.includes("Invalid Git revision pointer"))).toHaveLength(
+			invalid ? 1 : 0,
+		);
+		if (invalid) expect(existsSync(loaded)).toBe(false);
+		else expect(readFileSync(loaded, "utf8")).toBe("selected");
 	});
 
 	it("rejects a regular file at the selected checkout path", async () => {

@@ -659,7 +659,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 		);
 
 		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
-		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions);
+		const extensionsResult = await this.loadFinalExtensionSet(
+			extensionPaths,
+			preTrustExtensions,
+			this.getDirectoryEntrySelector(resolvedPaths),
+		);
 		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
 		for (const path of cliExtensionPaths.missingLocalPaths ?? []) {
 			extensionsResult.errors.push({ path, error: `Extension path does not exist: ${path}` });
@@ -821,7 +825,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 			resolvedPaths.installFailures,
 			cliExtensionPaths.installFailures,
 		);
-		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus);
+		const extensionsResult = await loadExtensionsCached(
+			extensionPaths,
+			this.cwd,
+			this.eventBus,
+			undefined,
+			this.getDirectoryEntrySelector(resolvedPaths),
+		);
 		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
 		if (!options.includeInlineFactories) {
 			return extensionsResult;
@@ -844,14 +854,28 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return getResourcePathKey(this.resolveExtensionLoadPath(path));
 	}
 
+	private getDirectoryEntrySelector({ gitRevisions, unavailableCheckouts }: ResolvedPaths) {
+		const projectTrusted = this.settingsManager.isProjectTrusted();
+		if (projectTrusted && !gitRevisions?.size && !unavailableCheckouts?.size) return;
+		return (entry: string) => {
+			if (!projectTrusted && this.isProjectManagedExtensionSource(entry)) return "";
+			return DefaultPackageManager.selectGitResourcePath(entry, gitRevisions, unavailableCheckouts);
+		};
+	}
+
 	/** Load extension paths: files from disk and `builtin:<name>` paths from the built-in extensions. */
-	private async loadExtensionPaths(paths: string[], runtime?: ExtensionRuntime): Promise<LoadExtensionsResult> {
+	private async loadExtensionPaths(
+		paths: string[],
+		runtime?: ExtensionRuntime,
+		selectDirectoryEntry?: (entry: string) => string,
+	): Promise<LoadExtensionsResult> {
 		const isBuiltinPath = (path: string) => path.startsWith(BUILTIN_PATH_PREFIX);
 		const result = await loadExtensionsCached(
 			paths.filter((path) => !isBuiltinPath(path)),
 			this.cwd,
 			this.eventBus,
 			runtime,
+			selectDirectoryEntry,
 		);
 		for (const path of paths.filter(isBuiltinPath)) {
 			const builtin = this.builtinExtensions.get(path.slice(BUILTIN_PATH_PREFIX.length));
@@ -880,6 +904,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private async loadFinalExtensionSet(
 		extensionPaths: string[],
 		preTrustExtensions: LoadExtensionsResult | undefined,
+		selectDirectoryEntry?: (entry: string) => string,
 	): Promise<LoadExtensionsResult> {
 		// Without a pre-trust pass nothing is preloaded, and inline extensions load here.
 		const preloaded = preTrustExtensions?.extensions ?? [];
@@ -895,7 +920,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 			const pathKey = this.getExtensionPathKey(path);
 			return !preloadedByPath.has(pathKey) && !failedPreloadPaths.has(pathKey);
 		});
-		const remainingExtensions = await this.loadExtensionPaths(remainingPaths, preTrustExtensions?.runtime);
+		const remainingExtensions = await this.loadExtensionPaths(
+			remainingPaths,
+			preTrustExtensions?.runtime,
+			selectDirectoryEntry,
+		);
 		const loadedByPath = new Map(preloadedByPath);
 		for (const extension of remainingExtensions.extensions) {
 			loadedByPath.set(getResourcePathKey(extension.resolvedPath), extension);
