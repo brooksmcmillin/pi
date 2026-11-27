@@ -545,7 +545,7 @@ test(
 					return relocate.apply(this, args);
 				},
 			);
-			const moving = locations.move({ origin: "owner", env: null, cwd: own }, BACKGROUND_CONTEXT);
+			const moving = locations.move({ env: null, cwd: own }, BACKGROUND_CONTEXT);
 			const outcome = moving.then(
 				() => "resolved",
 				(error: unknown) => error,

@@ -29,9 +29,14 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      # Type checks and tests reference model IDs that can disappear from live catalogs.
-      - name: Build with pinned model catalog
+      - &build
+        name: Build
+        shell: bash
         run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            npm run build
+            exit
+          fi
           node scripts/update-model-catalog-pin.mjs --hydrate
           npm run build:offline
 
@@ -55,6 +60,15 @@ jobs:
       - name: Check
         run: npm run check
 
+      # Fork tags may lag the imported release; compare with the release this checkout contains.
+      - name: Fetch the matching upstream release tag
+        run: |
+          tag="v$(node -p 'require("./packages/coding-agent/package.json").version')"
+          git fetch --depth=1 https://github.com/earendil-works/pi.git "refs/tags/$tag:refs/tags/$tag"
+
+      - name: Check released changelog sections
+        run: npm run check:released-changelogs
+
   # Tests are split across parallel jobs so the slowest suites do not run back to back.
   test:
     name: test (${{ matrix.name }})
@@ -65,6 +79,7 @@ jobs:
         include:
           - name: coding-agent
           - name: durable
+          - name: chord
           - name: other
     steps:
       - name: Checkout
@@ -78,7 +93,7 @@ jobs:
 
       # fd and ripgrep are used by coding-agent tools tests and tui autocomplete tests.
       - name: Install system dependencies
-        if: matrix.name != 'durable'
+        if: matrix.name != 'durable' && matrix.name != 'chord'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends fd-find ripgrep
@@ -87,10 +102,7 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Build with pinned model catalog
-        run: |
-          node scripts/update-model-catalog-pin.mjs --hydrate
-          npm run build:offline
+      - *build
 
       - name: Build the pi-env daemon
         if: matrix.name == 'other'
@@ -107,7 +119,7 @@ jobs:
           # Every other workspace, so new packages are tested without editing this workflow.
           args=()
           for dir in packages/*/; do
-            case "$dir" in packages/coding-agent/ | packages/durable/) continue ;; esac
+            case "$dir" in packages/coding-agent/ | packages/durable/ | packages/chord/) continue ;; esac
             args+=(--workspace "${dir%/}")
           done
           npm run test:scripts

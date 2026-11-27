@@ -8,7 +8,7 @@ use crate::exec::{
     start_waiter,
 };
 use crate::frame::{EVENT, Frame};
-use crate::output::Output;
+use crate::output::{Gate, Output};
 use crate::sys;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -123,13 +123,14 @@ pub fn run(
         Err(error) => return Err(abandon(child, error)),
     };
     // Like a full pipe: a program that writes faster than the link waits.
+    let gate = Gate::new(output);
     let stdout = child.stdout.take().unwrap();
     if let Err(error) = spawn_reader(
         0,
         stdout,
         sender.clone(),
         stop.clone(),
-        Some(output.clone()),
+        Some(gate.clone()),
         Some(drain.clone()),
     ) {
         return Err(abandon(child, error));
@@ -140,7 +141,7 @@ pub fn run(
         stderr,
         sender.clone(),
         stop.clone(),
-        Some(output.clone()),
+        Some(gate.clone()),
         Some(drain.clone()),
     ) {
         return Err(abandon(child, error));

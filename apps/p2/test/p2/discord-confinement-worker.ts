@@ -9,6 +9,7 @@ import {
 	ROOT_CONVERSATION_ID,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
+import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
 import { awaitWithContext, BACKGROUND_CONTEXT, defineFacet, forbidden, whenLive } from "@p2/app/v1";
 import discordWorker from "../../plugins/discord/worker.ts";
 import { InheritedLocation, Subagents } from "../../plugins/subagents/contract.worker.ts";
@@ -198,6 +199,8 @@ workerMain(
 							new SessionLocation(spawnLocation(init.values.session)),
 							store,
 							(fn, ctx) => host.root(fn, ctx),
+							await createNodePhotonImages(),
+							undefined,
 						),
 					},
 					{ name: "chord.app.files", facet: filesFacet(hostFiles(dir)) },

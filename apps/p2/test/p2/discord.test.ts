@@ -3,7 +3,7 @@
 // `DiscordIngress` with the fake provider (a batch with an attachment downloaded into the session's uploads, its turn's
 // answer, a thread's subagent forked from the main conversation).
 import assert from "node:assert/strict";
-import { writeFile } from "node:fs/promises";
+import { readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -26,7 +26,6 @@ import {
 	type SessionPort,
 	type TurnState,
 } from "../../plugins/discord/relay.ts";
-import { FileSummaries } from "../../plugins/files/contract.ts";
 import { Sessions } from "../../plugins/sessions/contract.ts";
 import { WorkerControl } from "../../plugins/status/contract.ts";
 import { Subagents } from "../../plugins/subagents/contract.ts";
@@ -1082,7 +1081,11 @@ it("reuse:discord-upload-chunk-writer: final-byte overruns are dropped, bounded 
 	const sessions = await holdIn(owner, Sessions, {}, "owner");
 	const session = (await sessions.create({ cwd: fixture.workspace }, BACKGROUND_CONTEXT)).id;
 	const ingress = fixture.server.host.hold(DiscordIngress, { session }, BACKGROUND_CONTEXT);
-	const mirror = await holdIn(owner, FileSummaries, {}, "owner");
+	const uploads = join(fixture.dataDir, "uploads", session);
+	const uploaded = async () =>
+		Promise.all(
+			(await readdir(uploads)).map(async (name) => ({ name, size: (await stat(join(uploads, name))).size })),
+		);
 	const file = (name: string, size: number) => ({
 		url: `${url}/${name}`,
 		name: `${name}.bin`,
@@ -1107,9 +1110,16 @@ it("reuse:discord-upload-chunk-writer: final-byte overruns are dropped, bounded 
 		],
 	};
 	await ended(ingress, (await ingress.deliver(input, BACKGROUND_CONTEXT)).submissionId);
-	const summary = (await mirror.of({ session }, BACKGROUND_CONTEXT)).uploads;
-	assert.equal(summary?.bytes, limit, "the final extra byte must not publish an oversized upload");
-	assert.deepEqual(summary?.newest.map((entry) => entry.key).sort(), ["discord:bounds:empty", "discord:bounds:limit"]);
+	const files = await uploaded();
+	assert.equal(
+		files.reduce((sum, file) => sum + file.size, 0),
+		limit,
+		"the final extra byte must not publish an oversized upload",
+	);
+	assert.deepEqual(files.map((file) => file.name).sort(), [
+		"discord-bounds-empty-empty.bin",
+		"discord-bounds-limit-limit.bin",
+	]);
 	assert.deepEqual(
 		requests,
 		["/over", "/over-chunk", "/limit", "/error", "/broken", "/empty"],
@@ -1122,9 +1132,12 @@ it("reuse:discord-upload-chunk-writer: final-byte overruns are dropped, bounded 
 		(await ingress.deliver({ ...input, requestId: "discord:bounds:retry" }, BACKGROUND_CONTEXT)).submissionId,
 	);
 	assert.deepEqual(requests.slice(6), ["/over", "/over-chunk", "/error", "/broken"]);
-	const retried = (await mirror.of({ session }, BACKGROUND_CONTEXT)).uploads;
-	assert.equal(retried?.files, 6);
-	assert.equal(retried?.bytes, limit + 4);
+	const retried = await uploaded();
+	assert.equal(retried.length, 6);
+	assert.equal(
+		retried.reduce((sum, file) => sum + file.size, 0),
+		limit + 4,
+	);
 });
 
 it("security:discord-unlink-leaves-relay-authorized: unlink cancels a worker download before submission", async (t) => {
@@ -1291,10 +1304,12 @@ describe("discord ingress (fake provider)", () => {
 		assert.deepEqual(data.attachments, [{ id: "discord:500:0", name: "notes.txt" }]);
 		const content = (entry?.model?.[0] as UserMessage).content;
 		assert(Array.isArray(content));
-		assert(content.some((part) => part.type === "text" && part.text.includes("<attachments>")));
-		const mirror = await holdIn(fixture.browser(), FileSummaries, {}, "owner");
-		const spaces = await mirror.of({ session }, BACKGROUND_CONTEXT);
-		assert.equal(spaces.uploads?.newest[0]?.source, "discord");
+		// The file follows the text, marked with its copy's path.
+		assert(
+			content.some(
+				(part) => part.type === "text" && /<file name=\[File #1\] path="[^"]+notes\.txt" \/>/.test(part.text),
+			),
+		);
 	});
 
 	it("a turn's answer lists the files its conversation offered during it, readable through the ingress", async () => {
