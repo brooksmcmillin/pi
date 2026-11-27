@@ -1363,19 +1363,24 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Pin installed checkout paths before resolving local aliases, regardless of declaration order.
 		const checkoutSnapshot = new Map<string, string>();
+		const unavailableCheckouts = new Map<string, string>();
 		for (const entry of allPackages) {
 			if (entry.scope === "project" && !this.settingsManager.isProjectTrusted()) continue;
 			const parsed = this.parseSource(this.getPackageSourceString(entry.pkg));
 			if (parsed.type !== "git") continue;
+			let logical: string | undefined;
 			try {
-				const logical = this.getGitStoragePath(parsed, entry.scope);
+				logical = this.getGitStoragePath(parsed, entry.scope);
 				const pinned = entry.scope === "user" ? bootstrapCheckouts?.get(logical) : undefined;
 				const selected =
 					pinned ?? this.readSelectedGitRevision(logical, this.getGitUpdateStatePath(logical, entry.scope));
 				// A valid pointer still excludes the retained checkout if its selection is missing.
 				if (logical !== selected) accumulator.gitRevisions.set(logical, selected);
 				if (existsSync(selected)) checkoutSnapshot.set(logical, selected);
-			} catch {
+			} catch (error) {
+				if (logical !== undefined && error instanceof GitRevisionPointerError) {
+					unavailableCheckouts.set(logical, this.getGitRevisionMatchTarget(logical, entry.scope));
+				}
 				// Normal package resolution reports failures for packages that are actually loaded.
 			}
 		}
@@ -1387,6 +1392,9 @@ export class DefaultPackageManager implements PackageManager {
 			accumulator,
 			onMissing,
 			checkoutSnapshot,
+			undefined,
+			undefined,
+			unavailableCheckouts,
 		);
 
 		const globalBaseDir = this.agentDir;
@@ -1878,6 +1886,7 @@ export class DefaultPackageManager implements PackageManager {
 		checkoutSnapshot?: Map<string, string>,
 		missingLocalPaths?: string[],
 		temporarySelection?: { checkouts: Map<string, string>; preparing: boolean },
+		unavailableCheckouts = new Map<string, string>(),
 	): Promise<PackageInstallFailure[]> {
 		const installFailures: PackageInstallFailure[] = [];
 		const collections: Array<() => void> = [];
@@ -1897,9 +1906,13 @@ export class DefaultPackageManager implements PackageManager {
 
 			if (parsed.type === "local") {
 				const baseDir = this.getBaseDirForScope(resolvedScope);
-				collect(resolvedScope, () =>
-					this.resolveLocalExtensionSource(parsed, accumulator, filter, metadata, baseDir, missingLocalPaths),
-				);
+				collect(resolvedScope, () => {
+					const original = this.resolvePathFromBase(parsed.path, baseDir);
+					for (const [logical, matchTarget] of unavailableCheckouts) {
+						if (redirectGitRevisionPath(original, logical, matchTarget) !== undefined) return;
+					}
+					this.resolveLocalExtensionSource(original, accumulator, filter, metadata, missingLocalPaths);
+				});
 				continue;
 			}
 
@@ -1961,14 +1974,22 @@ export class DefaultPackageManager implements PackageManager {
 			if (parsed.type === "git") {
 				let installedPath: string;
 				let present: boolean;
+				let logical: string | undefined;
+				const reportFailure = (error: unknown) => {
+					if (logical !== undefined && resolvedScope !== "temporary" && error instanceof GitRevisionPointerError) {
+						unavailableCheckouts.set(logical, this.getGitRevisionMatchTarget(logical, resolvedScope));
+					}
+					installFailures.push({ source: resolvedSource, scope: resolvedScope, message: String(error) });
+				};
 				try {
-					const logical = this.getGitStoragePath(parsed, resolvedScope);
+					logical = this.getGitStoragePath(parsed, resolvedScope);
 					const pinned = (resolvedScope === "temporary" ? temporaryCheckouts : checkoutSnapshot)?.get(logical);
 					if (pinned !== undefined) {
 						metadata.baseDir = pinned;
 						metadata.packageRoot = pinned;
+						const logicalPath = logical;
 						collect(resolvedScope, () =>
-							this.collectPackageResources(pinned, accumulator, filter, metadata, logical),
+							this.collectPackageResources(pinned, accumulator, filter, metadata, logicalPath),
 						);
 						continue;
 					}
@@ -1985,7 +2006,7 @@ export class DefaultPackageManager implements PackageManager {
 					present = recovered !== undefined;
 					installedPath = recovered ?? "";
 				} catch (error) {
-					installFailures.push({ source: resolvedSource, scope: resolvedScope, message: String(error) });
+					reportFailure(error);
 					continue;
 				}
 				if (!present) {
@@ -1997,12 +2018,13 @@ export class DefaultPackageManager implements PackageManager {
 				try {
 					installedPath = this.getGitInstallPath(parsed, resolvedScope);
 				} catch (error) {
-					installFailures.push({ source: resolvedSource, scope: resolvedScope, message: String(error) });
+					reportFailure(error);
 					continue;
 				}
 				metadata.baseDir = installedPath;
 				metadata.packageRoot = installedPath;
-				const logicalPath = this.getGitStoragePath(parsed, resolvedScope);
+				const logicalPath = logical;
+				unavailableCheckouts.delete(logicalPath);
 				if (logicalPath !== installedPath) accumulator.gitRevisions.set(logicalPath, installedPath);
 				else accumulator.gitRevisions.delete(logicalPath);
 				if (resolvedScope === "temporary") temporaryCheckouts.set(logicalPath, installedPath);
@@ -2032,14 +2054,12 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private resolveLocalExtensionSource(
-		source: LocalSource,
+		original: string,
 		accumulator: ResourceAccumulator,
 		filter: PackageFilter | undefined,
 		metadata: PathMetadata,
-		baseDir: string,
 		missingLocalPaths?: string[],
 	): void {
-		const original = this.resolvePathFromBase(source.path, baseDir);
 		const resolved = this.redirectGitResource(original, accumulator.gitRevisions);
 		if (!existsSync(resolved)) {
 			missingLocalPaths?.push(original);
@@ -3108,6 +3128,12 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		const legacyPath = this.getLegacyGlobalNpmInstallPath(source);
 		return legacyPath && existsSync(legacyPath) ? legacyPath : managedPath;
+	}
+
+	private getGitRevisionMatchTarget(logical: string, scope: SourceScope): string {
+		const state = this.getGitUpdateStatePath(logical, scope);
+		// Match the logical path and historical revision family without reading a checkout.
+		return join(dirname(logical), `.pi-revision-${basename(state)}-000000`);
 	}
 
 	private readSelectedGitRevision(logicalDir: string, state: string): string {

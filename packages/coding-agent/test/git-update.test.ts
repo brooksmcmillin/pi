@@ -623,6 +623,17 @@ describe("DefaultPackageManager git update", () => {
 			expect.objectContaining({ path: join(projectCheckout, "extensions", "implicit.ts"), enabled: true }),
 		);
 		expect(extensions.map((entry) => entry.path)).not.toContain(join(active, "extensions", "implicit.ts"));
+
+		const alias = join(installedDir, "extension.ts");
+		expect(existsSync(alias)).toBe(true);
+		settingsManager.setPackages([alias, gitSource]);
+		const manager = packageManager as unknown as { getGitUpdateStatePath(path: string, scope: string): string };
+		writeFileSync(`${manager.getGitUpdateStatePath(installedDir, "user")}.current`, "invalid");
+		const afterCorruption = await packageManager.resolve();
+		expect(afterCorruption.extensions.map(({ path }) => path)).not.toContain(alias);
+		expect(afterCorruption.extensions.map(({ path }) => path)).toContain(
+			join(projectCheckout, "extensions", "implicit.ts"),
+		);
 	});
 
 	it.each([false, true])(
@@ -2584,9 +2595,12 @@ describe("DefaultPackageManager git update", () => {
 		mkdirSync(join(remoteDir, "extensions"));
 		createCommit(remoteDir, "extensions/healthy.ts", "export default function() {}", "Add healthy extension");
 		git(["clone", remoteDir, dirname(dirname(other))], tempDir);
-		settingsManager.setPackages([gitSource, "git:github.com/test/other"]);
+		const retainedAlias = join(installedDir, "extension.ts");
+		expect(existsSync(retainedAlias)).toBe(true);
+		settingsManager.setPackages([retainedAlias, gitSource, "git:github.com/test/other"]);
 
 		const resources = await packageManager.resolve();
+		expect(resources.extensions.some((entry) => entry.path === retainedAlias)).toBe(false);
 		expect(resources.installFailures).toEqual([
 			{
 				source: gitSource,
@@ -2610,6 +2624,36 @@ describe("DefaultPackageManager git update", () => {
 		expect(existsSync(active)).toBe(false);
 		expect(existsSync(installedDir)).toBe(false);
 		expect(existsSync(other)).toBe(true);
+	});
+
+	it("skips a configured alias when the final checkout lookup sees an invalid pointer", async () => {
+		setupRemoteAndInstall();
+		const alias = join(installedDir, "extension.ts");
+		const backup = `${installedDir}-backup`;
+		renameSync(installedDir, backup);
+		settingsManager.setPackages([alias, gitSource]);
+		const manager = packageManager as unknown as {
+			recoverGitCheckout(path: string, scope: string): Promise<string | undefined>;
+			getGitUpdateStatePath(path: string, scope: string): string;
+		};
+		const recover = manager.recoverGitCheckout.bind(manager);
+		vi.spyOn(manager, "recoverGitCheckout").mockImplementationOnce(async (path, scope) => {
+			renameSync(backup, installedDir);
+			const recovered = await recover(path, scope);
+			expect(recovered).toBe(installedDir);
+			const state = manager.getGitUpdateStatePath(path, scope);
+			mkdirSync(dirname(state), { recursive: true });
+			writeFileSync(`${state}.current`, "invalid");
+			return recovered;
+		});
+		const result = await packageManager.resolve();
+		expect(result.extensions.map(({ path }) => path)).not.toContain(alias);
+		expect(result.installFailures).toEqual([
+			expect.objectContaining({
+				source: gitSource,
+				message: expect.stringContaining("Invalid Git revision pointer"),
+			}),
+		]);
 	});
 
 	it("waits for the logical checkout lock before resolving a missing selected revision", async () => {
@@ -2997,7 +3041,9 @@ describe("DefaultPackageManager git update", () => {
 		const resolved = await packageManager.resolve();
 		expect(resolved.extensions.find(({ path }) => path === aliasPath)?.metadata.source).toBe(aliasPath);
 		const worker = join(installedDir, "extensions", "worker.ts");
-		expect(resolved.extensions.map(({ path }) => path)).toContain(worker);
+		expect(
+			resolved.extensions.map(({ path }) => path).filter((path) => path === aliasPath || path === worker),
+		).toEqual([aliasPath, worker]);
 		expect(resolved.gitRevisions?.has(installedDir)).not.toBe(true);
 		const alias = await packageManager.resolveExtensionSources([worker], { gitRevisions: resolved.gitRevisions });
 		expect(alias.extensions.map(({ path }) => path)).toContain(worker);
