@@ -15,10 +15,18 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { CONFIG_DIR_NAME } from "../../../config.ts";
-import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/package-manager.ts";
+import {
+	matchesGitPackageExactRule,
+	matchesPackageAliasExactRule,
+	type PathMetadata,
+	type ResolvedPaths,
+	type ResolvedResource,
+	redirectGitRevisionPath,
+	selectGitDeclarationPath,
+} from "../../../core/package-manager.ts";
 import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
 import { BUILTIN_PATH_PREFIX, getResourcePathKey } from "../../../core/source-info.ts";
-import { isLocalPath, resolvePath, shortenHomePath } from "../../../utils/paths.ts";
+import { isLocalPath, isPathWithin, resolvePath, shortenHomePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
@@ -534,19 +542,24 @@ class ResourceList implements Component, Focusable {
 
 		// Generate pattern for this resource
 		const pattern = this.getResourcePattern(item);
-		const disablePattern = `-${pattern}`;
-		const enablePattern = `+${pattern}`;
-
-		// Filter out existing patterns for this resource
+		const declarations = item.metadata.gitRevision?.declarations ?? [];
+		const baseDir = this.getTopLevelBaseDir(scope);
 		const updated = current.filter((p) => {
-			const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
-			return stripped !== pattern;
+			const stripped = this.getPatternEntryTarget(p);
+			if (item.metadata.gitRevision && stripped === p) return true;
+			return (
+				stripped !== pattern &&
+				!declarations.includes(resolvePath(stripped, baseDir, { trim: true })) &&
+				!this.matchesGitRevisionOverride(item, stripped, scope)
+			);
 		});
 
 		if (enabled) {
-			updated.push(enablePattern);
+			updated.push(`+${pattern}`);
 		} else {
-			updated.push(disablePattern);
+			for (const target of new Set([pattern, ...this.getRowExclusionPatterns(item, scope)])) {
+				updated.push(`-${target}`);
+			}
 		}
 
 		if (scope === "project") {
@@ -597,21 +610,21 @@ class ResourceList implements Component, Focusable {
 		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
 		const current = (pkg[arrayKey] ?? []) as string[];
 
-		// Generate pattern relative to package root
+		// Write exclusions for each declaration so another alias cannot re-enable the row.
 		const pattern = this.getPackageResourcePattern(item);
-		const disablePattern = `-${pattern}`;
+		const patterns = this.getPackageResourcePatterns(item, pattern);
 		const enablePattern = `+${pattern}`;
 
 		// Filter out existing patterns for this resource
 		const updated = current.filter((p) => {
 			const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
-			return stripped !== pattern;
+			return stripped !== pattern && !this.matchesAbsoluteGitPackageOverride(item, p);
 		});
 
 		if (enabled) {
 			updated.push(enablePattern);
 		} else {
-			updated.push(disablePattern);
+			for (const path of patterns) updated.push(`-${path}`);
 		}
 
 		(pkg as Record<string, unknown>)[arrayKey] = updated.length > 0 ? updated : undefined;
@@ -665,19 +678,32 @@ class ResourceList implements Component, Focusable {
 
 	private setProjectTopLevelOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
 		const current = (this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[];
-		const pattern = this.isInheritedGlobalItem(item) ? item.path : this.getResourcePatternForScope(item, "project");
+		const pattern = this.isInheritedGlobalItem(item)
+			? (item.metadata.gitRevision?.aliases?.[0] ?? item.path)
+			: this.getResourcePatternForScope(item, "project");
 		const patterns = this.getTopLevelOverridePatterns(item, "project");
 		const updated = current.filter((entry) => {
 			const target = this.getPatternEntryTarget(entry);
-			if ((entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-")) && patterns.has(target))
+			if (
+				(entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-")) &&
+				(patterns.has(target) || this.matchesGitRevisionOverride(item, target, "project"))
+			)
 				return false;
-			return !(state === "inherit" && this.isInheritedGlobalItem(item) && target === pattern);
+			return !(
+				state === "inherit" &&
+				this.isInheritedGlobalItem(item) &&
+				(target === pattern ||
+					(entry === target && this.matchesGitRevisionOverride(item, target, "project", false)))
+			);
 		});
 		if (state !== "inherit") {
 			// Project entries name inherited files to override them. Built-in paths need no entry.
 			if (this.isInheritedGlobalItem(item) && item.metadata.source !== "builtin" && !updated.includes(pattern))
 				updated.push(pattern);
-			updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+			if (state === "load") updated.push(`+${pattern}`);
+			else
+				for (const path of new Set([pattern, ...this.getRowExclusionPatterns(item, "project")]))
+					updated.push(`-${path}`);
 		}
 		this.setProjectTopLevelPaths(item.resourceType, updated);
 		return true;
@@ -713,9 +739,13 @@ class ResourceList implements Component, Focusable {
 		}
 		const pattern = this.getPackageResourcePattern(item);
 		const updated = ((pkg[item.resourceType] ?? []) as string[]).filter(
-			(entry) => this.getPatternEntryTarget(entry) !== pattern,
+			(entry) =>
+				this.getPatternEntryTarget(entry) !== pattern && !this.matchesAbsoluteGitPackageOverride(item, entry),
 		);
-		if (state !== "inherit") updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+		if (state === "load") updated.push(`+${pattern}`);
+		if (state === "unload") {
+			for (const path of this.getPackageResourcePatterns(item, pattern)) updated.push(`-${path}`);
+		}
 		(pkg as Record<string, unknown>)[item.resourceType] = updated.length > 0 ? updated : undefined;
 		if (!RESOURCE_TYPES.some((key) => (pkg as Record<string, unknown>)[key] !== undefined)) {
 			if (pkg.autoload === false) packages.splice(pkgIndex, 1);
@@ -728,28 +758,70 @@ class ResourceList implements Component, Focusable {
 	private getNextOverrideState(item: ResourceItem): ProjectOverrideState {
 		const state = this.getProjectOverrideState(item);
 		const inheritedEnabled = this.getInheritedEnabled(item);
-		if (state === "inherit") return inheritedEnabled ? "unload" : "load";
+		if (state === "inherit") {
+			const enabled = this.isInheritedGlobalItem(item) ? inheritedEnabled : item.enabled;
+			return enabled ? "unload" : "load";
+		}
 		if (state === "unload") return inheritedEnabled ? "load" : "inherit";
+		if (this.hasProjectDeclarationExclusion(item) && !this.isInheritedGlobalItem(item)) return "unload";
 		return inheritedEnabled ? "inherit" : "unload";
+	}
+
+	private hasProjectDeclarationExclusion(item: ResourceItem): boolean {
+		if (
+			item.metadata.origin !== "top-level" ||
+			item.metadata.scope !== "project" ||
+			(item.metadata.gitRevision?.declarations?.length ?? 0) < 2
+		)
+			return false;
+		const entries = this.settingsManager.getProjectSettings()[item.resourceType] ?? [];
+		// Excluding one declaration need not disable the entire row.
+		return entries.some(
+			(entry) => entry.startsWith("-") && this.matchesGitRevisionOverride(item, entry.slice(1), "project"),
+		);
 	}
 
 	private getProjectOverrideState(item: ResourceItem): ProjectOverrideState {
 		if (this.writeScope !== "project") return "inherit";
 		if (item.metadata.origin === "top-level") {
-			return this.getOverrideStateFromEntries(
-				(this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[],
-				this.getTopLevelOverridePatterns(item, "project"),
-				false,
-			);
+			if (this.hasProjectDeclarationExclusion(item)) return item.enabled ? "load" : "unload";
+			const entries = (this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[];
+			const patterns = this.getTopLevelOverridePatterns(item, "project");
+			for (const entry of entries) {
+				const target = this.getPatternEntryTarget(entry);
+				if (target !== entry && this.matchesGitRevisionOverride(item, target, "project")) patterns.add(target);
+			}
+			return this.getOverrideStateFromEntries(entries, patterns, false);
 		}
 		const pkg = this.findMatchingPackageSource(item, "project");
 		if (typeof pkg !== "object") return "inherit";
 		const entries = pkg[item.resourceType];
 		if (entries === undefined) return "inherit";
-		return this.getOverrideStateFromEntries(
-			entries,
-			new Set([this.getPackageResourcePattern(item)]),
-			pkg.autoload !== false,
+		const patterns = new Set([this.getPackageResourcePattern(item)]);
+		for (const entry of entries) {
+			if (this.matchesAbsoluteGitPackageOverride(item, entry)) patterns.add(this.getPatternEntryTarget(entry));
+		}
+		const state = this.getOverrideStateFromEntries(entries, patterns, pkg.autoload !== false);
+		if (
+			state !== "inherit" &&
+			pkg.autoload === false &&
+			item.metadata.scope === "project" &&
+			item.metadata.packageDelta
+		) {
+			return item.enabled ? "load" : "unload";
+		}
+		return state;
+	}
+
+	private matchesAbsoluteGitPackageOverride(item: ResourceItem, entry: string): boolean {
+		if (!entry.startsWith("+") && !entry.startsWith("-")) return false;
+		const rule = entry.slice(1);
+		const { gitRevision, packageAliases, baseDir } = item.metadata;
+		return (
+			(packageAliases !== undefined &&
+				baseDir !== undefined &&
+				matchesPackageAliasExactRule([item.path, ...packageAliases], rule, baseDir)) ||
+			(gitRevision !== undefined && matchesGitPackageExactRule(item.path, rule, gitRevision))
 		);
 	}
 
@@ -779,6 +851,47 @@ class ResourceList implements Component, Focusable {
 		return this.getItemScope(item) === "user" || this.inheritedEnabledByKey.has(this.getResourceItemKey(item));
 	}
 
+	private matchesGitRevisionOverride(
+		item: ResourceItem,
+		target: string,
+		scope: SettingsScope,
+		matchSkillDirectory = true,
+	): boolean {
+		const revision = item.metadata.gitRevision;
+		if (!revision) return false;
+		const baseDir =
+			scope === this.getItemScope(item)
+				? (item.metadata.baseDir ?? this.getTopLevelBaseDir(scope))
+				: this.getTopLevelBaseDir(scope);
+		const path = resolvePath(target, baseDir, { trim: true });
+		if (matchSkillDirectory && revision.declarations?.length) {
+			const normalized = selectGitDeclarationPath(path, revision);
+			return revision.declarations.some((declaration) => {
+				const selected = selectGitDeclarationPath(declaration, revision);
+				return (
+					selected === normalized ||
+					(item.resourceType === "skills" && basename(selected) === "SKILL.md" && dirname(selected) === normalized)
+				);
+			});
+		}
+		const selected = redirectGitRevisionPath(path, revision.logical, revision.active);
+		return (
+			selected === item.path ||
+			revision.aliases?.includes(path) === true ||
+			(matchSkillDirectory &&
+				item.resourceType === "skills" &&
+				basename(item.path) === "SKILL.md" &&
+				(selected === dirname(item.path) || revision.aliases?.some((alias) => dirname(alias) === path) === true))
+		);
+	}
+
+	private getRowExclusionPatterns(item: ResourceItem, scope: SettingsScope): string[] {
+		const declarations = item.metadata.gitRevision?.declarations ?? [];
+		if (declarations.length < 2) return [];
+		const baseDir = this.getTopLevelBaseDir(scope);
+		return declarations.map((path) => this.formatTopLevelRulePath(item, baseDir, path));
+	}
+
 	private getTopLevelOverridePatterns(item: ResourceItem, scope: SettingsScope): Set<string> {
 		const baseDir = this.getTopLevelBaseDir(scope);
 		const patterns = new Set<string>([
@@ -793,8 +906,7 @@ class ResourceList implements Component, Focusable {
 	private getResourcePatternForScope(item: ResourceItem, scope: SettingsScope): string {
 		const sourceScope = this.getItemScope(item);
 		if (scope !== sourceScope || item.metadata.source === "builtin") return item.path;
-		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(sourceScope);
-		return relative(baseDir, item.path);
+		return this.formatTopLevelRulePath(item, this.getTopLevelBaseDir(sourceScope), this.getTopLevelRulePath(item));
 	}
 
 	private createPackageOverrideSource(item: ResourceItem): PackageSource {
@@ -851,13 +963,42 @@ class ResourceList implements Component, Focusable {
 	private getResourcePattern(item: ResourceItem): string {
 		if (item.metadata.source === "builtin") return item.path;
 		const scope = item.metadata.scope as "user" | "project";
-		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(scope);
-		return relative(baseDir, item.path);
+		return this.formatTopLevelRulePath(item, this.getTopLevelBaseDir(scope), this.getTopLevelRulePath(item));
+	}
+
+	private formatTopLevelRulePath(item: ResourceItem, settingsBase: string, path: string): string {
+		const discoveryBase = item.metadata.baseDir ?? settingsBase;
+		if (item.metadata.gitRevision && discoveryBase !== settingsBase) return path;
+		return relative(discoveryBase, path);
+	}
+
+	private getTopLevelRulePath(item: ResourceItem): string {
+		const revision = item.metadata.gitRevision;
+		const declaration = revision?.aliases?.[0];
+		if (
+			revision &&
+			declaration &&
+			((revision.declarations?.length ?? 0) > 1 || selectGitDeclarationPath(declaration, revision) !== item.path)
+		) {
+			return declaration;
+		}
+		return item.path;
+	}
+
+	private getPackageResourcePatterns(item: ResourceItem, preferred: string): Set<string> {
+		const { baseDir, packageAliases } = item.metadata;
+		const patterns = new Set([preferred]);
+		if (baseDir) for (const alias of packageAliases ?? []) patterns.add(relative(baseDir, alias));
+		return patterns;
 	}
 
 	private getPackageResourcePattern(item: ResourceItem): string {
 		const baseDir = item.metadata.baseDir ?? dirname(item.path);
-		return relative(baseDir, item.path);
+		const path =
+			item.metadata.packageAliases?.find((alias) => isPathWithin(baseDir, alias)) ??
+			item.metadata.packageAliases?.[0] ??
+			item.path;
+		return relative(baseDir, path);
 	}
 }
 

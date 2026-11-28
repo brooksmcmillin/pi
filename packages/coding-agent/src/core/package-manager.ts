@@ -4,14 +4,19 @@ import {
 	chmodSync,
 	existsSync,
 	globSync,
+	lstatSync,
 	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	readlinkSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { cp, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 
 function getEnv(): NodeJS.ProcessEnv {
@@ -36,7 +41,8 @@ function getEnv(): NodeJS.ProcessEnv {
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import ignore from "ignore";
-import { minimatch } from "minimatch";
+import { braceExpand, minimatch } from "minimatch";
+import lockfile from "proper-lockfile";
 import { gt, maxSatisfying, rcompare, satisfies, valid, validRange } from "semver";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import { spawnProcess, spawnProcessSync, waitForChildProcess } from "../utils/child-process.ts";
@@ -96,12 +102,15 @@ function getNpmVersionRange(version: string | undefined): string | undefined {
 }
 
 export interface PathMetadata {
+	packageDelta?: boolean;
+	packageAliases?: readonly string[];
 	source: string;
 	scope: SourceScope;
 	origin: "package" | "top-level";
 	baseDir?: string;
 	changelogPath?: string;
 	packageRoot?: string;
+	gitRevision?: { logical: string; active: string; aliases?: readonly string[]; declarations?: readonly string[] };
 }
 
 export interface ResolvedResource {
@@ -110,7 +119,21 @@ export interface ResolvedResource {
 	metadata: PathMetadata;
 }
 
+type UnavailableGitCheckouts = ReadonlyMap<string, { matchTarget: string; failure: PackageInstallFailure }>;
+
+export interface TemporaryGitSelection {
+	checkouts: ReadonlyMap<string, string>;
+	gitRevisions: ReadonlyMap<string, string>;
+	unavailableCheckouts?: UnavailableGitCheckouts;
+	installFailures: PackageInstallFailure[];
+}
+
 export interface ResolvedPaths {
+	/** Checkout selection shared with explicit extension sources in the same load. */
+	gitRevisions?: ReadonlyMap<string, string>;
+	unavailableCheckouts?: UnavailableGitCheckouts;
+	configuredGitCheckouts?: ReadonlyMap<string, string>;
+	missingLocalPaths?: string[];
 	extensions: ResolvedResource[];
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
@@ -167,7 +190,7 @@ export interface PackageManager {
 	listConfiguredPackages(): ConfiguredPackage[];
 	resolveExtensionSources(
 		sources: string[],
-		options?: { local?: boolean; temporary?: boolean },
+		options?: { local?: boolean; temporary?: boolean; gitRevisions?: ReadonlyMap<string, string> },
 	): Promise<ResolvedPaths>;
 	addSourceToSettings(source: string, options?: { local?: boolean }): boolean;
 	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean;
@@ -241,6 +264,9 @@ interface UpdatedPackage extends ConfiguredUpdateSource {
 }
 
 interface ResourceAccumulator {
+	gitRevisions: Map<string, string>;
+	unavailableCheckouts: Map<string, { matchTarget: string; failure: PackageInstallFailure }>;
+	blockedCheckoutFailures: Set<PackageInstallFailure>;
 	extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
@@ -328,8 +354,8 @@ function prefixIgnorePattern(line: string, prefix: string): string | null {
 	return negated ? `!${prefixed}` : prefixed;
 }
 
-function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
-	const relativeDir = relative(rootDir, dir);
+function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string, logicalDir = dir): void {
+	const relativeDir = relative(rootDir, logicalDir);
 	const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
 
 	for (const filename of IGNORE_FILE_NAMES) {
@@ -356,6 +382,8 @@ function isOverridePattern(s: string): boolean {
 	return s.startsWith("!") || s.startsWith("+") || s.startsWith("-");
 }
 
+const unchangedPath = (path: string) => path;
+
 function hasGlobPattern(s: string): boolean {
 	return s.includes("*") || s.includes("?");
 }
@@ -364,12 +392,14 @@ function hasGlobPattern(s: string): boolean {
 function expandPackageGlob(pattern: string, root: string): string[] {
 	return globSync(pattern, { cwd: root })
 		.map((match) => resolve(root, match))
-		.filter((path) =>
-			relative(root, path)
-				.split(sep)
-				.every((segment) => segment === ".." || !segment.startsWith(".")),
-		)
+		.filter((path) => isVisibleGlobPath(root, path))
 		.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function isVisibleGlobPath(root: string, path: string): boolean {
+	return relative(root, path)
+		.split(sep)
+		.every((segment) => segment === ".." || !segment.startsWith("."));
 }
 
 function splitPatterns(entries: string[]): { plain: string[]; patterns: string[] } {
@@ -385,21 +415,33 @@ function splitPatterns(entries: string[]): { plain: string[]; patterns: string[]
 	return { plain, patterns };
 }
 
+interface DiscoverySelection {
+	selectPath: (path: string) => string;
+	rememberAlias: (file: string, alias: string) => void;
+	recordDirect?: boolean;
+}
+
 function collectFiles(
 	dir: string,
 	filePattern: RegExp,
 	skipNodeModules = true,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	selection?: DiscoverySelection,
+	logicalDir = dir,
+	ancestors: ReadonlySet<string> = new Set(),
 ): string[] {
 	const files: string[] = [];
 	if (!existsSync(dir)) return files;
 
-	const root = rootDir ?? dir;
+	const root = rootDir ?? logicalDir;
 	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	addIgnoreRules(ig, dir, root, logicalDir);
 
 	try {
+		const identity = realpathSync(dir);
+		if (ancestors.has(identity)) return files;
+		const branch = new Set([...ancestors, identity]);
 		const entries = readdirSync(dir, { withFileTypes: true });
 		for (const entry of entries) {
 			if (entry.name.startsWith(".")) continue;
@@ -411,7 +453,7 @@ function collectFiles(
 
 			if (entry.isSymbolicLink()) {
 				try {
-					const stats = statSync(fullPath);
+					const stats = statSync(selection?.selectPath(fullPath) ?? fullPath);
 					isDir = stats.isDirectory();
 					isFile = stats.isFile();
 				} catch {
@@ -419,14 +461,17 @@ function collectFiles(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const logical = join(logicalDir, entry.name);
+			const relPath = toPosixPath(relative(root, logical));
 			const ignorePath = isDir ? `${relPath}/` : relPath;
 			if (ig.ignores(ignorePath)) continue;
 
 			if (isDir) {
-				files.push(...collectFiles(fullPath, filePattern, skipNodeModules, ig, root));
+				const selected = selection?.selectPath(fullPath) ?? fullPath;
+				files.push(...collectFiles(selected, filePattern, skipNodeModules, ig, root, selection, logical, branch));
 			} else if (isFile && filePattern.test(entry.name)) {
 				files.push(fullPath);
+				if (selection?.recordDirect || logical !== fullPath) selection?.rememberAlias(fullPath, logical);
 			}
 		}
 	} catch {
@@ -443,15 +488,25 @@ function collectSkillEntries(
 	mode: SkillDiscoveryMode,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	selection?: DiscoverySelection,
+	logicalDir = dir,
+	ancestors: ReadonlySet<string> = new Set(),
 ): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
-	const root = rootDir ?? dir;
+	const root = rootDir ?? logicalDir;
 	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	addIgnoreRules(ig, dir, root, logicalDir);
+	const addEntry = (file: string, logical: string) => {
+		entries.push(file);
+		if (selection?.recordDirect || file !== logical) selection?.rememberAlias(file, logical);
+	};
 
 	try {
+		const identity = realpathSync(dir);
+		if (ancestors.has(identity)) return entries;
+		const branch = new Set([...ancestors, identity]);
 		const dirEntries = readdirSync(dir, { withFileTypes: true });
 
 		for (const entry of dirEntries) {
@@ -463,15 +518,16 @@ function collectSkillEntries(
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
 				try {
-					isFile = statSync(fullPath).isFile();
+					isFile = statSync(selection?.selectPath(fullPath) ?? fullPath).isFile();
 				} catch {
 					continue;
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const logical = join(logicalDir, entry.name);
+			const relPath = toPosixPath(relative(root, logical));
 			if (isFile && !ig.ignores(relPath)) {
-				entries.push(fullPath);
+				addEntry(fullPath, logical);
 				return entries;
 			}
 		}
@@ -486,7 +542,7 @@ function collectSkillEntries(
 
 			if (entry.isSymbolicLink()) {
 				try {
-					const stats = statSync(fullPath);
+					const stats = statSync(selection?.selectPath(fullPath) ?? fullPath);
 					isDir = stats.isDirectory();
 					isFile = stats.isFile();
 				} catch {
@@ -494,31 +550,29 @@ function collectSkillEntries(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const logical = join(logicalDir, entry.name);
+			const relPath = toPosixPath(relative(root, logical));
 			const shouldIncludeMarkdownFile =
 				isFile &&
 				entry.name.endsWith(".md") &&
 				!ig.ignores(relPath) &&
-				((mode === "pi" && dir === root) || (mode === "agents" && dir !== root));
+				((mode === "pi" && logicalDir === root) || (mode === "agents" && logicalDir !== root));
 			if (shouldIncludeMarkdownFile) {
-				entries.push(fullPath);
+				addEntry(fullPath, logical);
 				continue;
 			}
 
 			if (!isDir) continue;
 			if (ig.ignores(`${relPath}/`)) continue;
 
-			entries.push(...collectSkillEntries(fullPath, mode, ig, root));
+			const selected = selection?.selectPath(fullPath) ?? fullPath;
+			entries.push(...collectSkillEntries(selected, mode, ig, root, selection, logical, branch));
 		}
 	} catch {
 		// Ignore errors
 	}
 
 	return entries;
-}
-
-function collectAutoSkillEntries(dir: string, mode: SkillDiscoveryMode): string[] {
-	return collectSkillEntries(dir, mode);
 }
 
 function findGitRepoRoot(startDir: string): string | null {
@@ -556,7 +610,7 @@ function collectAncestorAgentsSkillDirs(startDir: string): string[] {
 	return skillDirs;
 }
 
-function collectAutoPromptEntries(dir: string): string[] {
+function collectAutoPromptEntries(dir: string, selectPath: (path: string) => string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
@@ -573,7 +627,7 @@ function collectAutoPromptEntries(dir: string): string[] {
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
 				try {
-					isFile = statSync(fullPath).isFile();
+					isFile = statSync(selectPath(fullPath)).isFile();
 				} catch {
 					continue;
 				}
@@ -593,7 +647,7 @@ function collectAutoPromptEntries(dir: string): string[] {
 	return entries;
 }
 
-function collectAutoThemeEntries(dir: string): string[] {
+function collectAutoThemeEntries(dir: string, selectPath: (path: string) => string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
@@ -610,7 +664,7 @@ function collectAutoThemeEntries(dir: string): string[] {
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
 				try {
-					isFile = statSync(fullPath).isFile();
+					isFile = statSync(selectPath(fullPath)).isFile();
 				} catch {
 					continue;
 				}
@@ -630,15 +684,15 @@ function collectAutoThemeEntries(dir: string): string[] {
 	return entries;
 }
 
-function resolveExtensionEntries(dir: string): string[] | null {
-	const packageJsonPath = join(dir, "package.json");
+function resolveExtensionEntries(dir: string, selectPath: (path: string) => string): string[] | null {
+	const packageJsonPath = selectPath(join(dir, "package.json"));
 	if (existsSync(packageJsonPath)) {
 		const manifest = readPiManifest(packageJsonPath);
 		if (manifest?.extensions?.length) {
 			const entries: string[] = [];
 			for (const extPath of manifest.extensions) {
 				const resolvedExtPath = resolve(dir, extPath);
-				if (existsSync(resolvedExtPath)) {
+				if (existsSync(selectPath(resolvedExtPath))) {
 					entries.push(resolvedExtPath);
 				}
 			}
@@ -648,27 +702,42 @@ function resolveExtensionEntries(dir: string): string[] | null {
 		}
 	}
 
-	const indexTs = join(dir, "index.ts");
-	const indexJs = join(dir, "index.js");
-	if (existsSync(indexTs)) {
-		return [indexTs];
-	}
-	if (existsSync(indexJs)) {
-		return [indexJs];
+	for (const name of ["index.ts", "index.js"]) {
+		const index = join(dir, name);
+		try {
+			if (statSync(selectPath(index), { throwIfNoEntry: false })?.isFile()) return [index];
+		} catch {
+			// An unusable conventional entry should not hide sibling extensions.
+		}
 	}
 
 	return null;
 }
 
-function collectAutoExtensionEntries(dir: string): string[] {
+function collectAutoExtensionEntries(
+	originalDir: string,
+	selectPath = (path: string) => path,
+	rememberAlias?: (file: string, alias: string) => void,
+	recordDirect = false,
+): string[] {
+	const dir = selectPath(originalDir);
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
 	// First check if this directory itself has explicit extension entries (package.json or index)
-	const rootEntries = resolveExtensionEntries(dir);
-	if (rootEntries) {
-		return rootEntries;
-	}
+	const discover = (original: string, selected: string) => {
+		if (!selected) return null;
+		const files = resolveExtensionEntries(selected, selectPath);
+		if ((recordDirect || original !== selected) && rememberAlias) {
+			for (const file of files ?? []) {
+				if (recordDirect || isPathInside(selected, file))
+					rememberAlias(file, join(original, relative(selected, file)));
+			}
+		}
+		return files;
+	};
+	const rootEntries = discover(originalDir, dir);
+	if (rootEntries) return rootEntries;
 
 	// Otherwise, discover extensions from directory contents
 	const ig = ignore();
@@ -686,7 +755,7 @@ function collectAutoExtensionEntries(dir: string): string[] {
 
 			if (entry.isSymbolicLink()) {
 				try {
-					const stats = statSync(fullPath);
+					const stats = statSync(selectPath(fullPath));
 					isDir = stats.isDirectory();
 					isFile = stats.isFile();
 				} catch {
@@ -700,8 +769,9 @@ function collectAutoExtensionEntries(dir: string): string[] {
 
 			if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
 				entries.push(fullPath);
+				if (recordDirect || originalDir !== dir) rememberAlias?.(fullPath, join(originalDir, entry.name));
 			} else if (isDir) {
-				const resolvedEntries = resolveExtensionEntries(fullPath);
+				const resolvedEntries = discover(join(originalDir, entry.name), selectPath(fullPath));
 				if (resolvedEntries) {
 					entries.push(...resolvedEntries);
 				}
@@ -741,11 +811,15 @@ function isPathInside(parent: string, child: string): boolean {
 	);
 }
 
-function resolvePackageChangelogPath(packageRoot: string, manifest: PiManifest | null): string | undefined {
+function resolvePackageChangelogPath(
+	packageRoot: string,
+	manifest: PiManifest | null,
+	selectPath: (path: string) => string,
+): string | undefined {
 	const changelogPath = manifest?.changelogPath ?? "CHANGELOG.md";
 	if (!changelogPath) return undefined;
 
-	const resolvedPath = resolve(packageRoot, changelogPath);
+	const resolvedPath = selectPath(resolve(packageRoot, changelogPath));
 	if (!existsSync(resolvedPath)) return undefined;
 
 	const canonicalPackageRoot = canonicalizePath(packageRoot);
@@ -816,20 +890,35 @@ function getOverridePatterns(entries: string[]): string[] {
 	return entries.filter((pattern) => pattern.startsWith("!") || pattern.startsWith("+") || pattern.startsWith("-"));
 }
 
-function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: string): boolean {
+function isEnabledByOverrides(
+	filePath: string,
+	patterns: string[],
+	baseDir: string,
+	aliases: Iterable<string> = [],
+	historicalGlobPath?: string,
+): boolean {
+	const matches = (rules: string[], matcher: typeof matchesAnyPattern) => {
+		if (matcher(filePath, rules, baseDir)) return true;
+		for (const alias of aliases) if (matcher(alias, rules, baseDir)) return true;
+		return false;
+	};
 	const overrides = getOverridePatterns(patterns);
 	const excludes = overrides.filter((pattern) => pattern.startsWith("!")).map((pattern) => pattern.slice(1));
 	const forceIncludes = overrides.filter((pattern) => pattern.startsWith("+")).map((pattern) => pattern.slice(1));
 	const forceExcludes = overrides.filter((pattern) => pattern.startsWith("-")).map((pattern) => pattern.slice(1));
 
 	let enabled = true;
-	if (excludes.length > 0 && matchesAnyPattern(filePath, excludes, baseDir)) {
+	if (
+		excludes.length > 0 &&
+		(matches(excludes, matchesAnyPattern) ||
+			(historicalGlobPath && matchesAnyPattern(historicalGlobPath, excludes, baseDir)))
+	) {
 		enabled = false;
 	}
-	if (forceIncludes.length > 0 && matchesAnyExactPattern(filePath, forceIncludes, baseDir)) {
+	if (forceIncludes.length > 0 && matches(forceIncludes, matchesAnyExactPattern)) {
 		enabled = true;
 	}
-	if (forceExcludes.length > 0 && matchesAnyExactPattern(filePath, forceExcludes, baseDir)) {
+	if (forceExcludes.length > 0 && matches(forceExcludes, matchesAnyExactPattern)) {
 		enabled = false;
 	}
 	return enabled;
@@ -843,7 +932,22 @@ function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: str
  * - `+path`: force-include exact path (overrides exclusions)
  * - `-path`: force-exclude exact path (overrides force-includes)
  */
-function applyPatterns(allPaths: string[], patterns: string[], baseDir: string): Set<string> {
+function applyPatterns(
+	allPaths: string[],
+	patterns: string[],
+	baseDir: string,
+	logicalRoot = baseDir,
+	aliases?: ReadonlyMap<string, Set<string>>,
+	matchRule?: (rule: string, matcher: typeof matchesAnyPattern) => boolean,
+): Set<string> {
+	const matches = (file: string, rules: string[], matcher: typeof matchesAnyPattern) => {
+		if (matchRule) return rules.some((rule) => matchRule(rule, matcher));
+		if (matchesPackagePath(file, rules, baseDir, logicalRoot, matcher)) return true;
+		for (const alias of aliases?.get(file) ?? []) {
+			if (matcher(alias, rules, baseDir)) return true;
+		}
+		return false;
+	};
 	const includes: string[] = [];
 	const excludes: string[] = [];
 	const forceIncludes: string[] = [];
@@ -866,18 +970,18 @@ function applyPatterns(allPaths: string[], patterns: string[], baseDir: string):
 	if (includes.length === 0) {
 		result = [...allPaths];
 	} else {
-		result = allPaths.filter((filePath) => matchesAnyPattern(filePath, includes, baseDir));
+		result = allPaths.filter((filePath) => matches(filePath, includes, matchesAnyPattern));
 	}
 
 	// Step 2: Apply excludes
 	if (excludes.length > 0) {
-		result = result.filter((filePath) => !matchesAnyPattern(filePath, excludes, baseDir));
+		result = result.filter((filePath) => !matches(filePath, excludes, matchesAnyPattern));
 	}
 
 	// Step 3: Force-include (add back from allPaths, overriding exclusions)
 	if (forceIncludes.length > 0) {
 		for (const filePath of allPaths) {
-			if (!result.includes(filePath) && matchesAnyExactPattern(filePath, forceIncludes, baseDir)) {
+			if (!result.includes(filePath) && matches(filePath, forceIncludes, matchesAnyExactPattern)) {
 				result.push(filePath);
 			}
 		}
@@ -885,30 +989,245 @@ function applyPatterns(allPaths: string[], patterns: string[], baseDir: string):
 
 	// Step 4: Force-exclude (remove even if included or force-included)
 	if (forceExcludes.length > 0) {
-		result = result.filter((filePath) => !matchesAnyExactPattern(filePath, forceExcludes, baseDir));
+		result = result.filter((filePath) => !matches(filePath, forceExcludes, matchesAnyExactPattern));
 	}
 
 	return new Set(result);
 }
 
-function applyAutoloadDisabledPatterns(allPaths: string[], patterns: string[], baseDir: string): Map<string, boolean> {
-	const result = new Map<string, boolean>();
-	for (const pattern of patterns) {
+export function redirectGitRevisionPath(
+	path: string,
+	logical: string,
+	active: string,
+	directOnly = false,
+	onBoundary?: (hop: number) => void,
+): string | undefined {
+	function select(candidate: string, root: string): string | undefined {
+		// Windows path.relative folds case even on case-sensitive directories. Only
+		// canonical filesystem spellings should make different path spellings match.
+		if (candidate === root) return active;
+		if (candidate.startsWith(`${root}${sep}`)) return join(active, candidate.slice(root.length + 1));
+		const parent = dirname(root);
+		const boundary = parent.endsWith(sep) ? parent : `${parent}${sep}`;
+		if (!candidate.startsWith(boundary)) return undefined;
+		const [name, ...parts] = candidate.slice(boundary.length).split(sep);
+		const prefix = basename(active).slice(0, -6);
+		if (name?.startsWith(prefix) && /^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) return join(active, ...parts);
+		return undefined;
+	}
+
+	if (directOnly) return select(path, logical);
+
+	function readLinkTarget(component: string): string | undefined {
+		try {
+			const link = readlinkSync(component);
+			let parent = realpathSync(dirname(component));
+			let suffix = link;
+			if (process.platform !== "win32" && link.split("/").includes("..")) {
+				// Interpret parent segments after resolving directory links.
+				const parts = link.split("/");
+				const lastParent = parts.lastIndexOf("..");
+				const prefix = parts.slice(0, lastParent + 1).join("/");
+				parent = realpathSync.native(isAbsolute(link) ? prefix : `${parent}/${prefix}`);
+				suffix = parts.slice(lastParent + 1).join("/");
+			}
+			return resolve(parent, suffix);
+		} catch {
+			return undefined;
+		}
+	}
+
+	const root = canonicalizePath(logical);
+	const seen = new Set<string>();
+	let candidate = path;
+	// Check the checkout at each hop before following links inside its retained revision.
+	const maxHops = 40;
+	for (let hop = 0; hop <= maxHops && !seen.has(candidate); hop++) {
+		seen.add(candidate);
+		const selected = select(candidate, logical) ?? select(candidate, root);
+		if (selected !== undefined && (selected !== candidate || logical === active)) {
+			onBoundary?.(hop);
+			return selected;
+		}
+		if (hop === maxHops) break;
+		const prefixes: string[] = [];
+		for (let prefix = candidate; dirname(prefix) !== prefix; prefix = dirname(prefix)) prefixes.push(prefix);
+		let next: string | undefined;
+		for (const prefix of prefixes.reverse()) {
+			const target = readLinkTarget(prefix);
+			if (target !== undefined) {
+				next = join(target, candidate.slice(prefix.length));
+				break;
+			}
+		}
+		if (next === undefined) {
+			const canonical = select(canonicalizePath(candidate), root);
+			if (canonical !== undefined && canonical !== candidate) onBoundary?.(hop);
+			return canonical === candidate ? undefined : canonical;
+		}
+		candidate = next;
+	}
+	return undefined;
+}
+
+export function selectGitDeclarationPath(
+	path: string,
+	{ logical, active }: NonNullable<PathMetadata["gitRevision"]>,
+): string {
+	const direct = redirectGitRevisionPath(path, logical, active, true);
+	if (direct !== undefined) return direct;
+	// Resolve checkout-root aliases without following links to individual resources.
+	const canonicalRoot = canonicalizePath(logical);
+	let selected = path;
+	for (let parent = dirname(path); ; parent = dirname(parent)) {
+		const canonical = canonicalizePath(parent);
+		const root = redirectGitRevisionPath(canonical, canonicalRoot, active, true);
+		if (root === active) selected = join(active, relative(parent, path));
+		else if (isPathInside(canonical, canonicalRoot)) {
+			selected =
+				redirectGitRevisionPath(join(canonical, relative(parent, path)), canonicalRoot, active, true) ?? selected;
+		}
+		if (dirname(parent) === parent) return selected;
+	}
+}
+
+export function matchesPackageAliasExactRule(aliases: readonly string[], rule: string, baseDir: string): boolean {
+	return aliases.some((alias) => matchesAnyExactPattern(alias, [rule], baseDir));
+}
+
+export function matchesGitPackageExactRule(
+	file: string,
+	rule: string,
+	revision: { active: string; logical: string },
+): boolean {
+	return (
+		isAbsolute(normalizePath(rule)) &&
+		matchesPackagePath(file, [rule], revision.active, revision.logical, matchesAnyExactPattern)
+	);
+}
+
+function matchesPackagePath(
+	file: string,
+	rules: string[],
+	baseDir: string,
+	logicalRoot: string,
+	matcher: typeof matchesAnyPattern,
+): boolean {
+	if (matcher(file, rules, baseDir)) return true;
+	if (logicalRoot === baseDir || !isPathInside(baseDir, file)) return false;
+	const suffix = relative(baseDir, file);
+	if (matcher(join(logicalRoot, suffix), rules, logicalRoot)) return true;
+
+	// A saved absolute filter can name an earlier revision of this same package.
+	const revisionPath = /^(.+)\/(\.pi-revision-[a-f0-9]{64}-[a-zA-Z0-9]{6})(?:\/|$)/;
+	const [, activeParent, activeRevision] = revisionPath.exec(toPosixPath(baseDir)) ?? [];
+	if (!activeParent || !activeRevision) return false;
+	const revisionPrefix = activeRevision.slice(0, -6);
+	const packageSuffix = relative(join(activeParent, activeRevision), baseDir);
+	return rules.some((rule) => {
+		const normalized = toPosixPath(normalizePath(rule));
+		if (!isAbsolute(normalized)) return false;
+		const [, savedParent, revision] = revisionPath.exec(normalized) ?? [];
+		if (!savedParent || !revision?.startsWith(revisionPrefix)) return false;
+		if (savedParent !== activeParent) {
+			try {
+				const saved = statSync(savedParent);
+				const current = statSync(activeParent);
+				if (saved.dev !== current.dev || saved.ino !== current.ino) return false;
+			} catch {
+				return false;
+			}
+		}
+		const historicalRoot = join(savedParent, revision, packageSuffix);
+		return matcher(join(historicalRoot, suffix), [rule], historicalRoot);
+	});
+}
+
+function matchesPackageDeclaration(
+	file: string,
+	declaration: string | undefined,
+	spellings: ReadonlySet<string> | undefined,
+	patterns: string[],
+	root: string,
+	logicalRoot = root,
+): boolean {
+	return applyPatterns([file], patterns, root, logicalRoot, undefined, (rule, matcher) => {
+		const matches = (path: string) => matchesPackagePath(path, [rule], root, logicalRoot, matcher);
+		if (declaration !== undefined && [...(spellings ?? [])].some(matches)) return matches(declaration);
+		return matches(file);
+	}).has(file);
+}
+
+// Keep the first declaration of an already-resolving canonical path, even if disabled.
+// Distinct or newly available paths can still fall back to a surviving spelling.
+function distinctExistingAliases<T extends string | undefined>(aliases: T[]): T[] {
+	const seen = new Set<string>();
+	return aliases.filter((alias) => {
+		if (alias === undefined || !existsSync(alias)) return true;
+		const key = getResourcePathKey(alias);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+function chooseResourceAlias(spellings: Set<string> | undefined, matches: (alias?: Set<string>) => boolean) {
+	if (!spellings?.size) return { enabled: matches() };
+	for (const spelling of spellings) {
+		const aliases = new Set([spelling]);
+		if (matches(aliases)) return { aliases, enabled: true };
+	}
+	return { aliases: new Set([spellings.values().next().value!]), enabled: false };
+}
+
+function applyAutoloadDisabledPatterns(
+	allPaths: string[],
+	patterns: string[],
+	baseDir: string,
+	logicalRoot = baseDir,
+	aliases?: ReadonlyMap<string, Set<string>>,
+	filesBySpelling?: ReadonlyMap<string, string>,
+): Map<string, { enabled: boolean; alias?: string }> {
+	const states = new Map<string, Map<string | undefined, { enabled: boolean; firstRule: number }>>();
+	for (const [ruleIndex, pattern] of patterns.entries()) {
 		const target = pattern.slice(
 			pattern.startsWith("+") || pattern.startsWith("-") || pattern.startsWith("!") ? 1 : 0,
 		);
 		const enabled = !pattern.startsWith("-") && !pattern.startsWith("!");
 		const exact = pattern.startsWith("+") || pattern.startsWith("-");
+		const matcher = exact ? matchesAnyExactPattern : matchesAnyPattern;
 		for (const filePath of allPaths) {
-			if (
-				exact ? matchesAnyExactPattern(filePath, [target], baseDir) : matchesAnyPattern(filePath, [target], baseDir)
-			) {
-				result.set(filePath, enabled);
+			const spellings = [...(aliases?.get(filePath) ?? [])];
+			let matched: (string | undefined)[] = spellings.filter((path) =>
+				matchesPackagePath(path, [target], baseDir, logicalRoot, matcher),
+			);
+			if (!matched.length && matchesPackagePath(filePath, [target], baseDir, logicalRoot, matcher)) {
+				matched = spellings.length ? spellings : [undefined];
 			}
+			if (!matched.length) continue;
+			const declarations = states.get(filePath) ?? new Map();
+			for (const alias of matched)
+				declarations.set(alias, { enabled, firstRule: declarations.get(alias)?.firstRule ?? ruleIndex });
+			states.set(filePath, declarations);
 		}
 	}
-	return result;
+	const order = new Map([...(filesBySpelling?.keys() ?? [])].map((spelling, index) => [spelling, index]));
+	const rows = [...states].map(([filePath, declarations]) => {
+		const candidates = [...declarations].map(([alias, state]) => ({
+			filePath,
+			alias,
+			...state,
+			rank: order.get(alias ?? filePath) ?? Number.MAX_SAFE_INTEGER,
+		}));
+		candidates.sort((a, b) => a.firstRule - b.firstRule || a.rank - b.rank);
+		const surviving = new Set(distinctExistingAliases(candidates.map(({ alias }) => alias)));
+		return candidates.find(({ alias, enabled }) => surviving.has(alias) && enabled) ?? candidates[0]!;
+	});
+	rows.sort((a, b) => a.firstRule - b.firstRule || a.rank - b.rank);
+	return new Map(rows.map(({ filePath, alias, enabled }) => [filePath, { alias, enabled }]));
 }
+
+class GitRevisionPointerError extends Error {}
 
 export class DefaultPackageManager implements PackageManager {
 	private cwd: string;
@@ -988,8 +1307,13 @@ export class DefaultPackageManager implements PackageManager {
 			return existsSync(path) ? path : undefined;
 		}
 		if (parsed.type === "git") {
-			const path = this.getGitInstallPath(parsed, scope);
-			return existsSync(path) ? path : undefined;
+			try {
+				const path = this.getGitInstallPath(parsed, scope);
+				return existsSync(path) ? path : undefined;
+			} catch (error) {
+				if (error instanceof GitRevisionPointerError) return undefined;
+				throw error;
+			}
 		}
 		if (parsed.type === "local") {
 			const baseDir = this.getBaseDirForScope(scope);
@@ -1020,13 +1344,19 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	async resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
+	async resolve(
+		onMissing?: (source: string) => Promise<MissingSourceAction>,
+		temporaryGit?: TemporaryGitSelection,
+		bootstrapCheckouts?: ReadonlyMap<string, string>,
+	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
+		accumulator.gitRevisions = new Map(temporaryGit?.gitRevisions);
+		accumulator.unavailableCheckouts = new Map(temporaryGit?.unavailableCheckouts);
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 
 		// Collect all packages with scope (project first so cwd resources win collisions)
-		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
+		const allPackages: Array<{ pkg: PackageSource; scope: "user" | "project" }> = [];
 		for (const pkg of projectSettings.packages ?? []) {
 			allPackages.push({ pkg, scope: "project" });
 		}
@@ -1034,9 +1364,42 @@ export class DefaultPackageManager implements PackageManager {
 			allPackages.push({ pkg, scope: "user" });
 		}
 
+		// Pin installed checkout paths before resolving local aliases, regardless of declaration order.
+		const checkoutSnapshot = new Map<string, string>();
+		const { unavailableCheckouts } = accumulator;
+		for (const entry of allPackages) {
+			if (entry.scope === "project" && !this.settingsManager.isProjectTrusted()) continue;
+			const source = this.getPackageSourceString(entry.pkg);
+			const parsed = this.parseSource(source);
+			if (parsed.type !== "git") continue;
+			let logical: string | undefined;
+			try {
+				logical = this.getGitStoragePath(parsed, entry.scope);
+				const pinned = entry.scope === "user" ? bootstrapCheckouts?.get(logical) : undefined;
+				const selected =
+					pinned ?? this.readSelectedGitRevision(logical, this.getGitUpdateStatePath(logical, entry.scope));
+				// A valid pointer still excludes the retained checkout if its selection is missing.
+				if (logical !== selected) accumulator.gitRevisions.set(logical, selected);
+				if (existsSync(selected)) checkoutSnapshot.set(logical, selected);
+			} catch (error) {
+				if (logical !== undefined && error instanceof GitRevisionPointerError) {
+					unavailableCheckouts.set(logical, {
+						matchTarget: this.getGitRevisionMatchTarget(logical, entry.scope),
+						failure: { source, scope: entry.scope, message: String(error) },
+					});
+				}
+				// Normal package resolution reports failures for packages that are actually loaded.
+			}
+		}
+
 		// Dedupe: project scope wins over global for same package identity
 		const packageSources = this.dedupePackages(allPackages);
-		const installFailures = await this.resolvePackageSources(packageSources, accumulator, onMissing);
+		const installFailures = await this.resolvePackageSources(
+			packageSources,
+			accumulator,
+			onMissing,
+			checkoutSnapshot,
+		);
 
 		const globalBaseDir = this.agentDir;
 		const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
@@ -1055,6 +1418,7 @@ export class DefaultPackageManager implements PackageManager {
 					origin: "top-level",
 				},
 				projectBaseDir,
+				accumulator,
 			);
 			this.resolveLocalEntries(
 				globalEntries,
@@ -1066,10 +1430,19 @@ export class DefaultPackageManager implements PackageManager {
 					origin: "top-level",
 				},
 				globalBaseDir,
+				accumulator,
 			);
 		}
 
 		this.addAutoDiscoveredResources(accumulator, globalSettings, projectSettings, globalBaseDir, projectBaseDir);
+		for (const failure of accumulator.blockedCheckoutFailures) {
+			if (
+				failure.scope !== "temporary" &&
+				!installFailures.some(({ source, scope }) => source === failure.source && scope === failure.scope)
+			) {
+				installFailures.push(failure);
+			}
+		}
 
 		// Built-in extensions are enabled unless the user `extensions` setting excludes them, for example
 		// with `-builtin:mcp`. A matching `+`, `-`, or `!` entry in the project setting overrides that.
@@ -1079,7 +1452,7 @@ export class DefaultPackageManager implements PackageManager {
 				[path],
 				getOverridePatterns(projectSettings.extensions ?? []),
 				projectBaseDir,
-			).get(path);
+			).get(path)?.enabled;
 			this.addResource(
 				accumulator.extensions,
 				path,
@@ -1088,14 +1461,50 @@ export class DefaultPackageManager implements PackageManager {
 			);
 		}
 
-		return { ...this.toResolvedPaths(accumulator), installFailures };
+		return {
+			...this.toResolvedPaths(accumulator),
+			installFailures,
+			gitRevisions: accumulator.gitRevisions,
+			unavailableCheckouts: accumulator.unavailableCheckouts,
+			configuredGitCheckouts: checkoutSnapshot,
+		};
+	}
+
+	async prepareTemporaryGitSources(sources: string[]): Promise<TemporaryGitSelection> {
+		const accumulator = this.createAccumulator();
+		const checkouts = new Map<string, string>();
+		const gitSources = sources.filter((source) => this.parseSource(source).type === "git");
+		const installFailures = await this.resolvePackageSources(
+			gitSources.map((pkg) => ({ pkg, scope: "temporary" })),
+			accumulator,
+			undefined,
+			undefined,
+			undefined,
+			{ checkouts, preparing: true },
+		);
+		return {
+			checkouts,
+			gitRevisions: accumulator.gitRevisions,
+			unavailableCheckouts: accumulator.unavailableCheckouts,
+			installFailures,
+		};
 	}
 
 	async resolveExtensionSources(
 		sources: string[],
-		options?: { local?: boolean; temporary?: boolean },
+		options?: {
+			local?: boolean;
+			temporary?: boolean;
+			gitRevisions?: ReadonlyMap<string, string>;
+			temporaryGit?: TemporaryGitSelection;
+			unavailableCheckouts?: UnavailableGitCheckouts;
+		},
 	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
+		accumulator.gitRevisions = new Map(options?.gitRevisions ?? options?.temporaryGit?.gitRevisions);
+		accumulator.unavailableCheckouts = new Map(
+			options?.unavailableCheckouts ?? options?.temporaryGit?.unavailableCheckouts,
+		);
 		const scope: SourceScope = options?.temporary ? "temporary" : options?.local ? "project" : "user";
 		// `-e builtin:<name>` loads a built-in extension; the resource loader reports unknown names.
 		for (const source of sources.filter((source) => source.startsWith(BUILTIN_PATH_PREFIX))) {
@@ -1104,8 +1513,22 @@ export class DefaultPackageManager implements PackageManager {
 		const packageSources = sources
 			.filter((source) => !source.startsWith(BUILTIN_PATH_PREFIX))
 			.map((source) => ({ pkg: source as PackageSource, scope }));
-		const installFailures = await this.resolvePackageSources(packageSources, accumulator);
-		return { ...this.toResolvedPaths(accumulator), installFailures };
+		const missingLocalPaths: string[] = [];
+		const installFailures = await this.resolvePackageSources(
+			packageSources,
+			accumulator,
+			undefined,
+			undefined,
+			missingLocalPaths,
+			options?.temporaryGit ? { checkouts: new Map(options.temporaryGit.checkouts), preparing: false } : undefined,
+		);
+		const failures = [...(options?.temporaryGit?.installFailures ?? []), ...installFailures];
+		for (const failure of accumulator.blockedCheckoutFailures) {
+			if (!failures.some(({ source, scope }) => source === failure.source && scope === failure.scope)) {
+				failures.push(failure);
+			}
+		}
+		return { ...this.toResolvedPaths(accumulator), installFailures: failures, missingLocalPaths };
 	}
 
 	listConfiguredPackages(): ConfiguredPackage[] {
@@ -1271,19 +1694,43 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		const gitUpdates: UpdatedPackage[] = [];
 		if (gitCandidates.length > 0) {
-			const gitTasks = gitCandidates.map(
-				(entry) => async () =>
-					this.withProgress("update", entry.source, `Updating ${entry.source}...`, async () => {
+			const groups = new Map<string, GitUpdateTarget[]>();
+			const groupingErrors: unknown[] = [];
+			for (const entry of gitCandidates) {
+				try {
+					const logical = this.getGitStoragePath(entry.parsed, entry.scope);
+					const key = this.getGitCheckoutLockKey(logical, entry.scope);
+					const group = groups.get(key);
+					if (group) group.push(entry);
+					else groups.set(key, [entry]);
+				} catch (error) {
+					groupingErrors.push(error);
+				}
+			}
+			const gitTasks = [...groups.values()].map((group) => async () => {
+				const errors: unknown[] = [];
+				for (const entry of group) {
+					await this.withProgress("update", entry.source, `Updating ${entry.source}...`, async () => {
 						const targetDir = this.getGitInstallPath(entry.parsed, entry.scope);
 						const from = await this.getGitHead(targetDir);
 						await this.updateGit(entry.parsed, entry.scope);
-						const to = await this.getGitHead(targetDir);
+						const to = await this.getGitHead(this.getGitInstallPath(entry.parsed, entry.scope));
 						if (from !== to) {
 							gitUpdates.push({ source: entry.source, type: "git", scope: entry.scope, from, to });
 						}
-					}),
+					}).catch((error: unknown) => {
+						errors.push(error);
+					});
+				}
+				return errors;
+			});
+			tasks.push(
+				this.runWithConcurrency(gitTasks, GIT_UPDATE_CONCURRENCY).then((results) => {
+					const errors = [...groupingErrors, ...results.flat()];
+					if (errors.length === 1) throw errors[0];
+					if (errors.length > 1) throw new AggregateError(errors, `${errors.length} Git package updates failed.`);
+				}),
 			);
-			tasks.push(this.runWithConcurrency(gitTasks, GIT_UPDATE_CONCURRENCY).then(() => {}));
 		}
 
 		await Promise.all(tasks);
@@ -1438,10 +1885,8 @@ export class DefaultPackageManager implements PackageManager {
 					};
 				}
 
-				const installedPath = this.getGitInstallPath(parsed, entry.scope);
-				if (!existsSync(installedPath)) {
-					return undefined;
-				}
+				const installedPath = this.getInstalledPath(source, entry.scope);
+				if (!installedPath) return undefined;
 				const hasUpdate = await this.gitHasAvailableUpdate(installedPath);
 				if (!hasUpdate) {
 					return undefined;
@@ -1462,8 +1907,18 @@ export class DefaultPackageManager implements PackageManager {
 		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
 		accumulator: ResourceAccumulator,
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
+		checkoutSnapshot?: Map<string, string>,
+		missingLocalPaths?: string[],
+		temporarySelection?: { checkouts: Map<string, string>; preparing: boolean },
 	): Promise<PackageInstallFailure[]> {
+		const { unavailableCheckouts } = accumulator;
 		const installFailures: PackageInstallFailure[] = [];
+		const collections: Array<() => void> = [];
+		const temporaryCheckouts = temporarySelection?.checkouts ?? new Map<string, string>();
+		// Resolve checkout redirects first, then collect resources in declaration order.
+		const collect = (scope: SourceScope, resources: () => void) => {
+			if (scope !== "temporary" || !temporarySelection?.preparing) collections.push(resources);
+		};
 		for (const { pkg, scope } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			const filter = typeof pkg === "object" ? pkg : undefined;
@@ -1475,7 +1930,10 @@ export class DefaultPackageManager implements PackageManager {
 
 			if (parsed.type === "local") {
 				const baseDir = this.getBaseDirForScope(resolvedScope);
-				this.resolveLocalExtensionSource(parsed, accumulator, filter, metadata, baseDir);
+				collect(resolvedScope, () => {
+					const original = this.resolvePathFromBase(parsed.path, baseDir);
+					this.resolveLocalExtensionSource(original, accumulator, filter, metadata, missingLocalPaths);
+				});
 				continue;
 			}
 
@@ -1530,23 +1988,78 @@ export class DefaultPackageManager implements PackageManager {
 				}
 				metadata.baseDir = installedPath;
 				metadata.packageRoot = installedPath;
-				this.collectPackageResources(installedPath, accumulator, filter, metadata);
+				collect(resolvedScope, () => this.collectPackageResources(installedPath, accumulator, filter, metadata));
 				continue;
 			}
 
 			if (parsed.type === "git") {
-				const installedPath = this.getGitInstallPath(parsed, resolvedScope);
-				if (!existsSync(installedPath)) {
+				let installedPath: string;
+				let present: boolean;
+				let logical: string | undefined;
+				const reportFailure = (error: unknown) => {
+					const failure = { source: resolvedSource, scope: resolvedScope, message: String(error) };
+					if (logical !== undefined && error instanceof GitRevisionPointerError) {
+						unavailableCheckouts.set(logical, {
+							matchTarget: this.getGitRevisionMatchTarget(logical, resolvedScope),
+							failure,
+						});
+					}
+					installFailures.push(failure);
+				};
+				try {
+					logical = this.getGitStoragePath(parsed, resolvedScope);
+					const pinned = (resolvedScope === "temporary" ? temporaryCheckouts : checkoutSnapshot)?.get(logical);
+					if (pinned !== undefined) {
+						metadata.baseDir = pinned;
+						metadata.packageRoot = pinned;
+						const logicalPath = logical;
+						collect(resolvedScope, () =>
+							this.collectPackageResources(pinned, accumulator, filter, metadata, logicalPath),
+						);
+						continue;
+					}
+					if (resolvedScope === "temporary" && temporarySelection?.preparing === false) continue;
+					if (resolvedScope === "temporary") {
+						const selected = this.readSelectedGitRevision(
+							logical,
+							this.getGitUpdateStatePath(logical, resolvedScope),
+						);
+						if (selected !== logical) accumulator.gitRevisions.set(logical, selected);
+					}
+					const recovered = await this.recoverGitCheckout(logical, resolvedScope);
+					if (resolvedScope === "temporary" && !recovered) accumulator.gitRevisions.delete(logical);
+					present = recovered !== undefined;
+					installedPath = recovered ?? "";
+				} catch (error) {
+					reportFailure(error);
+					continue;
+				}
+				if (!present) {
 					const installed = await installMissing();
 					if (!installed) continue;
 				} else if (resolvedScope === "temporary" && !isOfflineModeEnabled()) {
 					await this.refreshTemporaryGitSource(parsed, resolvedSource, installedPath);
 				}
+				try {
+					installedPath = this.getGitInstallPath(parsed, resolvedScope);
+				} catch (error) {
+					reportFailure(error);
+					continue;
+				}
 				metadata.baseDir = installedPath;
 				metadata.packageRoot = installedPath;
-				this.collectPackageResources(installedPath, accumulator, filter, metadata);
+				const logicalPath = logical;
+				unavailableCheckouts.delete(logicalPath);
+				if (logicalPath !== installedPath) accumulator.gitRevisions.set(logicalPath, installedPath);
+				else accumulator.gitRevisions.delete(logicalPath);
+				if (resolvedScope === "temporary") temporaryCheckouts.set(logicalPath, installedPath);
+				else checkoutSnapshot?.set(logicalPath, installedPath);
+				collect(resolvedScope, () =>
+					this.collectPackageResources(installedPath, accumulator, filter, metadata, logicalPath),
+				);
 			}
 		}
+		for (const resources of collections) resources();
 		return installFailures;
 	}
 
@@ -1566,14 +2079,16 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private resolveLocalExtensionSource(
-		source: LocalSource,
+		original: string,
 		accumulator: ResourceAccumulator,
 		filter: PackageFilter | undefined,
 		metadata: PathMetadata,
-		baseDir: string,
+		missingLocalPaths?: string[],
 	): void {
-		const resolved = this.resolvePathFromBase(source.path, baseDir);
+		const resolved = this.selectConfiguredResource(original, accumulator);
+		if (!resolved) return;
 		if (!existsSync(resolved)) {
+			missingLocalPaths?.push(original);
 			return;
 		}
 
@@ -1587,7 +2102,7 @@ export class DefaultPackageManager implements PackageManager {
 			if (stats.isDirectory()) {
 				metadata.baseDir = resolved;
 				metadata.packageRoot = resolved;
-				const resources = this.collectPackageResources(resolved, accumulator, filter, metadata);
+				const resources = this.collectPackageResources(resolved, accumulator, filter, metadata, original);
 				if (!resources) {
 					this.addResource(accumulator.extensions, resolved, metadata, true);
 				}
@@ -2102,23 +2617,32 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
-		const targetDir = this.getGitInstallPath(source, scope);
-		if (existsSync(targetDir)) {
-			if (source.ref) {
-				await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
-				return;
-			}
-			const target = await this.getLocalGitUpdateTarget(targetDir);
-			await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+		const logicalDir = this.getGitStoragePath(source, scope);
+		const recovered = await this.recoverGitCheckout(logicalDir, scope);
+		const targetDir = recovered ?? logicalDir;
+		if (recovered) {
+			await this.ensureGitRef(logicalDir, targetDir, scope, source.ref);
 			return;
 		}
 		const gitRoot = this.getGitInstallRoot(scope);
 		if (gitRoot) {
 			this.ensureGitIgnore(gitRoot);
 		}
-		mkdirSync(dirname(targetDir), { recursive: true });
-		rmSync(this.getGitUpdateMarkerPath(targetDir), { force: true });
+		const release = this.lockGitCheckout(targetDir, scope);
+		try {
+			const pendingRemoval = this.reconcileGitRemoval(targetDir, scope);
+			if (pendingRemoval) throw new Error(`Finish removing Git package ${pendingRemoval} before retrying install.`);
+			if (existsSync(targetDir)) throw new Error(`Git package ${targetDir} appeared during install; retry install.`);
+			await this.cloneGitCheckout(source, targetDir, gitRoot);
+		} finally {
+			release();
+		}
+	}
 
+	private async cloneGitCheckout(source: GitSource, targetDir: string, gitRoot: string | undefined): Promise<void> {
+		mkdirSync(dirname(targetDir), { recursive: true });
+		const markerPath = this.getGitUpdateMarkerPath(targetDir);
+		if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
 		try {
 			await this.runCommand("git", ["clone", source.repo, targetDir]);
 			if (source.ref) {
@@ -2136,19 +2660,14 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async updateGit(source: GitSource, scope: SourceScope): Promise<void> {
-		const targetDir = this.getGitInstallPath(source, scope);
-		if (!existsSync(targetDir)) {
+		const logicalDir = this.getGitStoragePath(source, scope);
+		const targetDir = await this.recoverGitCheckout(logicalDir, scope);
+		if (!targetDir) {
 			await this.installGit(source, scope);
 			return;
 		}
 
-		if (source.ref) {
-			await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
-			return;
-		}
-
-		const target = await this.getLocalGitUpdateTarget(targetDir);
-		await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+		await this.ensureGitRef(logicalDir, targetDir, scope, source.ref);
 	}
 
 	private hasMissingGitDependencies(targetDir: string): boolean {
@@ -2176,69 +2695,249 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async repairMissingGitDependencies(targetDir: string): Promise<void> {
-		if (!this.hasMissingGitDependencies(targetDir)) return;
-		await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
-	}
-
 	private getGitUpdateMarkerPath(targetDir: string): string {
 		return join(dirname(targetDir), `.${basename(targetDir)}.pi-update-incomplete`);
 	}
 
-	private async cleanAndInstallGitDependencies(targetDir: string, markerPath: string): Promise<void> {
-		// Clean untracked files (extensions should be pristine). On Windows, files loaded by
-		// another process (e.g. a native module of this extension in another pi session) cannot
-		// be deleted, so git clean fails. Still install dependencies for the new commit, but keep
-		// the marker so the next update retries the clean.
-		let cleaned = true;
-		try {
-			await this.runCommand("git", ["clean", "-fdx"], { cwd: targetDir });
-		} catch (error) {
-			cleaned = false;
-			const reason = error instanceof Error ? error.message : String(error);
-			this.emitProgress({
-				type: "progress",
-				action: "update",
-				source: targetDir,
-				message: `Could not remove all untracked files in ${targetDir} (${reason}). Files may be in use by another pi session; close it and run the update again.`,
-			});
-		}
+	private getGitUpdateStatePath(targetDir: string, scope: SourceScope): string {
+		const root = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+		return this.getGitUpdateStatePathForIdentity(root, this.getGitCheckoutIdentity(root, targetDir));
+	}
 
-		const packageJsonPath = join(targetDir, "package.json");
-		if (existsSync(packageJsonPath)) {
-			await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
-		}
-		if (cleaned) {
-			rmSync(markerPath, { force: true });
+	private getGitUpdateStatePathForIdentity(root: string, identity: string): string {
+		return join(root, ".git-update-state", createHash("sha256").update(identity).digest("hex"));
+	}
+
+	private getGitCheckoutIdentity(root: string, targetDir: string): string {
+		// Case sensitivity belongs to the directory, not the operating system.
+		let parent = root;
+		return relative(root, targetDir)
+			.split(sep)
+			.map((part) => {
+				let name = part;
+				if (existsSync(join(parent, part))) {
+					const entries = readdirSync(parent);
+					if (!entries.includes(part)) {
+						const requested = statSync(join(parent, part), { throwIfNoEntry: false });
+						name =
+							entries.find((entry) => {
+								if (!requested || entry.toLowerCase() !== part.toLowerCase()) return false;
+								const existing = statSync(join(parent, entry), { throwIfNoEntry: false });
+								return existing?.dev === requested.dev && existing.ino === requested.ino;
+							}) ?? part;
+					}
+				}
+				parent = join(parent, name);
+				return name;
+			})
+			.join(sep);
+	}
+
+	private getGitCheckoutLockKey(targetDir: string, scope: SourceScope): string {
+		const root = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+		// Case variants share a mutation lock even when the checkout no longer exists.
+		// Revision pointers still use the filesystem's actual checkout identity.
+		const digest = createHash("sha256").update(relative(root, targetDir).toLowerCase()).digest("hex");
+		return join(root, ".git-update-state", digest);
+	}
+
+	private lockGitCheckout(targetDir: string, scope: SourceScope): () => void {
+		const key = this.getGitCheckoutLockKey(targetDir, scope);
+		this.ensureGitIgnore(dirname(key));
+		return lockfile.lockSync(key, { realpath: false });
+	}
+
+	private assertSameGitCheckout(targetDir: string, installed: { dev: number; ino: number }): void {
+		const current = statSync(targetDir, { throwIfNoEntry: false });
+		if (current?.dev !== installed.dev || current.ino !== installed.ino) {
+			throw new Error(`Git package ${targetDir} changed during update; retry the update.`);
 		}
 	}
 
-	private async ensureGitRef(targetDir: string, fetchArgs: string[], ref: string): Promise<void> {
-		// Fetch only the ref we will reset to, avoiding unrelated branch/tag noise.
-		await this.runCommand("git", fetchArgs, { cwd: targetDir });
-
-		const localHead = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
-			cwd: targetDir,
-			timeoutMs: NETWORK_TIMEOUT_MS,
-		});
-		const commitRef = `${ref}^{commit}`;
-		const targetHead = await this.runCommandCapture("git", ["rev-parse", commitRef], {
-			cwd: targetDir,
-			timeoutMs: NETWORK_TIMEOUT_MS,
-		});
+	private async ensureGitRef(
+		logicalDir: string,
+		targetDir: string,
+		scope: SourceScope,
+		configuredRef?: string,
+	): Promise<void> {
+		const installed = statSync(targetDir);
+		const state = this.getGitUpdateStatePath(logicalDir, scope);
+		const releaseFetch = this.lockGitCheckout(logicalDir, scope);
+		let localHead: string;
+		let targetHead: string;
+		try {
+			this.assertSameGitCheckout(targetDir, installed);
+			if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
+				throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
+			}
+			// Fallback target discovery can write origin/HEAD; keep it under the fetch lock.
+			const { fetchArgs, ref } = configuredRef
+				? { fetchArgs: ["fetch", "origin", configuredRef], ref: "FETCH_HEAD" }
+				: await this.getLocalGitUpdateTarget(targetDir);
+			// Pin the fetched commit before another operation can overwrite FETCH_HEAD.
+			const options = { cwd: targetDir, timeoutMs: NETWORK_TIMEOUT_MS };
+			await this.runCommand("git", fetchArgs, { cwd: targetDir });
+			localHead = await this.runCommandCapture("git", ["rev-parse", "HEAD"], options);
+			targetHead = await this.runCommandCapture("git", ["rev-parse", `${ref}^{commit}`], options);
+		} finally {
+			releaseFetch();
+		}
 		const markerPath = this.getGitUpdateMarkerPath(targetDir);
-		if (localHead.trim() === targetHead.trim()) {
-			if (existsSync(markerPath)) {
-				await this.cleanAndInstallGitDependencies(targetDir, markerPath);
-			} else {
-				await this.repairMissingGitDependencies(targetDir);
+		const interruptedLegacyUpdate = statSync(markerPath, { throwIfNoEntry: false })?.isFile();
+		const previous = `${state}.previous`;
+		if (localHead.trim() === targetHead.trim() && !interruptedLegacyUpdate) {
+			if (existsSync(previous) || this.hasMissingGitDependencies(targetDir)) {
+				const release = this.lockGitCheckout(logicalDir, scope);
+				try {
+					this.assertSameGitCheckout(targetDir, installed);
+					if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
+						throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
+					}
+					await this.removeGitUpdateFiles(previous);
+					if (this.hasMissingGitDependencies(targetDir)) {
+						await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
+					}
+				} finally {
+					release();
+				}
 			}
 			return;
 		}
 
-		writeFileSync(markerPath, "", "utf-8");
-		await this.runCommand("git", ["reset", "--hard", commitRef], { cwd: targetDir });
-		await this.cleanAndInstallGitDependencies(targetDir, markerPath);
+		const gitDir = join(targetDir, ".git");
+		if (!lstatSync(gitDir, { throwIfNoEntry: false })?.isDirectory() || existsSync(join(gitDir, "commondir"))) {
+			throw new Error(`Cannot stage Git package ${targetDir}: its metadata must be in a standalone .git directory.`);
+		}
+
+		this.ensureGitIgnore(dirname(state));
+		// Relative file: dependencies must resolve from the same parent as the installed checkout.
+		const staged = mkdtempSync(join(dirname(logicalDir), `.pi-revision-${basename(state)}-`));
+		let published = false;
+		try {
+			const releaseSnapshot = this.lockGitCheckout(logicalDir, scope);
+			try {
+				this.assertSameGitCheckout(targetDir, installed);
+				if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
+					throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
+				}
+				// Snapshot refs under the fetch lock without blocking its heartbeat.
+				await cp(gitDir, join(staged, ".git"), {
+					recursive: true,
+					filter: (path) => {
+						if (lstatSync(path).isSymbolicLink()) {
+							throw new Error(
+								`Cannot stage Git package ${targetDir}: symbolic link in Git metadata at ${path}.`,
+							);
+						}
+						return !basename(path).endsWith(".lock");
+					},
+				});
+			} finally {
+				releaseSnapshot();
+			}
+			const config = join(staged, ".git", "config");
+
+			const worktreeConfig = join(staged, ".git", "config.worktree");
+
+			if (existsSync(worktreeConfig)) {
+				await this.runCommand("git", ["config", "--file", worktreeConfig, "core.worktree", ".."], {
+					cwd: staged,
+				});
+			}
+			if (existsSync(config)) {
+				await this.runCommand("git", ["--git-dir=.git", "config", "--local", "core.worktree", ".."], {
+					cwd: staged,
+				});
+			}
+			await this.runCommand("git", ["--git-dir=.git", "--work-tree=.", "reset", "--hard", targetHead.trim()], {
+				cwd: staged,
+			});
+			if (existsSync(join(staged, "package.json"))) {
+				await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: staged });
+			}
+			const release = this.lockGitCheckout(logicalDir, scope);
+			try {
+				this.assertSameGitCheckout(targetDir, installed);
+				if (this.readSelectedGitRevision(logicalDir, state) !== targetDir) {
+					throw new Error(`Git package ${logicalDir} changed during update; retry the update.`);
+				}
+				if (!existsSync(staged)) throw new Error(`Git package ${logicalDir}: prepared revision disappeared.`);
+				const pending = `${state}.pending`;
+				writeFileSync(pending, basename(staged), "utf8");
+				renameSync(pending, `${state}.current`);
+				published = true;
+				if (interruptedLegacyUpdate) await this.removeGitUpdateFiles(markerPath, { recursive: false });
+			} finally {
+				release();
+			}
+		} finally {
+			if (!published) await this.removeGitUpdateFiles(staged);
+		}
+	}
+
+	private async recoverGitCheckout(logicalDir: string, scope: SourceScope): Promise<string | undefined> {
+		const state = this.getGitUpdateStatePath(logicalDir, scope);
+		const selected = this.readSelectedGitRevision(logicalDir, state);
+		if (existsSync(selected)) return selected;
+		const key = this.getGitCheckoutLockKey(logicalDir, scope);
+		if (
+			!existsSync(`${state}.previous`) &&
+			!existsSync(`${key}.lock`) &&
+			!existsSync(`${key}.removing`) &&
+			selected === logicalDir
+		) {
+			return existsSync(logicalDir) ? logicalDir : undefined;
+		}
+		this.ensureGitIgnore(dirname(state));
+		// Allow an abandoned lock to reach proper-lockfile's default 10-second stale interval.
+		const release = await lockfile
+			.lock(key, {
+				realpath: false,
+				retries: { retries: 105, factor: 1, minTimeout: 100 },
+			})
+			.catch((error: NodeJS.ErrnoException) => {
+				if (error.code !== "ELOCKED") throw error;
+				throw new Error(`Git package ${logicalDir} is still locked. Retry after the other Pi operation finishes.`, {
+					cause: error,
+				});
+			});
+		try {
+			const pendingRemoval = this.reconcileGitRemoval(logicalDir, scope);
+			if (pendingRemoval) throw new Error(`Finish removing Git package ${pendingRemoval} before retrying.`);
+			const currentState = this.getGitUpdateStatePath(logicalDir, scope);
+			const current = this.readSelectedGitRevision(logicalDir, currentState);
+			if (current === logicalDir) this.restoreGitBackup(logicalDir, `${currentState}.previous`);
+			if (existsSync(current)) return current;
+			if (current !== logicalDir) throw new GitRevisionPointerError(`Selected Git checkout is missing: ${current}`);
+			return undefined;
+		} finally {
+			await release();
+		}
+	}
+
+	private restoreGitBackup(targetDir: string, previous: string): void {
+		if (existsSync(targetDir) || !existsSync(previous)) return;
+		try {
+			renameSync(previous, targetDir);
+		} catch (error) {
+			throw new Error(`Could not restore Git package ${targetDir}; previous checkout is at ${previous}.`, {
+				cause: error,
+			});
+		}
+	}
+
+	private async removeGitUpdateFiles(path: string, { recursive } = { recursive: true }): Promise<void> {
+		try {
+			await rm(path, { recursive, force: true });
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			this.emitProgress({
+				type: "progress",
+				action: "update",
+				source: path,
+				message: `Could not remove temporary Git package files at ${path} (${reason}).`,
+			});
+		}
 	}
 
 	private async refreshTemporaryGitSource(source: GitSource, sourceStr: string, installedPath: string): Promise<void> {
@@ -2265,11 +2964,82 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
+	// Caller holds the case-folded mutation lock. Only finish records whose logical checkout is gone.
+	private reconcileGitRemoval(targetDir: string, scope: SourceScope): string | undefined {
+		const root = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+		const cleanup = `${this.getGitCheckoutLockKey(targetDir, scope)}.removing`;
+		const pending = lstatSync(cleanup, { throwIfNoEntry: false });
+		if (!pending) return undefined;
+		if (!pending.isFile()) throw new GitRevisionPointerError(`Expected a regular file at ${cleanup}`);
+		const prior = readFileSync(cleanup, "utf8");
+		const previousTarget = join(root, prior);
+		if (prior.toLowerCase() !== relative(root, targetDir).toLowerCase() || relative(root, previousTarget) !== prior) {
+			throw new GitRevisionPointerError(`Invalid Git removal record at ${cleanup}`);
+		}
+		if (existsSync(previousTarget)) return previousTarget;
+		const previousState = this.getGitUpdateStatePathForIdentity(root, prior);
+		rmSync(`${previousState}.current`, { force: true });
+		rmSync(cleanup);
+		return undefined;
+	}
+
 	private async removeGit(source: GitSource, scope: SourceScope): Promise<void> {
-		const targetDir = this.getGitInstallPath(source, scope);
-		rmSync(targetDir, { recursive: true, force: true });
-		rmSync(this.getGitUpdateMarkerPath(targetDir), { force: true });
-		this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
+		const targetDir = this.getGitStoragePath(source, scope);
+		const release = this.lockGitCheckout(targetDir, scope);
+		try {
+			const root = this.getGitInstallRoot(scope) ?? getExtensionTempFolder(this.agentDir);
+			const identity = this.getGitCheckoutIdentity(root, targetDir);
+			const state = this.getGitUpdateStatePathForIdentity(root, identity);
+			const cleanup = `${this.getGitCheckoutLockKey(targetDir, scope)}.removing`;
+			const pendingRemoval = this.reconcileGitRemoval(targetDir, scope);
+			if (pendingRemoval && relative(root, pendingRemoval) !== identity) {
+				throw new Error(`Finish removing Git package ${pendingRemoval} before removing ${targetDir}.`);
+			}
+			const pointer = `${state}.current`;
+			const pointerInfo = lstatSync(pointer, { throwIfNoEntry: false });
+			if (pointerInfo && !pointerInfo.isFile()) {
+				throw new GitRevisionPointerError(`Cannot remove Git package: expected a regular file at ${pointer}`);
+			}
+			let selected = targetDir;
+			try {
+				selected = this.readSelectedGitRevision(targetDir, state);
+			} catch (error) {
+				if (!(error instanceof GitRevisionPointerError)) throw error;
+				// Only remove the logical checkout and revisions belonging to this package key.
+			}
+			if (existsSync(dirname(targetDir))) {
+				const prefix = `.pi-revision-${basename(state)}-`;
+				for (const entry of readdirSync(dirname(targetDir))) {
+					const revision = join(dirname(targetDir), entry);
+					if (
+						revision !== selected &&
+						entry.startsWith(prefix) &&
+						/^[a-zA-Z0-9]{6}$/.test(entry.slice(prefix.length))
+					) {
+						await rm(revision, { recursive: true, force: true });
+					}
+				}
+			}
+			rmSync(`${state}.pending`, { force: true });
+			const markerPath = this.getGitUpdateMarkerPath(targetDir);
+			if (statSync(markerPath, { throwIfNoEntry: false })?.isFile()) rmSync(markerPath, { force: true });
+			await rm(`${state}.previous`, { recursive: true, force: true });
+			// Keep the logical spelling available if selected cleanup fails, and keep the pointer
+			// until logical deletion finishes so readers cannot fall back to the old checkout.
+			if (selected !== targetDir) await rm(selected, { recursive: true, force: true });
+			if (pointerInfo) {
+				const draft = `${cleanup}.tmp`;
+				rmSync(draft, { force: true });
+				writeFileSync(draft, identity, { flag: "wx" });
+				renameSync(draft, cleanup);
+			}
+			await rm(targetDir, { recursive: true, force: true });
+			rmSync(pointer, { force: true });
+			rmSync(cleanup, { force: true });
+			this.pruneEmptyGitParents(targetDir, this.getGitInstallRoot(scope));
+		} finally {
+			release();
+		}
 	}
 
 	private pruneEmptyGitParents(targetDir: string, installRoot: string | undefined): void {
@@ -2386,7 +3156,51 @@ export class DefaultPackageManager implements PackageManager {
 		return legacyPath && existsSync(legacyPath) ? legacyPath : managedPath;
 	}
 
+	private getGitRevisionMatchTarget(logical: string, scope: SourceScope): string {
+		const state = this.getGitUpdateStatePath(logical, scope);
+		// Match the logical path and historical revision family without reading a checkout.
+		return join(dirname(logical), `.pi-revision-${basename(state)}-000000`);
+	}
+
+	private readSelectedGitRevision(logicalDir: string, state: string): string {
+		const pointer = `${state}.current`;
+		let name: string;
+		try {
+			if (!lstatSync(pointer).isFile()) throw new GitRevisionPointerError(`Expected a regular file at ${pointer}`);
+			name = readFileSync(pointer, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return logicalDir;
+			if (error instanceof GitRevisionPointerError) throw error;
+			throw new GitRevisionPointerError(`Could not read Git revision pointer at ${pointer}`, { cause: error });
+		}
+		const prefix = `.pi-revision-${basename(state)}-`;
+		if (!name.startsWith(prefix) || !/^[a-zA-Z0-9]{6}$/.test(name.slice(prefix.length))) {
+			throw new GitRevisionPointerError(`Invalid Git revision pointer at ${pointer}`);
+		}
+		const selected = join(dirname(logicalDir), name);
+		try {
+			const target = lstatSync(selected, { throwIfNoEntry: false });
+			if (target && !target.isDirectory()) throw new GitRevisionPointerError(`Expected a directory at ${selected}`);
+		} catch (error) {
+			if (error instanceof GitRevisionPointerError) throw error;
+			throw new GitRevisionPointerError(`Could not inspect selected Git checkout at ${selected}`, { cause: error });
+		}
+		return selected;
+	}
+
 	private getGitInstallPath(source: GitSource, scope: SourceScope): string {
+		const logicalDir = this.getGitStoragePath(source, scope);
+		return this.readSelectedGitRevision(logicalDir, this.getGitUpdateStatePath(logicalDir, scope));
+	}
+
+	private getGitStoragePath(source: GitSource, scope: SourceScope): string {
+		if (
+			[source.host, ...source.path.split("/")].some((part) => /^\.pi-revision-[a-f0-9]{64}-[a-z0-9]{6}$/i.test(part))
+		) {
+			throw new GitRevisionPointerError(
+				"Git package path overlaps Pi's reserved revision namespace; use a local checkout instead",
+			);
+		}
 		if (scope === "temporary") {
 			// Include the ref in the hash so each pinned ref gets its own checkout.
 			return this.getTemporaryDir(`git-${source.host}`, source.path, source.ref);
@@ -2395,7 +3209,13 @@ export class DefaultPackageManager implements PackageManager {
 		if (!installRoot) {
 			throw new Error("Missing git install root");
 		}
-		return this.resolveManagedPath(installRoot, source.host, source.path);
+		const checkout = this.resolveManagedPath(installRoot, source.host, source.path);
+		if (relative(installRoot, checkout).split(sep)[0]?.toLowerCase() === ".git-update-state") {
+			throw new GitRevisionPointerError(
+				"Git package path overlaps Pi's reserved update state directory; use a local checkout instead",
+			);
+		}
+		return checkout;
 	}
 
 	private getGitInstallRoot(scope: SourceScope): string | undefined {
@@ -2451,9 +3271,17 @@ export class DefaultPackageManager implements PackageManager {
 		accumulator: ResourceAccumulator,
 		filter: PackageFilter | undefined,
 		metadata: PathMetadata,
+		filterRoot = packageRoot,
 	): boolean {
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
+		if (filterRoot !== packageRoot) {
+			metadata.gitRevision = { active: packageRoot, logical: filterRoot };
+		}
+		const selectPath =
+			accumulator.gitRevisions.size || accumulator.unavailableCheckouts.size
+				? (path: string) => this.selectConfiguredResource(path, accumulator)
+				: unchangedPath;
+		const manifest = readPiManifest(selectPath(join(packageRoot, "package.json")));
+		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest, selectPath);
 		if (changelogPath) {
 			metadata.changelogPath = changelogPath;
 		} else {
@@ -2465,11 +3293,29 @@ export class DefaultPackageManager implements PackageManager {
 				const patterns = filter[resourceType];
 				const target = this.getTargetMap(accumulator, resourceType);
 				if (filter.autoload === false) {
-					this.applyPackageDeltaFilter(packageRoot, patterns ?? [], resourceType, target, metadata);
+					this.applyPackageDeltaFilter(
+						packageRoot,
+						patterns ?? [],
+						resourceType,
+						target,
+						metadata,
+						filterRoot,
+						manifest,
+						selectPath,
+					);
 				} else if (patterns !== undefined) {
-					this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata);
+					this.applyPackageFilter(
+						packageRoot,
+						patterns,
+						resourceType,
+						target,
+						metadata,
+						filterRoot,
+						manifest,
+						selectPath,
+					);
 				} else {
-					this.collectDefaultResources(packageRoot, resourceType, target, metadata);
+					this.collectDefaultResources(packageRoot, resourceType, target, metadata, manifest, selectPath);
 				}
 			}
 			return true;
@@ -2484,6 +3330,7 @@ export class DefaultPackageManager implements PackageManager {
 					resourceType,
 					this.getTargetMap(accumulator, resourceType),
 					metadata,
+					selectPath,
 				);
 			}
 			return true;
@@ -2492,11 +3339,15 @@ export class DefaultPackageManager implements PackageManager {
 		let hasAnyDir = false;
 		for (const resourceType of RESOURCE_TYPES) {
 			const dir = join(packageRoot, resourceType);
-			if (existsSync(dir)) {
-				// Collect all files from the directory (all enabled by default)
-				const files = collectResourceFiles(dir, resourceType);
-				for (const f of files) {
-					this.addResource(this.getTargetMap(accumulator, resourceType), f, metadata, true);
+			if (existsSync(selectPath(dir))) {
+				const { allFiles, aliases } = this.collectSelectedPackagePaths([dir], resourceType, selectPath, true);
+				for (const f of allFiles) {
+					this.addResource(
+						this.getTargetMap(accumulator, resourceType),
+						f,
+						this.withPackageAliases(metadata, aliases.get(f)),
+						true,
+					);
 				}
 				hasAnyDir = true;
 			}
@@ -2509,21 +3360,21 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
+		manifest: PiManifest | null,
+		selectPath: (path: string) => string,
 	): void {
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
 		const entries = manifest?.[resourceType];
 		if (entries) {
-			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
+			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata, selectPath);
 			return;
 		}
-		const dir = join(packageRoot, resourceType);
-		if (existsSync(dir)) {
-			// Collect all files from the directory (all enabled by default)
-			const files = collectResourceFiles(dir, resourceType);
-			for (const f of files) {
-				this.addResource(target, f, metadata, true);
-			}
-		}
+		const { allFiles, aliases } = this.collectSelectedPackagePaths(
+			[join(packageRoot, resourceType)],
+			resourceType,
+			selectPath,
+			true,
+		);
+		for (const f of allFiles) this.addResource(target, f, this.withPackageAliases(metadata, aliases.get(f)), true);
 	}
 
 	private applyPackageFilter(
@@ -2532,24 +3383,47 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
+		filterRoot: string,
+		manifest: PiManifest | null,
+		selectPath: (path: string) => string,
 	): void {
-		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType);
+		const { allFiles, aliases, filesBySpelling } = this.collectManifestFiles(
+			packageRoot,
+			resourceType,
+			manifest,
+			selectPath,
+		);
 
 		if (userPatterns.length === 0) {
 			// Empty array explicitly disables all resources of this type
 			for (const f of allFiles) {
-				this.addResource(target, f, metadata, false);
+				this.addResource(target, f, this.withPackageAliases(metadata, aliases?.get(f)), false);
 			}
 			return;
 		}
 
-		// Apply user patterns
-		const enabledByUser = applyPatterns(allFiles, userPatterns, packageRoot);
-
-		for (const f of allFiles) {
-			const enabled = enabledByUser.has(f);
-			this.addResource(target, f, metadata, enabled);
-		}
+		// Rank each row by its winning spelling, not an earlier rejected alias.
+		const order = new Map([...filesBySpelling.keys()].map((spelling, index) => [spelling, index]));
+		const rows = allFiles.map((f) => {
+			const spellings = aliases?.get(f);
+			const candidates = spellings && new Set(distinctExistingAliases([...spellings]));
+			const declaration = chooseResourceAlias(candidates, (alias) =>
+				matchesPackageDeclaration(
+					f,
+					alias?.values().next().value,
+					spellings,
+					userPatterns,
+					packageRoot,
+					filterRoot,
+				),
+			);
+			const allAliases = new Set([...(declaration.aliases ?? []), ...(aliases?.get(f) ?? [])]);
+			const spelling = declaration.aliases?.values().next().value ?? f;
+			return { f, allAliases, enabled: declaration.enabled, rank: order.get(spelling) ?? Number.MAX_SAFE_INTEGER };
+		});
+		rows.sort((a, b) => a.rank - b.rank);
+		for (const row of rows)
+			this.addResource(target, row.f, this.withPackageAliases(metadata, row.allAliases), row.enabled);
 	}
 
 	private applyPackageDeltaFilter(
@@ -2558,15 +3432,37 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
+		filterRoot: string,
+		manifest: PiManifest | null,
+		selectPath: (path: string) => string,
 	): void {
 		if (userPatterns.length === 0) {
 			return;
 		}
 
-		const { allFiles } = this.collectManifestFiles(packageRoot, resourceType);
-		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot);
-		for (const [filePath, enabled] of enabledByUser) {
-			this.addResource(target, filePath, metadata, enabled);
+		const { allFiles, aliases, filesBySpelling } = this.collectManifestFiles(
+			packageRoot,
+			resourceType,
+			manifest,
+			selectPath,
+		);
+		const enabledByUser = applyAutoloadDisabledPatterns(
+			allFiles,
+			userPatterns,
+			packageRoot,
+			filterRoot,
+			aliases,
+			filesBySpelling,
+		);
+		for (const [filePath, { enabled, alias }] of enabledByUser) {
+			const spellings = aliases?.get(filePath);
+			const ordered = alias === undefined ? spellings : new Set([alias, ...(spellings ?? [])]);
+			this.addResource(
+				target,
+				filePath,
+				this.withPackageAliases({ ...metadata, packageDelta: true }, ordered),
+				enabled,
+			);
 		}
 	}
 
@@ -2578,23 +3474,15 @@ export class DefaultPackageManager implements PackageManager {
 	private collectManifestFiles(
 		packageRoot: string,
 		resourceType: ResourceType,
-	): { allFiles: string[]; enabledByManifest: Set<string> } {
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
+		manifest: PiManifest | null,
+		selectPath: (path: string) => string,
+	) {
 		const entries = manifest?.[resourceType];
 		if (entries && entries.length > 0) {
-			const allFiles = this.collectFilesFromManifestEntries(entries, packageRoot, resourceType);
-			const manifestPatterns = entries.filter(isOverridePattern);
-			const enabledByManifest =
-				manifestPatterns.length > 0 ? applyPatterns(allFiles, manifestPatterns, packageRoot) : new Set(allFiles);
-			return { allFiles: Array.from(enabledByManifest), enabledByManifest };
+			return this.collectFilesFromManifestEntries(entries, packageRoot, resourceType, selectPath, true);
 		}
 
-		const conventionDir = join(packageRoot, resourceType);
-		if (!existsSync(conventionDir)) {
-			return { allFiles: [], enabledByManifest: new Set() };
-		}
-		const allFiles = collectResourceFiles(conventionDir, resourceType);
-		return { allFiles, enabledByManifest: new Set(allFiles) };
+		return this.collectSelectedPackagePaths([join(packageRoot, resourceType)], resourceType, selectPath, true);
 	}
 
 	private addManifestEntries(
@@ -2603,30 +3491,153 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
+		selectPath: (path: string) => string,
 	): void {
 		if (!entries) return;
 
-		const allFiles = this.collectFilesFromManifestEntries(entries, root, resourceType);
-		const patterns = entries.filter(isOverridePattern);
-		const enabledPaths = applyPatterns(allFiles, patterns, root);
-
+		const { allFiles, aliases } = this.collectFilesFromManifestEntries(entries, root, resourceType, selectPath);
 		for (const f of allFiles) {
-			if (enabledPaths.has(f)) {
-				this.addResource(target, f, metadata, true);
-			}
+			this.addResource(target, f, this.withPackageAliases(metadata, aliases.get(f)), true);
 		}
 	}
 
-	private collectFilesFromManifestEntries(entries: string[], root: string, resourceType: ResourceType): string[] {
+	private withPackageAliases(metadata: PathMetadata, aliases?: Set<string>): PathMetadata {
+		return aliases?.size ? { ...metadata, packageAliases: [...aliases] } : metadata;
+	}
+
+	private collectFilesFromManifestEntries(
+		entries: string[],
+		root: string,
+		resourceType: ResourceType,
+		selectPath: (path: string) => string,
+		preserveFilterOrder = false,
+	) {
 		const sourceEntries = entries.filter((entry) => !isOverridePattern(entry));
 		const resolved = sourceEntries.flatMap((entry) => {
 			if (!hasGlobPattern(entry)) {
 				return [resolve(root, entry)];
 			}
 
-			return expandPackageGlob(entry, root);
+			if (selectPath === unchangedPath) return expandPackageGlob(entry, root);
+
+			const matches = new Set<string>();
+			const scans = new Map<string, string[]>();
+			const glob = (pattern: string, cwd: string) => {
+				const key = JSON.stringify([cwd, pattern]);
+				let paths = scans.get(key);
+				if (!paths) {
+					paths = expandPackageGlob(pattern, cwd);
+					scans.set(key, paths);
+				}
+				return paths;
+			};
+			const expand = (parts: string[], physical: string, logical: string, ancestors: ReadonlySet<string>) => {
+				for (const match of glob(parts.join("/"), physical)) {
+					const spelling = resolve(logical, relative(physical, match));
+					if (isVisibleGlobPath(root, spelling)) matches.add(spelling);
+				}
+				for (let i = 1; i < parts.length; i++) {
+					// A wildcard can match a managed checkout boundary, not just a file inside it.
+					for (const directory of glob(parts.slice(0, i).join("/"), physical)) {
+						const selected = selectPath(directory);
+						if (!selected || selected === directory || ancestors.has(selected)) continue;
+						if (!statSync(selected, { throwIfNoEntry: false })?.isDirectory()) continue;
+						const spelling = resolve(logical, relative(physical, directory));
+						if (!isVisibleGlobPath(root, spelling)) continue;
+						// A globstar can keep consuming directories after crossing the boundary.
+						const rest = parts.slice(parts[i - 1] === "**" ? i - 1 : i);
+						expand(rest, selected, spelling, new Set([...ancestors, selected]));
+					}
+				}
+			};
+			for (const pattern of braceExpand(toPosixPath(entry))) {
+				const parts = pattern.split("/");
+				// Leave character classes, extglobs and escaped syntax for native glob.
+				const magic = parts.findIndex((part) => /[*?[({\\]/.test(part));
+				// A literal brace alternative still needs discovery in the selected parent.
+				const wildcard = magic < 0 ? parts.length - 1 : magic;
+				// Pass the fixed prefix as a literal cwd; it may contain characters meaningful to glob.
+				const prefix = wildcard === 0 ? root : resolve(root, `${parts.slice(0, wildcard).join("/")}/`);
+				const selected = selectPath(prefix);
+				if (selected) expand(parts.slice(wildcard), selected, prefix, new Set([selected]));
+			}
+			return [...matches].sort();
 		});
-		return this.collectFilesFromPaths(resolved, resourceType);
+		const patterns = entries.filter(isOverridePattern);
+		const discovered = this.collectSelectedPackagePaths(resolved, resourceType, selectPath);
+		const allFiles: string[] = [];
+		const aliases = new Map<string, Set<string>>();
+		const declarations = discovered.filesBySpelling;
+		const enabled = applyPatterns([...declarations.keys()], patterns, root);
+		// Settings filters have historically consumed force-includes at the end.
+		const order = preserveFilterOrder ? enabled : declarations.keys();
+		const filesBySpelling = new Map<string, string>();
+		for (const spelling of order) {
+			if (!enabled.has(spelling)) continue;
+			const file = declarations.get(spelling)!;
+			filesBySpelling.set(spelling, file);
+			let spellings = aliases.get(file);
+			if (!spellings) {
+				allFiles.push(file);
+				spellings = new Set<string>();
+				aliases.set(file, spellings);
+			}
+			spellings.add(spelling);
+		}
+		return { allFiles, aliases, filesBySpelling };
+	}
+
+	private collectSelectedPackagePaths(
+		resolved: string[],
+		resourceType: ResourceType,
+		selectPath: (path: string) => string,
+		directoriesOnly = false,
+	) {
+		const aliases = new Map<string, Set<string>>();
+		const allFiles = new Set<string>();
+		const filesBySpelling = new Map<string, string>();
+		const rememberAlias = (file: string, alias: string) => {
+			if (!filesBySpelling.has(alias)) filesBySpelling.set(alias, file);
+			const spellings = aliases.get(file) ?? new Set<string>();
+			spellings.add(alias);
+			aliases.set(file, spellings);
+		};
+		for (const original of resolved) {
+			const selected = selectPath(original);
+			if (!selected) continue;
+			if (directoriesOnly) {
+				try {
+					if (!statSync(selected, { throwIfNoEntry: false })?.isDirectory()) continue;
+				} catch {
+					continue;
+				}
+			}
+			const logicalPath = (path: string) =>
+				selected !== original && (path === selected || isPathInside(selected, path))
+					? join(original, relative(selected, path))
+					: path;
+			const rememberDiscoveredAlias = (file: string, alias: string) => {
+				const active = selectPath(file);
+				if (active) rememberAlias(active, logicalPath(alias));
+			};
+			for (const path of this.collectFilesFromPaths(
+				[selected],
+				resourceType,
+				selectPath,
+				rememberDiscoveredAlias,
+				true,
+			)) {
+				const active = selectPath(path);
+				if (existsSync(active)) allFiles.add(active);
+			}
+		}
+		for (const [file, spellings] of aliases) {
+			if (spellings.size === 1 && spellings.has(file)) aliases.delete(file);
+		}
+		for (const [spelling, file] of filesBySpelling) {
+			if (!allFiles.has(file)) filesBySpelling.delete(spelling);
+		}
+		return { allFiles: [...allFiles], aliases, filesBySpelling };
 	}
 
 	private resolveLocalEntries(
@@ -2635,21 +3646,211 @@ export class DefaultPackageManager implements PackageManager {
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
 		baseDir: string,
+		accumulator: ResourceAccumulator,
 	): void {
 		if (entries.length === 0) return;
+		const { gitRevisions } = accumulator;
 
 		// Collect all files from plain entries (non-pattern entries)
 		const { plain, patterns } = splitPatterns(entries);
-		const resolvedPlain = plain.map((p) => this.resolvePathFromBase(p, baseDir));
-		const allFiles = this.collectFilesFromPaths(resolvedPlain, resourceType);
+		const { allFiles, aliases, filesBySpelling } = this.collectSelectedPackagePaths(
+			plain.map((entry) => this.resolvePathFromBase(entry, baseDir)),
+			resourceType,
+			(path) => this.selectConfiguredResource(path, accumulator),
+		);
 
-		// Determine which files are enabled based on patterns
-		const enabledPaths = applyPatterns(allFiles, patterns, baseDir);
+		// pi config saves exact paths relative to the settings directory. Resolve them through
+		// the same revision mapping as declarations, even if they name a different revision.
+		const rules = this.redirectGitExactRules(patterns, baseDir, gitRevisions, aliases);
+		const order = new Map([...filesBySpelling.keys()].map((spelling, index) => [spelling, index]));
+		const rows = allFiles.map((f) => {
+			const spellings = aliases.get(f);
+			const revision = this.withGitRevision(metadata, f, gitRevisions).gitRevision;
+			const matches = (alias?: Set<string>) => {
+				if (!alias || !revision)
+					return applyPatterns([f], rules, baseDir, baseDir, alias ? new Map([[f, alias]]) : undefined).has(f);
+				const spelling = alias.values().next().value!;
+				const candidateRules = this.getDeclarationRules(
+					spelling,
+					revision,
+					patterns,
+					baseDir,
+					gitRevisions,
+					aliases,
+					spellings,
+				);
+				return applyPatterns([spelling], candidateRules, baseDir).has(spelling);
+			};
+			// Before redirection, canonical deduplication keeps the first declaration,
+			// even when disabled. Skip direct duplicates already owned by the package.
+			const existing = target.get(f);
+			const candidates: string[] = [];
+			for (const alias of spellings ?? []) {
+				if (
+					revision &&
+					existing?.metadata.origin === "package" &&
+					(alias === f || !this.isIndependentGitAlias(alias, revision))
+				)
+					continue;
+				candidates.push(alias);
+			}
+			const declaration = chooseResourceAlias(
+				candidates.length ? new Set(distinctExistingAliases(candidates)) : undefined,
+				matches,
+			);
+			return {
+				f,
+				metadata: this.withGitRevision(metadata, f, gitRevisions, declaration.aliases, spellings),
+				enabled: declaration.enabled,
+				rank: order.get(declaration.aliases?.values().next().value ?? f) ?? Number.MAX_SAFE_INTEGER,
+			};
+		});
+		rows.sort((a, b) => a.rank - b.rank);
+		for (const row of rows) this.addResource(target, row.f, row.metadata, row.enabled);
+	}
 
-		// Add all files with their enabled state
-		for (const f of allFiles) {
-			this.addResource(target, f, metadata, enabledPaths.has(f));
+	private getDeclarationRules(
+		spelling: string,
+		revision: NonNullable<PathMetadata["gitRevision"]>,
+		patterns: string[],
+		baseDir: string,
+		gitRevisions: ReadonlyMap<string, string>,
+		aliases: ReadonlyMap<string, Set<string>>,
+		spellings?: ReadonlySet<string>,
+	): string[] {
+		const normalized = selectGitDeclarationPath(spelling, revision);
+		return patterns.flatMap((pattern) => {
+			if (!pattern.startsWith("+") && !pattern.startsWith("-")) {
+				return this.redirectGitExactRules([pattern], baseDir, gitRevisions, aliases);
+			}
+			const rule = pattern.slice(1);
+			if ([...(spellings ?? [])].some((path) => matchesAnyExactPattern(path, [rule], baseDir))) return [pattern];
+			const historical = selectGitDeclarationPath(this.resolvePathFromBase(rule, baseDir), revision);
+			return matchesAnyExactPattern(normalized, [historical], baseDir)
+				? [pattern, `${pattern[0]}${spelling}`]
+				: [pattern];
+		});
+	}
+
+	private redirectGitExactRules(
+		patterns: string[],
+		baseDir: string,
+		gitRevisions: ReadonlyMap<string, string>,
+		declarations?: ReadonlyMap<string, Set<string>>,
+	): string[] {
+		if (gitRevisions.size === 0) return patterns;
+		return patterns.flatMap((pattern) => {
+			if (pattern[0] !== "+" && pattern[0] !== "-" && pattern[0] !== "!") return [pattern];
+			const original = this.resolvePathFromBase(pattern.slice(1), baseDir);
+			const active = this.redirectGitResource(original, gitRevisions);
+			if (declarations?.get(active)?.has(original)) return [pattern];
+			// Keep relative globs relative so literal settings-directory characters do not become glob syntax.
+			const target = pattern[0] === "!" && !isAbsolute(pattern.slice(1)) ? relative(baseDir, active) : active;
+			return active === original ? [pattern] : [pattern, `${pattern[0]}${target}`];
+		});
+	}
+
+	private redirectGitResource(path: string, revisions: ReadonlyMap<string, string>): string {
+		return DefaultPackageManager.selectGitResourcePath(path, revisions);
+	}
+
+	private selectConfiguredResource(path: string, accumulator: ResourceAccumulator): string {
+		return DefaultPackageManager.selectGitResourcePath(
+			path,
+			accumulator.gitRevisions,
+			accumulator.unavailableCheckouts,
+			accumulator.blockedCheckoutFailures,
+		);
+	}
+
+	static selectGitResourcePath(
+		path: string,
+		revisions?: ReadonlyMap<string, string>,
+		unavailableCheckouts?: UnavailableGitCheckouts,
+		blockedCheckoutFailures?: Set<PackageInstallFailure>,
+	): string {
+		if (!revisions?.size && !unavailableCheckouts?.size) return path;
+		const unavailable = (candidate: string, lexicalOnly: boolean) => {
+			for (const [logical, { matchTarget, failure }] of unavailableCheckouts ?? []) {
+				if (redirectGitRevisionPath(candidate, logical, matchTarget, lexicalOnly) !== undefined) {
+					blockedCheckoutFailures?.add(failure);
+					return true;
+				}
+			}
+			return false;
+		};
+		let selected = path;
+		const seen = new Set([path]);
+		// A selected checkout can itself contain a link into another managed checkout.
+		for (let hops = 0; hops < 40; hops++) {
+			let next: string | undefined;
+			// Select the containing revision before following links in a retained checkout.
+			// The empty path means unavailable to filesystem discovery, not a fallback checkout.
+			if (unavailable(selected, true)) return "";
+			for (const [logical, active] of revisions ?? []) {
+				const candidate = redirectGitRevisionPath(selected, logical, active, true);
+				if (candidate !== undefined && candidate !== selected) {
+					next = candidate;
+					break;
+				}
+			}
+			if (next === undefined) {
+				let bestBoundary = Infinity;
+				let blocked: PackageInstallFailure | undefined;
+				for (const [logical, { matchTarget, failure }] of unavailableCheckouts ?? []) {
+					let boundary = bestBoundary;
+					const candidate = redirectGitRevisionPath(selected, logical, matchTarget, false, (position) => {
+						boundary = position;
+					});
+					if (candidate !== undefined && boundary < bestBoundary) {
+						bestBoundary = boundary;
+						blocked = failure;
+					}
+				}
+				for (const [logical, active] of revisions ?? []) {
+					let boundary = bestBoundary;
+					const candidate = redirectGitRevisionPath(selected, logical, active, false, (position) => {
+						boundary = position;
+					});
+					if (candidate !== undefined && candidate !== selected && boundary < bestBoundary) {
+						next = candidate;
+						bestBoundary = boundary;
+						blocked = undefined;
+					}
+				}
+				if (blocked) {
+					blockedCheckoutFailures?.add(blocked);
+					return "";
+				}
+			}
+			if (next === undefined) return selected;
+			if (seen.has(next)) break;
+			seen.add(next);
+			selected = next;
 		}
+		return unavailable(selected, false) ? "" : selected;
+	}
+
+	private withGitRevision(
+		metadata: PathMetadata,
+		path: string,
+		revisions: ReadonlyMap<string, string>,
+		aliases?: ReadonlySet<string>,
+		declarations?: ReadonlySet<string>,
+	): PathMetadata {
+		for (const [logical, active] of revisions) {
+			if (isPathInside(active, path))
+				return {
+					...metadata,
+					gitRevision: {
+						logical,
+						active,
+						aliases: aliases && [...aliases],
+						declarations: declarations && [...declarations],
+					},
+				};
+		}
+		return metadata;
 	}
 
 	private addAutoDiscoveredResources(
@@ -2703,6 +3904,25 @@ export class DefaultPackageManager implements PackageManager {
 			? collectAncestorAgentsSkillDirs(this.cwd).filter((dir) => !pathsEqual(dir, userAgentsSkillsDir))
 			: [];
 
+		const selectPath = (path: string) => this.selectConfiguredResource(path, accumulator);
+		const aliases = new Map<string, Set<string>>();
+		const rememberAlias = (file: string, alias: string) => {
+			const spellings = aliases.get(file) ?? new Set<string>();
+			spellings.add(alias);
+			aliases.set(file, spellings);
+		};
+		const discoverSkills = (original: string, mode: SkillDiscoveryMode) =>
+			collectSkillEntries(selectPath(original), mode, undefined, original, { selectPath, rememberAlias }, original);
+		const discoverAtSelectedRoot = (original: string, collect: typeof collectAutoPromptEntries) => {
+			const selected = selectPath(original);
+			const paths = collect(selected, selectPath);
+			if (selected !== original) {
+				for (const path of paths) {
+					if (isPathInside(selected, path)) rememberAlias(path, join(original, relative(selected, path)));
+				}
+			}
+			return paths;
+		};
 		const addResources = (
 			resourceType: ResourceType,
 			paths: string[],
@@ -2711,17 +3931,52 @@ export class DefaultPackageManager implements PackageManager {
 			baseDir: string,
 		) => {
 			const target = this.getTargetMap(accumulator, resourceType);
+			const discovered = new Map<string, Set<string>>();
 			for (const path of paths) {
-				const enabled = isEnabledByOverrides(path, overrides, baseDir);
-				this.addResource(target, path, metadata, enabled);
+				const active = selectPath(path);
+				if (active !== path && !existsSync(active)) continue;
+				const spellings = discovered.get(active) ?? new Set<string>();
+				if (path !== active) spellings.add(path);
+				for (const alias of aliases.get(path) ?? []) spellings.add(alias);
+				discovered.set(active, spellings);
 			}
+			const rules = this.redirectGitExactRules(overrides, baseDir, accumulator.gitRevisions, discovered);
+			for (const [active, spellings] of discovered) {
+				const revision = this.withGitRevision(metadata, active, accumulator.gitRevisions).gitRevision;
+				const declaration = chooseResourceAlias(new Set(distinctExistingAliases([...spellings])), (alias) => {
+					if (!alias || !revision) return isEnabledByOverrides(active, rules, baseDir, alias);
+					const spelling = alias.values().next().value!;
+					return isEnabledByOverrides(
+						spelling,
+						this.getDeclarationRules(
+							spelling,
+							revision,
+							overrides,
+							baseDir,
+							accumulator.gitRevisions,
+							discovered,
+							spellings,
+						),
+						baseDir,
+						[],
+						selectGitDeclarationPath(spelling, revision),
+					);
+				});
+				this.addResource(
+					target,
+					active,
+					this.withGitRevision(metadata, active, accumulator.gitRevisions, declaration.aliases, spellings),
+					declaration.enabled,
+				);
+			}
+			aliases.clear();
 		};
 
 		if (projectTrusted) {
 			// Project extensions from .pi/
 			addResources(
 				"extensions",
-				collectAutoExtensionEntries(projectDirs.extensions),
+				collectAutoExtensionEntries(projectDirs.extensions, selectPath, rememberAlias),
 				projectMetadata,
 				projectOverrides.extensions,
 				projectBaseDir,
@@ -2730,7 +3985,7 @@ export class DefaultPackageManager implements PackageManager {
 			// Project skills from .pi/
 			addResources(
 				"skills",
-				collectAutoSkillEntries(projectDirs.skills, "pi"),
+				discoverSkills(projectDirs.skills, "pi"),
 				projectMetadata,
 				projectOverrides.skills,
 				projectBaseDir,
@@ -2746,7 +4001,7 @@ export class DefaultPackageManager implements PackageManager {
 			};
 			addResources(
 				"skills",
-				collectAutoSkillEntries(agentsSkillsDir, "agents"),
+				discoverSkills(agentsSkillsDir, "agents"),
 				agentsMetadata,
 				projectOverrides.skills,
 				agentsBaseDir,
@@ -2756,14 +4011,14 @@ export class DefaultPackageManager implements PackageManager {
 		if (projectTrusted) {
 			addResources(
 				"prompts",
-				collectAutoPromptEntries(projectDirs.prompts),
+				discoverAtSelectedRoot(projectDirs.prompts, collectAutoPromptEntries),
 				projectMetadata,
 				projectOverrides.prompts,
 				projectBaseDir,
 			);
 			addResources(
 				"themes",
-				collectAutoThemeEntries(projectDirs.themes),
+				discoverAtSelectedRoot(projectDirs.themes, collectAutoThemeEntries),
 				projectMetadata,
 				projectOverrides.themes,
 				projectBaseDir,
@@ -2773,20 +4028,14 @@ export class DefaultPackageManager implements PackageManager {
 		// User extensions from ~/.pi/agent/
 		addResources(
 			"extensions",
-			collectAutoExtensionEntries(userDirs.extensions),
+			collectAutoExtensionEntries(userDirs.extensions, selectPath, rememberAlias),
 			userMetadata,
 			userOverrides.extensions,
 			globalBaseDir,
 		);
 
 		// User skills from ~/.pi/agent/
-		addResources(
-			"skills",
-			collectAutoSkillEntries(userDirs.skills, "pi"),
-			userMetadata,
-			userOverrides.skills,
-			globalBaseDir,
-		);
+		addResources("skills", discoverSkills(userDirs.skills, "pi"), userMetadata, userOverrides.skills, globalBaseDir);
 
 		// User skills from ~/.agents/ (with its own baseDir)
 		const userAgentsBaseDir = dirname(userAgentsSkillsDir);
@@ -2796,7 +4045,7 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		addResources(
 			"skills",
-			collectAutoSkillEntries(userAgentsSkillsDir, "agents"),
+			discoverSkills(userAgentsSkillsDir, "agents"),
 			userAgentsMetadata,
 			userOverrides.skills,
 			userAgentsBaseDir,
@@ -2804,21 +4053,27 @@ export class DefaultPackageManager implements PackageManager {
 
 		addResources(
 			"prompts",
-			collectAutoPromptEntries(userDirs.prompts),
+			discoverAtSelectedRoot(userDirs.prompts, collectAutoPromptEntries),
 			userMetadata,
 			userOverrides.prompts,
 			globalBaseDir,
 		);
 		addResources(
 			"themes",
-			collectAutoThemeEntries(userDirs.themes),
+			discoverAtSelectedRoot(userDirs.themes, collectAutoThemeEntries),
 			userMetadata,
 			userOverrides.themes,
 			globalBaseDir,
 		);
 	}
 
-	private collectFilesFromPaths(paths: string[], resourceType: ResourceType): string[] {
+	private collectFilesFromPaths(
+		paths: string[],
+		resourceType: ResourceType,
+		selectPath?: (path: string) => string,
+		rememberAlias?: (file: string, alias: string) => void,
+		recordDirect = false,
+	): string[] {
 		const files: string[] = [];
 		for (const p of paths) {
 			if (!existsSync(p)) continue;
@@ -2827,8 +4082,25 @@ export class DefaultPackageManager implements PackageManager {
 				const stats = statSync(p);
 				if (stats.isFile()) {
 					files.push(p);
+					if (recordDirect) rememberAlias?.(p, p);
 				} else if (stats.isDirectory()) {
-					files.push(...collectResourceFiles(p, resourceType));
+					if (!selectPath || !rememberAlias) {
+						files.push(...collectResourceFiles(p, resourceType));
+					} else if (resourceType === "extensions") {
+						files.push(...collectAutoExtensionEntries(p, selectPath, rememberAlias, recordDirect));
+					} else if (resourceType === "skills") {
+						files.push(
+							...collectSkillEntries(p, "pi", undefined, undefined, { selectPath, rememberAlias, recordDirect }),
+						);
+					} else {
+						files.push(
+							...collectFiles(p, FILE_PATTERNS[resourceType], true, undefined, undefined, {
+								selectPath,
+								rememberAlias,
+								recordDirect,
+							}),
+						);
+					}
 				}
 			} catch {
 				// Ignore errors
@@ -2855,6 +4127,29 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
+	private isIndependentGitAlias(path: string, revision: NonNullable<PathMetadata["gitRevision"]>): boolean {
+		for (let component = path; dirname(component) !== component; component = dirname(component)) {
+			try {
+				if (!lstatSync(component, { throwIfNoEntry: false })?.isSymbolicLink()) continue;
+				if (component === path) return true;
+				// A link to the checkout or a directory inside it adds another declaration.
+				// An alias of its storage parent just re-spells the same checkout path.
+				if (
+					redirectGitRevisionPath(
+						canonicalizePath(component),
+						canonicalizePath(revision.logical),
+						revision.active,
+						true,
+					)
+				)
+					return true;
+			} catch {
+				// An inaccessible component does not prove a separate alias.
+			}
+		}
+		return false;
+	}
+
 	private addResource(
 		map: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		path: string,
@@ -2862,13 +4157,28 @@ export class DefaultPackageManager implements PackageManager {
 		enabled: boolean,
 	): void {
 		if (!path) return;
-		if (!map.has(path)) {
+		const existing = map.get(path);
+		const revision = metadata.gitRevision;
+		// Selection can collapse distinct spellings before canonical precedence runs.
+		// An independent auto-discovered alias keeps its own enablement. A plain
+		// configured declaration still does not undo an explicit package exclusion.
+		if (
+			!existing ||
+			(metadata.origin === "top-level" &&
+				revision?.aliases?.some((alias) => alias !== path && this.isIndependentGitAlias(alias, revision)) &&
+				resourcePrecedenceRank(metadata) < resourcePrecedenceRank(existing.metadata))
+		) {
+			// A replacement takes its position from the winning declaration, not the displaced row.
+			if (existing) map.delete(path);
 			map.set(path, { metadata, enabled });
 		}
 	}
 
 	private createAccumulator(): ResourceAccumulator {
 		return {
+			gitRevisions: new Map(),
+			unavailableCheckouts: new Map(),
+			blockedCheckoutFailures: new Set(),
 			extensions: new Map(),
 			skills: new Map(),
 			prompts: new Map(),

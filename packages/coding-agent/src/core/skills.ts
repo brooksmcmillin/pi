@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "fs";
 import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
@@ -44,8 +44,8 @@ function prefixIgnorePattern(line: string, prefix: string): string | null {
 	return negated ? `!${prefixed}` : prefixed;
 }
 
-function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
-	const relativeDir = relative(rootDir, dir);
+function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string, logicalDir = dir): void {
+	const relativeDir = relative(rootDir, logicalDir);
 	const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
 
 	for (const filename of IGNORE_FILE_NAMES) {
@@ -176,6 +176,9 @@ function loadSkillsFromDirInternal(
 	includeRootFiles: boolean,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	selectPath = (path: string) => path,
+	logicalDir = dir,
+	ancestors: ReadonlySet<string> = new Set(),
 ): LoadSkillsResult {
 	const skills: Skill[] = [];
 	const diagnostics: ResourceDiagnostic[] = [];
@@ -184,11 +187,14 @@ function loadSkillsFromDirInternal(
 		return { skills, diagnostics };
 	}
 
-	const root = rootDir ?? dir;
+	const root = rootDir ?? logicalDir;
 	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	addIgnoreRules(ig, dir, root, logicalDir);
 
 	try {
+		const identity = realpathSync(dir);
+		if (ancestors.has(identity)) return { skills, diagnostics };
+		const branch = new Set([...ancestors, identity]);
 		const entries = readdirSync(dir, { withFileTypes: true });
 
 		for (const entry of entries) {
@@ -196,7 +202,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const fullPath = join(dir, entry.name);
+			const fullPath = selectPath(join(dir, entry.name));
 
 			let isFile = entry.isFile();
 			if (entry.isSymbolicLink()) {
@@ -207,12 +213,12 @@ function loadSkillsFromDirInternal(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const relPath = toPosixPath(relative(root, join(logicalDir, entry.name)));
 			if (!isFile || ig.ignores(relPath)) {
 				continue;
 			}
 
-			const result = loadSkillFromFile(fullPath, source);
+			const result = loadSkillFromFile(fullPath, source, join(logicalDir, entry.name));
 			if (result.skill) {
 				skills.push(result.skill);
 			}
@@ -230,7 +236,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const fullPath = join(dir, entry.name);
+			const fullPath = selectPath(join(dir, entry.name));
 
 			// For symlinks, check if they point to a directory and follow them
 			let isDirectory = entry.isDirectory();
@@ -246,14 +252,23 @@ function loadSkillsFromDirInternal(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
+			const relPath = toPosixPath(relative(root, join(logicalDir, entry.name)));
 			const ignorePath = isDirectory ? `${relPath}/` : relPath;
 			if (ig.ignores(ignorePath)) {
 				continue;
 			}
 
 			if (isDirectory) {
-				const subResult = loadSkillsFromDirInternal(fullPath, source, false, ig, root);
+				const subResult = loadSkillsFromDirInternal(
+					fullPath,
+					source,
+					false,
+					ig,
+					root,
+					selectPath,
+					join(logicalDir, entry.name),
+					branch,
+				);
 				skills.push(...subResult.skills);
 				diagnostics.push(...subResult.diagnostics);
 				continue;
@@ -263,7 +278,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const result = loadSkillFromFile(fullPath, source);
+			const result = loadSkillFromFile(fullPath, source, join(logicalDir, entry.name));
 			if (result.skill) {
 				skills.push(result.skill);
 			}
@@ -277,9 +292,10 @@ function loadSkillsFromDirInternal(
 function loadSkillFromFile(
 	filePath: string,
 	source: string,
+	declarationPath = filePath,
 ): { skill: Skill | null; diagnostics: ResourceDiagnostic[] } {
 	const diagnostics: ResourceDiagnostic[] = [];
-	const isDeclaredSkill = basename(filePath) === "SKILL.md";
+	const isDeclaredSkill = basename(declarationPath) === "SKILL.md";
 
 	let rawContent: string;
 	try {
@@ -308,7 +324,7 @@ function loadSkillFromFile(
 	}
 
 	const skillDir = dirname(filePath);
-	const parentDirName = basename(skillDir);
+	const parentDirName = basename(dirname(declarationPath));
 
 	// Validate description
 	const descErrors = validateDescription(description);
@@ -403,6 +419,8 @@ export interface LoadSkillsOptions {
 	agentDir: string;
 	/** Explicit skill paths (files or directories) */
 	skillPaths: string[];
+	selectPathForRoot?: (root: string) => ((path: string) => string) | undefined;
+	getDiscoveredPath?: (filePath: string) => string | undefined;
 	/** Include default skills directories. */
 	includeDefaults: boolean;
 }
@@ -471,7 +489,9 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	};
 
 	for (const rawPath of skillPaths) {
-		const resolvedPath = resolvePath(rawPath, resolvedCwd, { trim: true });
+		const original = resolvePath(rawPath, resolvedCwd, { trim: true });
+		const selectPath = options.selectPathForRoot?.(original);
+		const resolvedPath = selectPath?.(original) ?? original;
 		if (!existsSync(resolvedPath)) {
 			allDiagnostics.push({ type: "warning", message: "skill path does not exist", path: resolvedPath });
 			continue;
@@ -480,10 +500,13 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 		try {
 			const stats = statSync(resolvedPath);
 			const source = getSource(resolvedPath);
+			const declarationPath = (selectPath ? undefined : options.getDiscoveredPath?.(resolvedPath)) ?? original;
 			if (stats.isDirectory()) {
-				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true));
-			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
-				const result = loadSkillFromFile(resolvedPath, source);
+				addSkills(
+					loadSkillsFromDirInternal(resolvedPath, source, true, undefined, undefined, selectPath, declarationPath),
+				);
+			} else if (stats.isFile() && declarationPath.endsWith(".md")) {
+				const result = loadSkillFromFile(resolvedPath, source, declarationPath);
 				if (result.skill) {
 					addSkills({ skills: [result.skill], diagnostics: result.diagnostics });
 				} else {

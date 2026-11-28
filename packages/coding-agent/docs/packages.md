@@ -18,6 +18,14 @@ pi install ./local-package
 
 If a configured package fails to install at startup, for example because npm cannot reach the registry, Pi warns about it, skips that package's resources, and keeps running. Pi tries to install it again on the next start or `/reload`. `pi install` and `pi update --extensions` still report the failure and exit non-zero.
 
+When a Git package changes revision or Pi rebuilds a checkout left incomplete by an older updater, Pi prepares the checkout and its dependencies beside the installed package. Pi then switches which checkout it loads without moving either checkout. This preserves absolute paths written by install scripts. If preparation or the switch fails, Pi still loads the previous checkout. Repairing missing dependencies at the same revision instead runs in the selected checkout. Older checkouts are retained for running sessions and removed when you uninstall a configured package. For temporary `-e` packages, you can clear `~/.pi/agent/tmp/extensions/` once all sessions using that cache have exited.
+
+If a configured Git package's revision pointer is invalid, Pi reports the failure and skips configured resources that resolve into that package's retained checkouts. Unrelated resources still load.
+
+For directory extensions, Pi applies checkout selection to the entry file found by the existing module resolver. It does not recover a missing `main` that the resolver cannot find, or change how imports made by the extension are resolved.
+
+Staged updates support ordinary Pi-managed clones with a standalone `.git` directory and no symlinks inside that directory. Do not share a checkout across distinct managed Git roots. Use a local package declaration for checkouts you manage yourself.
+
 Personal installs are written to `~/.pi/agent/settings.json`. Add `--local` or `-l` to write the package declaration to `.pi/settings.json`. Pi reads declarations from that file only after project trust is granted.
 
 Project packages are installed and loaded only after project trust is resolved. Packages can execute extension code and can include skills that instruct the model to run programs. Review third-party package source before installing it. Review project package declarations before granting project trust.
@@ -28,7 +36,7 @@ Use `--extension` or `-e` to try a package for one invocation without adding it 
 pi -e npm:@example/pi-tools
 ```
 
-Pi caches `-e` packages under `~/.pi/agent/tmp/extensions/` and checks them on every start and `/reload`. An npm package is reinstalled when the registry has a newer version that matches the specification. A version pinned to an exact number, such as `@1.2.3`, is not checked. A git package is fetched and reset to the remote branch or ref. A ref that is a commit hash already checked out is not fetched. If the check fails or offline mode is on, Pi loads the cached copy.
+Pi caches `-e` packages under `~/.pi/agent/tmp/extensions/` and checks them on every start and `/reload`. An npm package is reinstalled when the registry has a newer version that matches the specification. A version pinned to an exact number, such as `@1.2.3`, is not checked. For a Git package, Pi fetches the requested branch or ref and selects a prepared checkout when the revision changes. A ref that is a commit hash already checked out is not fetched. If the check fails or offline mode is on, Pi loads the cached copy.
 
 ## Choose a source
 

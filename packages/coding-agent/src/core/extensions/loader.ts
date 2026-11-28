@@ -591,8 +591,13 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
-async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
-	if (isCurrentCacheToken(cacheToken)) {
+async function loadExtensionModule(
+	extensionPath: string,
+	cacheToken?: ExtensionCacheToken,
+	selectDirectoryEntry?: (entry: string) => string,
+) {
+	const checkEntry = selectDirectoryEntry && fs.statSync(extensionPath, { throwIfNoEntry: false })?.isDirectory();
+	if (!checkEntry && isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
 		if (cachedFactory) {
 			return cachedFactory;
@@ -613,13 +618,23 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		...resolutionOptions,
 	});
 
-	const module = await jiti.import(canonicalizePath(extensionPath), { default: true });
+	let importPath = canonicalizePath(extensionPath);
+	if (checkEntry) {
+		const entry = jiti.esmResolve(importPath);
+		importPath = selectDirectoryEntry(entry.startsWith("file:") ? fileURLToPath(entry) : entry);
+		if (!importPath) return null;
+		if (isCurrentCacheToken(cacheToken)) {
+			const cachedFactory = extensionCache.get(importPath);
+			if (cachedFactory) return cachedFactory;
+		}
+	}
+	const module = await jiti.import(importPath, { default: true });
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;
 	}
 	if (isCurrentCacheToken(cacheToken)) {
-		extensionCache.set(extensionPath, factory);
+		extensionCache.set(checkEntry ? importPath : extensionPath, factory);
 	}
 	return factory;
 }
@@ -672,11 +687,13 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
+	selectDirectoryEntry?: (entry: string) => string,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
 	try {
-		const factory = await loadExtensionModule(resolvedPath, cacheToken);
+		const factory = await loadExtensionModule(resolvedPath, cacheToken, selectDirectoryEntry);
+		if (factory === null) return { extension: null, error: null };
 		time(`${extensionPath} module import`, "extensions");
 		if (!factory) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
@@ -714,6 +731,7 @@ async function loadExtensionsInternal(
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
 	useCache = false,
+	selectDirectoryEntry?: (entry: string) => string,
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
@@ -730,6 +748,7 @@ async function loadExtensionsInternal(
 			resolvedEventBus,
 			resolvedRuntime,
 			cacheToken,
+			selectDirectoryEntry,
 		);
 
 		if (error) {
@@ -764,8 +783,9 @@ export async function loadExtensionsCached(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
+	selectDirectoryEntry?: (entry: string) => string,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true, selectDirectoryEntry);
 }
 
 function isExtensionFile(name: string): boolean {
