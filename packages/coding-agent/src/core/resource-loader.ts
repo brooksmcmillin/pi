@@ -659,28 +659,22 @@ export class DefaultResourceLoader implements ResourceLoader {
 		);
 
 		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
-		const directoryFailures = new Set<PackageInstallFailure>();
+		const selectionFailures = new Set<PackageInstallFailure>();
 		const extensionsResult = await this.loadFinalExtensionSet(
 			extensionPaths,
 			preTrustExtensions,
-			this.getDirectoryEntrySelector(resolvedPaths, directoryFailures),
+			this.getDirectoryEntrySelector(resolvedPaths, selectionFailures),
 		);
-		mergeExtensionWarnings(extensionsResult, [
-			...installWarnings,
-			...packageWarnings,
-			...collectPackageInstallWarnings([...directoryFailures]),
-		]);
 		for (const path of cliExtensionPaths.missingLocalPaths ?? []) {
 			extensionsResult.errors.push({ path, error: `Extension path does not exist: ${path}` });
 		}
-		this.extensionsResult = this.extensionsOverride ? this.extensionsOverride(extensionsResult) : extensionsResult;
-		this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
 		const selectExplicitPath = (source: string) =>
 			DefaultPackageManager.selectGitResourcePath(
 				this.resolveResourcePath(source),
 				resolvedPaths.gitRevisions,
 				resolvedPaths.unavailableCheckouts,
+				selectionFailures,
 			);
 		const selector = (explicit: string[], discovered: string[]) => {
 			const explicitRoots = new Set(explicit.map((path) => this.resolveResourcePath(path)));
@@ -744,6 +738,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 				this.themeDiagnostics.push({ type: "error", message: "Theme path does not exist", path: resolved });
 			}
 		}
+
+		mergeExtensionWarnings(extensionsResult, [
+			...installWarnings,
+			...packageWarnings,
+			...collectPackageInstallWarnings([...selectionFailures]),
+		]);
+		this.extensionsResult = this.extensionsOverride ? this.extensionsOverride(extensionsResult) : extensionsResult;
+		this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
 		const agentsFiles = {
 			agentsFiles: this.noContextFiles
@@ -1317,6 +1319,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		try {
 			const entries = readdirSync(dir, { withFileTypes: true });
 			for (const entry of entries) {
+				if (!entry.name.endsWith(".json")) continue;
 				const selected = selectPath(join(dir, entry.name));
 				let isFile = entry.isFile();
 				if (entry.isSymbolicLink()) {
@@ -1327,9 +1330,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 					}
 				}
 				if (!isFile) {
-					continue;
-				}
-				if (!entry.name.endsWith(".json")) {
 					continue;
 				}
 				this.loadThemeFromFile(selected, themes, diagnostics, colorMode);

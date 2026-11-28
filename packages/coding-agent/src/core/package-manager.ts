@@ -1000,7 +1000,7 @@ export function redirectGitRevisionPath(
 	logical: string,
 	active: string,
 	directOnly = false,
-	onBoundary?: (prefixLength: number) => void,
+	onBoundary?: (hop: number) => void,
 ): string | undefined {
 	function select(candidate: string, root: string): string | undefined {
 		// Windows path.relative folds case even on case-sensitive directories. Only
@@ -1037,66 +1037,34 @@ export function redirectGitRevisionPath(
 		}
 	}
 
-	function selectAncestor(candidate: string, root: string) {
-		let result: { selected: string; boundary: number } | undefined;
-		for (let ancestor = dirname(candidate); ; ancestor = dirname(ancestor)) {
-			const canonical = canonicalizePath(ancestor);
-			// An outer checkout alias takes precedence over symlinks inside the old checkout.
-			const match = select(join(canonical, candidate.slice(ancestor.length)), root);
-			if (match !== undefined && match !== candidate) result = { selected: match, boundary: ancestor.length };
-			if (dirname(ancestor) === ancestor) return result;
-		}
-	}
-
-	function selectPath(candidate: string): string | undefined {
-		const direct = select(candidate, logical);
-		if (direct && (direct !== candidate || logical === active)) return direct;
-		// A path already in the selected checkout can still be a link into a retained copy.
-		const root = canonicalizePath(logical);
-		const canonicalCandidate = canonicalizePath(candidate);
-		let selected = select(canonicalCandidate, root);
-		let boundary = candidate.length;
-		// Rank earlier file-link hops ahead of the final canonical path, but after directory aliases.
-		if (canonicalCandidate !== candidate || !existsSync(candidate)) {
-			let link = candidate;
-			const visited = new Set([link]);
-			for (let hop = 0; hop < 40; hop++) {
-				const target = readLinkTarget(link);
-				if (!target || visited.has(target)) break;
-				const match = select(target, root) ?? selectAncestor(target, root)?.selected;
-				if (match && match !== candidate) {
-					selected = match;
-					boundary -= 1 / (hop + 2);
-					break;
-				}
-				visited.add(target);
-				link = target;
-			}
-		}
-		const ancestor = selectAncestor(candidate, root);
-		if (ancestor) ({ selected, boundary } = ancestor);
-		if (selected === candidate) return undefined;
-		if (selected && candidate === path) onBoundary?.(boundary);
-		return selected;
-	}
-
+	const root = canonicalizePath(logical);
 	const seen = new Set<string>();
 	let candidate = path;
-	// Bound even cycles that grow the remaining suffix at each hop.
-	for (let hops = 0; hops < 40 && !seen.has(candidate); hops++) {
+	// Check the checkout at each hop before following links inside its retained revision.
+	const maxHops = 40;
+	for (let hop = 0; hop <= maxHops && !seen.has(candidate); hop++) {
 		seen.add(candidate);
-		const selected = selectPath(candidate);
-		if (selected || existsSync(candidate)) return selected;
-		// A dangling link may be an ancestor of the requested file.
+		const selected = select(candidate, logical) ?? select(candidate, root);
+		if (selected !== undefined && (selected !== candidate || logical === active)) {
+			onBoundary?.(hop);
+			return selected;
+		}
+		if (hop === maxHops) break;
+		const prefixes: string[] = [];
+		for (let prefix = candidate; dirname(prefix) !== prefix; prefix = dirname(prefix)) prefixes.push(prefix);
 		let next: string | undefined;
-		for (let component = candidate; dirname(component) !== component; component = dirname(component)) {
-			const target = readLinkTarget(component);
-			if (target) {
-				next = join(target, candidate.slice(component.length));
+		for (const prefix of prefixes.reverse()) {
+			const target = readLinkTarget(prefix);
+			if (target !== undefined) {
+				next = join(target, candidate.slice(prefix.length));
 				break;
 			}
 		}
-		if (!next) return undefined;
+		if (next === undefined) {
+			const canonical = select(canonicalizePath(candidate), root);
+			if (canonical !== undefined && canonical !== candidate) onBoundary?.(hop);
+			return canonical === candidate ? undefined : canonical;
+		}
 		candidate = next;
 	}
 	return undefined;
@@ -1554,11 +1522,13 @@ export class DefaultPackageManager implements PackageManager {
 			missingLocalPaths,
 			options?.temporaryGit ? { checkouts: new Map(options.temporaryGit.checkouts), preparing: false } : undefined,
 		);
-		return {
-			...this.toResolvedPaths(accumulator),
-			installFailures: [...(options?.temporaryGit?.installFailures ?? []), ...installFailures],
-			missingLocalPaths,
-		};
+		const failures = [...(options?.temporaryGit?.installFailures ?? []), ...installFailures];
+		for (const failure of accumulator.blockedCheckoutFailures) {
+			if (!failures.some(({ source, scope }) => source === failure.source && scope === failure.scope)) {
+				failures.push(failure);
+			}
+		}
+		return { ...this.toResolvedPaths(accumulator), installFailures: failures, missingLocalPaths };
 	}
 
 	listConfiguredPackages(): ConfiguredPackage[] {
@@ -3825,12 +3795,12 @@ export class DefaultPackageManager implements PackageManager {
 				}
 			}
 			if (next === undefined) {
-				let bestBoundary = Number.POSITIVE_INFINITY;
+				let bestBoundary = Infinity;
 				let blocked: PackageInstallFailure | undefined;
 				for (const [logical, { matchTarget, failure }] of unavailableCheckouts ?? []) {
-					let boundary = Number.MAX_SAFE_INTEGER;
-					const candidate = redirectGitRevisionPath(selected, logical, matchTarget, false, (length) => {
-						boundary = length;
+					let boundary = bestBoundary;
+					const candidate = redirectGitRevisionPath(selected, logical, matchTarget, false, (position) => {
+						boundary = position;
 					});
 					if (candidate !== undefined && boundary < bestBoundary) {
 						bestBoundary = boundary;
@@ -3838,9 +3808,9 @@ export class DefaultPackageManager implements PackageManager {
 					}
 				}
 				for (const [logical, active] of revisions ?? []) {
-					let boundary = Number.MAX_SAFE_INTEGER;
-					const candidate = redirectGitRevisionPath(selected, logical, active, false, (length) => {
-						boundary = length;
+					let boundary = bestBoundary;
+					const candidate = redirectGitRevisionPath(selected, logical, active, false, (position) => {
+						boundary = position;
 					});
 					if (candidate !== undefined && candidate !== selected && boundary < bestBoundary) {
 						next = candidate;

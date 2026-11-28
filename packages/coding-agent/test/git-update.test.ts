@@ -2681,33 +2681,70 @@ describe("DefaultPackageManager git update", () => {
 		).toHaveLength(1);
 	});
 
-	it("warns once when a directory entry reaches a shadowed invalid checkout", async () => {
-		setupRemoteAndInstall();
-		mkdirSync(join(remoteDir, "extensions"));
-		createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add project extension");
-		const projectCheckout = join(tempDir, ".pi", "git", "github.com", "test", "extension");
-		mkdirSync(dirname(projectCheckout), { recursive: true });
-		git(["clone", remoteDir, projectCheckout], tempDir);
-		const directory = join(tempDir, "bare-extension");
-		mkdirSync(directory);
-		writeFileSync(join(directory, "package.json"), JSON.stringify({ main: "entry.ts" }));
-		symlinkSync(join(installedDir, "extension.ts"), join(directory, "entry.ts"), "file");
-		const manager = packageManager as unknown as { getGitUpdateStatePath(path: string, scope: string): string };
-		const pointer = `${manager.getGitUpdateStatePath(installedDir, "user")}.current`;
-		mkdirSync(dirname(pointer), { recursive: true });
-		writeFileSync(pointer, "invalid");
-		settingsManager.setPackages([directory, gitSource]);
-		settingsManager.setProjectPackages([gitSource]);
-		expect((await packageManager.resolve()).installFailures).toEqual([]);
-		const loader = new DefaultResourceLoader({ cwd: tempDir, agentDir, settingsManager });
-		await loader.reload();
-		const result = loader.getExtensions();
-		expect(result.extensions.map(({ path }) => path)).toEqual([join(projectCheckout, "extensions", "worker.ts")]);
-		expect(result.errors).toEqual([]);
-		expect(result.warnings).toEqual([
-			{ path: gitSource, warning: expect.stringContaining("Invalid Git revision pointer") },
-		]);
-	});
+	it.each(["directory entry", "CLI extension", "explicit resources", "ignored entries"])(
+		"reports relevant checkout warnings for %s with a shadowed invalid checkout",
+		async (kind) => {
+			setupRemoteAndInstall();
+			mkdirSync(join(remoteDir, "extensions"));
+			createCommit(remoteDir, "extensions/worker.ts", "export default function() {}", "Add project extension");
+			const projectCheckout = join(tempDir, ".pi", "git", "github.com", "test", "extension");
+			mkdirSync(dirname(projectCheckout), { recursive: true });
+			git(["clone", remoteDir, projectCheckout], tempDir);
+			const directory = join(tempDir, "bare-extension");
+			mkdirSync(directory);
+			writeFileSync(join(directory, "package.json"), JSON.stringify({ main: "entry.ts" }));
+			symlinkSync(join(installedDir, "extension.ts"), join(directory, "entry.ts"), "file");
+			const manager = packageManager as unknown as { getGitUpdateStatePath(path: string, scope: string): string };
+			const pointer = `${manager.getGitUpdateStatePath(installedDir, "user")}.current`;
+			mkdirSync(dirname(pointer), { recursive: true });
+			writeFileSync(pointer, "invalid");
+			settingsManager.setPackages(kind === "directory entry" ? [directory, gitSource] : [gitSource]);
+			settingsManager.setProjectPackages([gitSource]);
+			expect((await packageManager.resolve()).installFailures).toEqual([]);
+			const explicit = kind === "explicit resources";
+			const ignored = kind === "ignored entries";
+			const retained = join(installedDir, "retained.md");
+			const promptDir = join(tempDir, "explicit-prompts");
+			const healthy = join(promptDir, "healthy.md");
+			mkdirSync(promptDir);
+			writeFileSync(retained, "---\nname: retained\ndescription: Test skill\n---\nRetained content");
+			writeFileSync(healthy, "Healthy prompt");
+			symlinkSync(retained, join(promptDir, ignored ? "ignored.txt" : "retained.md"), "file");
+			const theme = join(installedDir, "retained.json");
+			const themeDir = join(tempDir, "explicit-themes");
+			mkdirSync(themeDir);
+			const healthyTheme = join(themeDir, "healthy.json");
+			const themeContent = readFileSync(join(process.cwd(), "src/modes/interactive/theme/dark.json"), "utf8");
+			writeFileSync(theme, themeContent);
+			writeFileSync(healthyTheme, JSON.stringify({ ...JSON.parse(themeContent), name: "healthy" }));
+			symlinkSync(theme, join(themeDir, "ignored.txt"), "file");
+			const loader = new DefaultResourceLoader({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+				additionalExtensionPaths: kind === "CLI extension" ? [join(installedDir, "extension.ts")] : [],
+				additionalSkillPaths: explicit ? [retained] : [],
+				additionalPromptTemplatePaths: explicit || ignored ? [promptDir] : [],
+				additionalThemePaths: explicit ? [theme] : ignored ? [themeDir] : [],
+			});
+			await loader.reload();
+			if (explicit) {
+				expect(loader.getSkills().skills.map(({ filePath }) => filePath)).not.toContain(retained);
+				expect(loader.getPrompts().prompts.map(({ name }) => name)).toEqual(["healthy"]);
+				expect(loader.getThemes().themes.map(({ sourcePath }) => sourcePath)).not.toContain(theme);
+			}
+			if (ignored) {
+				expect(loader.getPrompts().prompts.map(({ name }) => name)).toEqual(["healthy"]);
+				expect(loader.getThemes().themes.map(({ sourcePath }) => sourcePath)).toContain(healthyTheme);
+			}
+			const result = loader.getExtensions();
+			expect(result.extensions.map(({ path }) => path)).toEqual([join(projectCheckout, "extensions", "worker.ts")]);
+			expect(result.errors).toEqual([]);
+			expect(result.warnings ?? []).toEqual(
+				ignored ? [] : [{ path: gitSource, warning: expect.stringContaining("Invalid Git revision pointer") }],
+			);
+		},
+	);
 
 	it.each([false, true])("checks the resolved directory extension entry (invalid pointer: %s)", async (invalid) => {
 		setupRemoteAndInstall();
@@ -2832,6 +2869,21 @@ describe("DefaultPackageManager git update", () => {
 				symlinkSync(join(externalAlias, "explicit.ts"), intermediate, "file");
 				const mixed = await packageManager.resolve();
 				expect(mixed.extensions.map(({ path }) => path)).toContain(selectedExplicit);
+
+				symlinkSync(other, join(installedDir, "nested"), "dir");
+				const replacement = join(active, "nested", "extension.ts");
+				mkdirSync(dirname(replacement));
+				writeFileSync(replacement, "export default function() {}");
+				rmSync(intermediate);
+				symlinkSync(join(externalAlias, "nested", "extension.ts"), intermediate, "file");
+				const nested = await packageManager.resolve();
+				expect(nested.extensions.map(({ path }) => path)).toContain(replacement);
+
+				const insideAlias = join(agentDir, "inside-checkout");
+				symlinkSync(join(installedDir, "nested"), insideAlias, "dir");
+				settingsManager.setExtensionPaths([join(insideAlias, "extension.ts")]);
+				const inside = await packageManager.resolve();
+				expect(inside.extensions.map(({ path }) => path)).toContain(replacement);
 			}
 			expect(result.extensions.map(({ path }) => path)).not.toContain(join(dirname(healthy), "retained.ts"));
 			expect(result.installFailures).toEqual([

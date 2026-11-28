@@ -193,6 +193,7 @@ function loadTemplatesFromDir(
 		const entries = readdirSync(dir, { withFileTypes: true });
 
 		for (const entry of entries) {
+			if (!entry.name.endsWith(".md")) continue;
 			const fullPath = selectPath(join(dir, entry.name));
 
 			// For symlinks, check if they point to a file
@@ -207,7 +208,7 @@ function loadTemplatesFromDir(
 				}
 			}
 
-			if (isFile && entry.name.endsWith(".md")) {
+			if (isFile) {
 				const result = loadTemplateFromFile(fullPath, getSourceInfo(fullPath));
 				if (result.template) {
 					templates.push({ ...result.template, name: basename(entry.name, ".md") });
